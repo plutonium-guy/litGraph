@@ -1,0 +1,23 @@
+[package]
+name = "litgraph-tools-utils"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Built-in utility tools for litGraph agents — Calculator (evalexpr), HttpRequest (reqwest), and other small primitives that don't need network credentials."
+
+[dependencies]
+litgraph-core.workspace = true
+async-trait.workspace = true
+tokio = { workspace = true, features = ["process", "io-util"] }
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+evalexpr.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }
+tempfile = "3"

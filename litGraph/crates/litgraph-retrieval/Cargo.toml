@@ -1,0 +1,23 @@
+[package]
+name = "litgraph-retrieval"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Retrieval primitives for litGraph — VectorStore + Retriever traits, BM25, hybrid RRF, reranker hook."
+
+[dependencies]
+litgraph-core.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+tokio = { workspace = true }
+serde.workspace = true
+serde_json.workspace = true
+rayon.workspace = true
+tracing.workspace = true
+unicode-segmentation.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }
+async-trait.workspace = true

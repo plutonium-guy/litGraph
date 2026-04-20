@@ -1,0 +1,18 @@
+[package]
+name = "litgraph-resilience"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Resilient wrappers for litGraph providers — retry with exponential backoff via the `backon` crate, classifies transient vs terminal errors."
+
+[dependencies]
+litgraph-core.workspace = true
+async-trait.workspace = true
+tokio = { workspace = true }
+backon.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }

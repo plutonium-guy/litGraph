@@ -1,0 +1,45 @@
+[package]
+name = "litgraph-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Criterion benchmark harness for litGraph hot paths."
+publish = false
+
+[[bench]]
+name = "graph_parallel"
+harness = false
+
+[[bench]]
+name = "bm25"
+harness = false
+
+[[bench]]
+name = "splitters"
+harness = false
+
+[[bench]]
+name = "cache"
+harness = false
+
+[[bench]]
+name = "hnsw"
+harness = false
+
+[dependencies]
+litgraph-core.workspace = true
+litgraph-graph.workspace = true
+litgraph-retrieval.workspace = true
+litgraph-splitters.workspace = true
+litgraph-cache.workspace = true
+litgraph-stores-memory.workspace = true
+litgraph-stores-hnsw.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+async-trait.workspace = true
+futures.workspace = true

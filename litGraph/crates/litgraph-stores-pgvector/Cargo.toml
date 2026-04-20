@@ -1,0 +1,21 @@
+[package]
+name = "litgraph-stores-pgvector"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "pgvector-backed VectorStore for litGraph — stores embeddings in Postgres, HNSW or IVFFlat index on the column. Uses tokio-postgres + deadpool-postgres."
+
+[dependencies]
+litgraph-core.workspace = true
+litgraph-retrieval.workspace = true
+async-trait.workspace = true
+tokio = { workspace = true }
+tokio-postgres.workspace = true
+deadpool-postgres.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+uuid = { version = "1", features = ["v4"] }

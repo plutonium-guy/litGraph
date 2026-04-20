@@ -1,0 +1,14 @@
+[package]
+name = "litgraph-tokenizers"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Token counting + message-history trimming for litGraph. Uses tiktoken-rs for OpenAI BPE encodings; falls back to character/4 estimation for non-OpenAI models."
+
+[dependencies]
+litgraph-core.workspace = true
+tiktoken-rs.workspace = true
+parking_lot.workspace = true
+tracing.workspace = true

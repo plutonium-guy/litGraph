@@ -1,0 +1,9 @@
+from typing import Any
+
+def count_tokens(model: str, text: str) -> int: ...
+def count_message_tokens(model: str, messages: list[dict[str, Any]]) -> int: ...
+def trim_messages(
+    model: str,
+    messages: list[dict[str, Any]],
+    max_tokens: int,
+) -> list[dict[str, Any]]: ...

@@ -1,0 +1,24 @@
+[package]
+name = "litgraph-providers-openai"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "OpenAI / OpenAI-compatible provider adapter for litGraph (chat + streaming + tools)."
+
+[dependencies]
+litgraph-core.workspace = true
+async-trait.workspace = true
+tokio = { workspace = true }
+tokio-stream.workspace = true
+futures.workspace = true
+futures-util.workspace = true
+async-stream.workspace = true
+reqwest.workspace = true
+eventsource-stream.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+backon.workspace = true

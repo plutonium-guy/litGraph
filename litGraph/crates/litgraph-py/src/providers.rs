@@ -1,0 +1,1049 @@
+//! Python-facing provider bindings. Wraps the core `ChatModel` trait implementors
+//! and exposes them as Python classes. Provides `.with_cache(cache)` and
+//! `.instrument(tracker)` sugar that chain `CachedModel` + `InstrumentedChatModel`
+//! around the provider without re-wrapping on every call.
+
+use std::sync::{Arc, Mutex};
+
+use futures::StreamExt;
+use litgraph_cache::{CachedModel, SemanticCachedModel};
+use litgraph_resilience::{RateLimitConfig, RateLimitedChatModel, RetryConfig, RetryingChatModel};
+use litgraph_core::model::ChatStreamEvent;
+use litgraph_core::{ChatModel, ChatOptions, Message, Role};
+use litgraph_observability::{CallbackBus, InstrumentedChatModel};
+use litgraph_providers_anthropic::{AnthropicChat, AnthropicConfig};
+use litgraph_providers_bedrock::{AwsCredentials, BedrockChat, BedrockConfig};
+use litgraph_providers_cohere::{CohereChat, CohereChatConfig};
+use litgraph_providers_gemini::{GeminiChat, GeminiConfig};
+use litgraph_providers_openai::{OpenAIChat, OpenAIConfig};
+use pyo3::exceptions::{PyRuntimeError, PyStopIteration, PyValueError};
+use pyo3::prelude::*;
+use pyo3::types::{PyDict, PyList};
+use tokio::sync::mpsc;
+
+use crate::cache::{PyMemoryCache, PySemanticCache, PySqliteCache};
+use crate::observability::PyCostTracker;
+use crate::runtime::{block_on_compat, rt};
+
+pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_class::<PyOpenAIChat>()?;
+    m.add_class::<PyAnthropicChat>()?;
+    m.add_class::<PyGeminiChat>()?;
+    m.add_class::<PyBedrockChat>()?;
+    m.add_class::<PyCohereChat>()?;
+    m.add_class::<PyChatStream>()?;
+    m.add_function(wrap_pyfunction!(ollama_chat, m)?)?;
+    m.add_function(wrap_pyfunction!(groq_chat, m)?)?;
+    m.add_function(wrap_pyfunction!(together_chat, m)?)?;
+    m.add_function(wrap_pyfunction!(mistral_chat, m)?)?;
+    m.add_function(wrap_pyfunction!(deepseek_chat, m)?)?;
+    m.add_function(wrap_pyfunction!(xai_chat, m)?)?;
+    m.add_function(wrap_pyfunction!(fireworks_chat, m)?)?;
+    Ok(())
+}
+
+#[pyclass(name = "CohereChat", module = "litgraph.providers")]
+pub struct PyCohereChat {
+    inner: Arc<dyn ChatModel>,
+    model: String,
+    bus_handle: Option<Arc<tokio::task::JoinHandle<()>>>,
+}
+
+#[pymethods]
+impl PyCohereChat {
+    #[new]
+    #[pyo3(signature = (api_key, model, base_url=None, timeout_s=120, on_request=None))]
+    fn new(
+        api_key: String,
+        model: String,
+        base_url: Option<String>,
+        timeout_s: u64,
+        on_request: Option<Py<PyAny>>,
+    ) -> PyResult<Self> {
+        let mut cfg = CohereChatConfig::new(api_key, &model);
+        cfg.timeout = std::time::Duration::from_secs(timeout_s);
+        if let Some(url) = base_url { cfg = cfg.with_base_url(url); }
+        if let Some(cb) = on_request {
+            cfg = cfg.with_on_request(wrap_py_inspector(cb));
+        }
+        let chat = CohereChat::new(cfg).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        Ok(Self { inner: Arc::new(chat), model, bus_handle: None })
+    }
+
+    #[pyo3(signature = (messages, temperature=None, max_tokens=None))]
+    fn invoke<'py>(
+        &self,
+        py: Python<'py>,
+        messages: Bound<'py, PyList>,
+        temperature: Option<f32>,
+        max_tokens: Option<u32>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let msgs = parse_messages(&messages)?;
+        let opts = ChatOptions { temperature, max_tokens, ..Default::default() };
+        let chat = self.inner.clone();
+        let resp = py.allow_threads(|| {
+            block_on_compat(async move { chat.invoke(msgs, &opts).await })
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })?;
+        response_to_py_dict(py, &resp)
+    }
+
+    #[pyo3(signature = (messages, temperature=None, max_tokens=None))]
+    fn stream<'py>(
+        &self,
+        _py: Python<'py>,
+        messages: Bound<'py, PyList>,
+        temperature: Option<f32>,
+        max_tokens: Option<u32>,
+    ) -> PyResult<PyChatStream> {
+        let msgs = parse_messages(&messages)?;
+        let opts = ChatOptions { temperature, max_tokens, ..Default::default() };
+        let chat = self.inner.clone();
+        let rx = spawn_stream(chat, msgs, opts);
+        Ok(PyChatStream { rx: Arc::new(Mutex::new(Some(rx))) })
+    }
+
+    fn with_cache(&mut self, py: Python<'_>, cache: Bound<'_, PyAny>) -> PyResult<()> {
+        let backend = unify_cache_backend(py, &cache)?;
+        self.inner = Arc::new(CachedModel::new(self.inner.clone(), backend));
+        Ok(())
+    }
+
+    fn with_semantic_cache(&mut self, cache: PyRef<'_, PySemanticCache>) -> PyResult<()> {
+        self.inner = Arc::new(SemanticCachedModel::new(self.inner.clone(), cache.inner.clone()));
+        Ok(())
+    }
+
+    #[pyo3(signature = (max_times=5, min_delay_ms=200, max_delay_ms=30_000, factor=2.0, jitter=true))]
+    fn with_retry(&mut self, max_times: usize, min_delay_ms: u64, max_delay_ms: u64,
+                  factor: f32, jitter: bool) -> PyResult<()> {
+        let cfg = RetryConfig {
+            min_delay: std::time::Duration::from_millis(min_delay_ms),
+            max_delay: std::time::Duration::from_millis(max_delay_ms),
+            factor, max_times, jitter,
+        };
+        self.inner = Arc::new(RetryingChatModel::new(self.inner.clone(), cfg));
+        Ok(())
+    }
+
+    /// Token-bucket rate limit. `requests_per_minute` sets steady-state rate;
+    /// `burst` (default = rpm) is the bucket capacity for idle accumulation.
+    /// Set `burst=1` for a strict non-bursty cadence.
+    #[pyo3(signature = (requests_per_minute, burst=None))]
+    fn with_rate_limit(&mut self, requests_per_minute: u32, burst: Option<u32>) -> PyResult<()> {
+        let mut cfg = RateLimitConfig::per_minute(requests_per_minute);
+        if let Some(b) = burst { cfg = cfg.with_burst(b); }
+        self.inner = Arc::new(RateLimitedChatModel::new(self.inner.clone(), cfg));
+        Ok(())
+    }
+
+    fn instrument(&mut self, tracker: PyRef<'_, PyCostTracker>) -> PyResult<()> {
+        let bus = CallbackBus::new();
+        bus.subscribe(tracker.inner.clone());
+        let _g = rt().enter();
+        let (handle, join) = bus.start();
+        self.inner = Arc::new(InstrumentedChatModel::new(self.inner.clone(), handle));
+        self.bus_handle = Some(Arc::new(join));
+        Ok(())
+    }
+
+    fn __repr__(&self) -> String { format!("CohereChat(model='{}')", self.model) }
+}
+
+impl PyCohereChat {
+    pub(crate) fn chat_model(&self) -> std::sync::Arc<dyn litgraph_core::ChatModel> {
+        self.inner.clone()
+    }
+}
+
+/// Convenience constructor for a local Ollama server. Same as
+/// `OpenAIChat(api_key="ollama", model=..., base_url="http://localhost:11434/v1")`.
+///
+/// Ollama implements the OpenAI-compatible API, so all `OpenAIChat` methods
+/// (`invoke`, `stream`, `with_cache`, `instrument`, …) work unchanged.
+#[pyfunction]
+#[pyo3(signature = (model, base_url=None, timeout_s=120))]
+fn ollama_chat(
+    model: String,
+    base_url: Option<String>,
+    timeout_s: u64,
+) -> PyResult<PyOpenAIChat> {
+    let url = base_url.unwrap_or_else(|| "http://localhost:11434/v1".into());
+    PyOpenAIChat::new("ollama".into(), model, Some(url), timeout_s, None)
+}
+
+/// Groq — OpenAI-compatible inference for Llama / Mixtral / Whisper running
+/// on Groq's LPU. Default: `https://api.groq.com/openai/v1`.
+#[pyfunction]
+#[pyo3(signature = (api_key, model, base_url=None, timeout_s=120))]
+fn groq_chat(
+    api_key: String,
+    model: String,
+    base_url: Option<String>,
+    timeout_s: u64,
+) -> PyResult<PyOpenAIChat> {
+    let url = base_url.unwrap_or_else(|| "https://api.groq.com/openai/v1".into());
+    PyOpenAIChat::new(api_key, model, Some(url), timeout_s, None)
+}
+
+/// Together AI — OpenAI-compatible serverless inference for hundreds of OSS
+/// models. Default: `https://api.together.xyz/v1`.
+#[pyfunction]
+#[pyo3(signature = (api_key, model, base_url=None, timeout_s=120))]
+fn together_chat(
+    api_key: String,
+    model: String,
+    base_url: Option<String>,
+    timeout_s: u64,
+) -> PyResult<PyOpenAIChat> {
+    let url = base_url.unwrap_or_else(|| "https://api.together.xyz/v1".into());
+    PyOpenAIChat::new(api_key, model, Some(url), timeout_s, None)
+}
+
+/// Mistral La Plateforme — OpenAI-compatible. Default:
+/// `https://api.mistral.ai/v1`. Common models: `mistral-large-latest`,
+/// `mistral-small-latest`, `codestral-latest`, `pixtral-large-latest`.
+#[pyfunction]
+#[pyo3(signature = (api_key, model, base_url=None, timeout_s=120))]
+fn mistral_chat(
+    api_key: String,
+    model: String,
+    base_url: Option<String>,
+    timeout_s: u64,
+) -> PyResult<PyOpenAIChat> {
+    let url = base_url.unwrap_or_else(|| "https://api.mistral.ai/v1".into());
+    PyOpenAIChat::new(api_key, model, Some(url), timeout_s, None)
+}
+
+/// DeepSeek — OpenAI-compatible. Default: `https://api.deepseek.com/v1`.
+/// Common models: `deepseek-chat`, `deepseek-reasoner`.
+#[pyfunction]
+#[pyo3(signature = (api_key, model, base_url=None, timeout_s=120))]
+fn deepseek_chat(
+    api_key: String,
+    model: String,
+    base_url: Option<String>,
+    timeout_s: u64,
+) -> PyResult<PyOpenAIChat> {
+    let url = base_url.unwrap_or_else(|| "https://api.deepseek.com/v1".into());
+    PyOpenAIChat::new(api_key, model, Some(url), timeout_s, None)
+}
+
+/// xAI Grok — OpenAI-compatible. Default: `https://api.x.ai/v1`.
+/// Common models: `grok-2-latest`, `grok-2-vision-latest`.
+#[pyfunction]
+#[pyo3(signature = (api_key, model, base_url=None, timeout_s=120))]
+fn xai_chat(
+    api_key: String,
+    model: String,
+    base_url: Option<String>,
+    timeout_s: u64,
+) -> PyResult<PyOpenAIChat> {
+    let url = base_url.unwrap_or_else(|| "https://api.x.ai/v1".into());
+    PyOpenAIChat::new(api_key, model, Some(url), timeout_s, None)
+}
+
+/// Fireworks AI — OpenAI-compatible serverless inference for OSS models.
+/// Default: `https://api.fireworks.ai/inference/v1`.
+#[pyfunction]
+#[pyo3(signature = (api_key, model, base_url=None, timeout_s=120))]
+fn fireworks_chat(
+    api_key: String,
+    model: String,
+    base_url: Option<String>,
+    timeout_s: u64,
+) -> PyResult<PyOpenAIChat> {
+    let url = base_url.unwrap_or_else(|| "https://api.fireworks.ai/inference/v1".into());
+    PyOpenAIChat::new(api_key, model, Some(url), timeout_s, None)
+}
+
+/// Wrap a Python callable as a Rust `Fn(&str, &serde_json::Value)` request
+/// inspector. Closure re-acquires the GIL inside and dispatches to the
+/// callable with `(model: str, body: dict)`. Errors raised inside the callable
+/// are logged via tracing — never want a debug hook to crash the request path.
+fn wrap_py_inspector(cb: Py<PyAny>) -> impl Fn(&str, &serde_json::Value) + Send + Sync + 'static {
+    let cb = Arc::new(cb);
+    move |model: &str, body: &serde_json::Value| {
+        let cb = cb.clone();
+        let model = model.to_string();
+        let body = body.clone();
+        Python::with_gil(|py| {
+            let py_body = match crate::graph::json_to_py(py, &body) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(error = %e, "on_request: failed to convert body to Python");
+                    return;
+                }
+            };
+            if let Err(e) = cb.call1(py, (model, py_body)) {
+                tracing::warn!(error = %e, "on_request: Python callback raised");
+            }
+        });
+    }
+}
+
+/// Extract the underlying `Arc<dyn ChatModel>` from whichever provider subtype
+/// was passed. Central point for future providers (Gemini, Bedrock).
+fn unify_cache_backend(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResult<Arc<dyn litgraph_cache::Cache>> {
+    if let Ok(c) = obj.extract::<PyRef<PyMemoryCache>>() {
+        return Ok(c.inner.clone());
+    }
+    if let Ok(c) = obj.extract::<PyRef<PySqliteCache>>() {
+        return Ok(c.inner.clone());
+    }
+    let _ = py;
+    Err(PyValueError::new_err("expected MemoryCache or SqliteCache"))
+}
+
+#[pyclass(name = "OpenAIChat", module = "litgraph.providers")]
+pub struct PyOpenAIChat {
+    inner: Arc<dyn ChatModel>,
+    model: String,
+    /// Keeps the callback bus alive as long as the instrumented model is used.
+    bus_handle: Option<Arc<tokio::task::JoinHandle<()>>>,
+}
+
+#[pymethods]
+impl PyOpenAIChat {
+    /// `on_request` — optional Python callable `(model: str, body: dict) -> None`
+    /// invoked just before each HTTP request. Use to log / snapshot / assert
+    /// the final wire body. Solves "what is the model actually seeing?" without
+    /// monkey-patching reqwest. Errors raised inside the callback propagate as
+    /// Rust panics by design.
+    #[new]
+    #[pyo3(signature = (api_key, model, base_url=None, timeout_s=120, on_request=None))]
+    fn new(
+        api_key: String,
+        model: String,
+        base_url: Option<String>,
+        timeout_s: u64,
+        on_request: Option<Py<PyAny>>,
+    ) -> PyResult<Self> {
+        let mut cfg = OpenAIConfig::new(api_key, &model);
+        cfg.timeout = std::time::Duration::from_secs(timeout_s);
+        if let Some(url) = base_url {
+            cfg = cfg.with_base_url(url);
+        }
+        if let Some(cb) = on_request {
+            cfg = cfg.with_on_request(wrap_py_inspector(cb));
+        }
+        let chat = OpenAIChat::new(cfg).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        Ok(Self { inner: Arc::new(chat), model, bus_handle: None })
+    }
+
+    /// Invoke. Optional `response_format` enables structured output. Pass either:
+    /// - `{"type": "json_object"}` — model returns valid JSON, no schema constraint
+    /// - `{"type": "json_schema", "json_schema": {"name": "...", "schema": {...}}}` — model adheres to schema
+    /// Provider maps this to OpenAI's native `response_format` field.
+    #[pyo3(signature = (messages, temperature=None, max_tokens=None, response_format=None))]
+    fn invoke<'py>(
+        &self,
+        py: Python<'py>,
+        messages: Bound<'py, PyList>,
+        temperature: Option<f32>,
+        max_tokens: Option<u32>,
+        response_format: Option<Bound<'py, PyDict>>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let msgs = parse_messages(&messages)?;
+        let rf = response_format
+            .map(|d| crate::graph::py_dict_to_json(&d))
+            .transpose()?;
+        let opts = ChatOptions { temperature, max_tokens, response_format: rf, ..Default::default() };
+        let chat = self.inner.clone();
+        let resp = py.allow_threads(|| {
+            block_on_compat(async move { chat.invoke(msgs, &opts).await })
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })?;
+        response_to_py_dict(py, &resp)
+    }
+
+    /// Streaming — returns a `ChatStream` iterator. Each item is a dict:
+    /// - `{"type": "delta", "text": "..."}` — partial assistant text
+    /// - `{"type": "tool_call_delta", "index": i, ...}` — streaming tool call
+    /// - `{"type": "done", ...}` — final response (text, finish_reason, usage)
+    #[pyo3(signature = (messages, temperature=None, max_tokens=None))]
+    fn stream<'py>(
+        &self,
+        _py: Python<'py>,
+        messages: Bound<'py, PyList>,
+        temperature: Option<f32>,
+        max_tokens: Option<u32>,
+    ) -> PyResult<PyChatStream> {
+        let msgs = parse_messages(&messages)?;
+        let opts = ChatOptions { temperature, max_tokens, ..Default::default() };
+        let chat = self.inner.clone();
+        let rx = spawn_stream(chat, msgs, opts);
+        Ok(PyChatStream { rx: Arc::new(Mutex::new(Some(rx))) })
+    }
+
+    /// Wrap this provider with a Cache. Subsequent invocations hit the cache.
+    fn with_cache(&mut self, py: Python<'_>, cache: Bound<'_, PyAny>) -> PyResult<()> {
+        let backend = unify_cache_backend(py, &cache)?;
+        self.inner = Arc::new(CachedModel::new(self.inner.clone(), backend));
+        Ok(())
+    }
+
+    /// Wrap with a SemanticCache — looks up responses by embedding cosine.
+    /// Use a conservative threshold (≥ 0.95) in production.
+    fn with_semantic_cache(&mut self, cache: PyRef<'_, PySemanticCache>) -> PyResult<()> {
+        self.inner = Arc::new(SemanticCachedModel::new(self.inner.clone(), cache.inner.clone()));
+        Ok(())
+    }
+
+    /// Wrap with retry + jittered exponential backoff. Retries 429 (rate-limited),
+    /// timeouts, and 5xx responses. Does NOT retry 4xx (client bug) or stream calls.
+    #[pyo3(signature = (max_times=5, min_delay_ms=200, max_delay_ms=30_000, factor=2.0, jitter=true))]
+    fn with_retry(
+        &mut self,
+        max_times: usize,
+        min_delay_ms: u64,
+        max_delay_ms: u64,
+        factor: f32,
+        jitter: bool,
+    ) -> PyResult<()> {
+        let cfg = RetryConfig {
+            min_delay: std::time::Duration::from_millis(min_delay_ms),
+            max_delay: std::time::Duration::from_millis(max_delay_ms),
+            factor,
+            max_times,
+            jitter,
+        };
+        self.inner = Arc::new(RetryingChatModel::new(self.inner.clone(), cfg));
+        Ok(())
+    }
+
+    /// Token-bucket rate limit. `requests_per_minute` sets steady-state rate;
+    /// `burst` (default = rpm) is the bucket capacity for idle accumulation.
+    /// Set `burst=1` for a strict non-bursty cadence.
+    #[pyo3(signature = (requests_per_minute, burst=None))]
+    fn with_rate_limit(&mut self, requests_per_minute: u32, burst: Option<u32>) -> PyResult<()> {
+        let mut cfg = RateLimitConfig::per_minute(requests_per_minute);
+        if let Some(b) = burst { cfg = cfg.with_burst(b); }
+        self.inner = Arc::new(RateLimitedChatModel::new(self.inner.clone(), cfg));
+        Ok(())
+    }
+
+    /// Wrap this provider so it emits events to a `CostTracker` (and any other
+    /// subscribers on the bus). The bus owns a drain task that lives as long as
+    /// the returned provider.
+    fn instrument(&mut self, tracker: PyRef<'_, PyCostTracker>) -> PyResult<()> {
+        let bus = CallbackBus::new();
+        bus.subscribe(tracker.inner.clone());
+        let _g = rt().enter();
+        let (handle, join) = bus.start();
+        self.inner = Arc::new(InstrumentedChatModel::new(self.inner.clone(), handle));
+        self.bus_handle = Some(Arc::new(join));
+        Ok(())
+    }
+
+    fn __repr__(&self) -> String { format!("OpenAIChat(model='{}')", self.model) }
+}
+
+impl PyOpenAIChat {
+    pub(crate) fn chat_model(&self) -> std::sync::Arc<dyn litgraph_core::ChatModel> {
+        self.inner.clone()
+    }
+}
+
+#[pyclass(name = "AnthropicChat", module = "litgraph.providers")]
+pub struct PyAnthropicChat {
+    inner: Arc<dyn ChatModel>,
+    model: String,
+    bus_handle: Option<Arc<tokio::task::JoinHandle<()>>>,
+}
+
+#[pymethods]
+impl PyAnthropicChat {
+    #[new]
+    #[pyo3(signature = (api_key, model, base_url=None, timeout_s=120, max_tokens=4096, on_request=None))]
+    fn new(
+        api_key: String,
+        model: String,
+        base_url: Option<String>,
+        timeout_s: u64,
+        max_tokens: u32,
+        on_request: Option<Py<PyAny>>,
+    ) -> PyResult<Self> {
+        let mut cfg = AnthropicConfig::new(api_key, &model);
+        cfg.timeout = std::time::Duration::from_secs(timeout_s);
+        cfg.max_tokens = max_tokens;
+        if let Some(url) = base_url { cfg = cfg.with_base_url(url); }
+        if let Some(cb) = on_request {
+            cfg = cfg.with_on_request(wrap_py_inspector(cb));
+        }
+        let chat = AnthropicChat::new(cfg).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        Ok(Self { inner: Arc::new(chat), model, bus_handle: None })
+    }
+
+    /// Invoke. `response_format = {"type":"json_schema","json_schema":{"schema":{...}}}`
+    /// triggers Anthropic's tool-call workaround: a synthesized tool with that
+    /// schema is forced via tool_choice, and the response is unwrapped back
+    /// into the text field. `{"type":"json_object"}` is no-op for Anthropic
+    /// (no native equivalent — use a system prompt to ask for JSON).
+    #[pyo3(signature = (messages, temperature=None, max_tokens=None, response_format=None))]
+    fn invoke<'py>(
+        &self,
+        py: Python<'py>,
+        messages: Bound<'py, PyList>,
+        temperature: Option<f32>,
+        max_tokens: Option<u32>,
+        response_format: Option<Bound<'py, PyDict>>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let msgs = parse_messages(&messages)?;
+        let rf = response_format
+            .map(|d| crate::graph::py_dict_to_json(&d))
+            .transpose()?;
+        let opts = ChatOptions { temperature, max_tokens, response_format: rf, ..Default::default() };
+        let chat = self.inner.clone();
+        let resp = py.allow_threads(|| {
+            block_on_compat(async move { chat.invoke(msgs, &opts).await })
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })?;
+        response_to_py_dict(py, &resp)
+    }
+
+    #[pyo3(signature = (messages, temperature=None, max_tokens=None))]
+    fn stream<'py>(
+        &self,
+        _py: Python<'py>,
+        messages: Bound<'py, PyList>,
+        temperature: Option<f32>,
+        max_tokens: Option<u32>,
+    ) -> PyResult<PyChatStream> {
+        let msgs = parse_messages(&messages)?;
+        let opts = ChatOptions { temperature, max_tokens, ..Default::default() };
+        let chat = self.inner.clone();
+        let rx = spawn_stream(chat, msgs, opts);
+        Ok(PyChatStream { rx: Arc::new(Mutex::new(Some(rx))) })
+    }
+
+    fn with_cache(&mut self, py: Python<'_>, cache: Bound<'_, PyAny>) -> PyResult<()> {
+        let backend = unify_cache_backend(py, &cache)?;
+        self.inner = Arc::new(CachedModel::new(self.inner.clone(), backend));
+        Ok(())
+    }
+
+    /// Wrap with a SemanticCache — looks up responses by embedding cosine.
+    /// Use a conservative threshold (≥ 0.95) in production.
+    fn with_semantic_cache(&mut self, cache: PyRef<'_, PySemanticCache>) -> PyResult<()> {
+        self.inner = Arc::new(SemanticCachedModel::new(self.inner.clone(), cache.inner.clone()));
+        Ok(())
+    }
+
+    #[pyo3(signature = (max_times=5, min_delay_ms=200, max_delay_ms=30_000, factor=2.0, jitter=true))]
+    fn with_retry(&mut self, max_times: usize, min_delay_ms: u64, max_delay_ms: u64,
+                  factor: f32, jitter: bool) -> PyResult<()> {
+        let cfg = RetryConfig {
+            min_delay: std::time::Duration::from_millis(min_delay_ms),
+            max_delay: std::time::Duration::from_millis(max_delay_ms),
+            factor, max_times, jitter,
+        };
+        self.inner = Arc::new(RetryingChatModel::new(self.inner.clone(), cfg));
+        Ok(())
+    }
+
+    #[pyo3(signature = (requests_per_minute, burst=None))]
+    fn with_rate_limit(&mut self, requests_per_minute: u32, burst: Option<u32>) -> PyResult<()> {
+        let mut cfg = RateLimitConfig::per_minute(requests_per_minute);
+        if let Some(b) = burst { cfg = cfg.with_burst(b); }
+        self.inner = Arc::new(RateLimitedChatModel::new(self.inner.clone(), cfg));
+        Ok(())
+    }
+
+    fn instrument(&mut self, tracker: PyRef<'_, PyCostTracker>) -> PyResult<()> {
+        let bus = CallbackBus::new();
+        bus.subscribe(tracker.inner.clone());
+        let _g = rt().enter();
+        let (handle, join) = bus.start();
+        self.inner = Arc::new(InstrumentedChatModel::new(self.inner.clone(), handle));
+        self.bus_handle = Some(Arc::new(join));
+        Ok(())
+    }
+
+    fn __repr__(&self) -> String { format!("AnthropicChat(model='{}')", self.model) }
+}
+
+impl PyAnthropicChat {
+    pub(crate) fn chat_model(&self) -> std::sync::Arc<dyn litgraph_core::ChatModel> {
+        self.inner.clone()
+    }
+}
+
+#[pyclass(name = "GeminiChat", module = "litgraph.providers")]
+pub struct PyGeminiChat {
+    inner: Arc<dyn ChatModel>,
+    model: String,
+    bus_handle: Option<Arc<tokio::task::JoinHandle<()>>>,
+}
+
+#[pymethods]
+impl PyGeminiChat {
+    #[new]
+    #[pyo3(signature = (api_key, model, base_url=None, timeout_s=120, on_request=None))]
+    fn new(
+        api_key: String,
+        model: String,
+        base_url: Option<String>,
+        timeout_s: u64,
+        on_request: Option<Py<PyAny>>,
+    ) -> PyResult<Self> {
+        let mut cfg = GeminiConfig::new(api_key, &model);
+        cfg.timeout = std::time::Duration::from_secs(timeout_s);
+        if let Some(url) = base_url { cfg = cfg.with_base_url(url); }
+        if let Some(cb) = on_request {
+            cfg = cfg.with_on_request(wrap_py_inspector(cb));
+        }
+        let chat = GeminiChat::new(cfg).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        Ok(Self { inner: Arc::new(chat), model, bus_handle: None })
+    }
+
+    /// Invoke. Optional `response_format` enables structured output. Mapped to
+    /// Gemini's `generationConfig.responseMimeType` + `responseSchema`.
+    #[pyo3(signature = (messages, temperature=None, max_tokens=None, response_format=None))]
+    fn invoke<'py>(
+        &self,
+        py: Python<'py>,
+        messages: Bound<'py, PyList>,
+        temperature: Option<f32>,
+        max_tokens: Option<u32>,
+        response_format: Option<Bound<'py, PyDict>>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let msgs = parse_messages(&messages)?;
+        let rf = response_format
+            .map(|d| crate::graph::py_dict_to_json(&d))
+            .transpose()?;
+        let opts = ChatOptions { temperature, max_tokens, response_format: rf, ..Default::default() };
+        let chat = self.inner.clone();
+        let resp = py.allow_threads(|| {
+            block_on_compat(async move { chat.invoke(msgs, &opts).await })
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })?;
+        response_to_py_dict(py, &resp)
+    }
+
+    #[pyo3(signature = (messages, temperature=None, max_tokens=None))]
+    fn stream<'py>(
+        &self,
+        _py: Python<'py>,
+        messages: Bound<'py, PyList>,
+        temperature: Option<f32>,
+        max_tokens: Option<u32>,
+    ) -> PyResult<PyChatStream> {
+        let msgs = parse_messages(&messages)?;
+        let opts = ChatOptions { temperature, max_tokens, ..Default::default() };
+        let chat = self.inner.clone();
+        let rx = spawn_stream(chat, msgs, opts);
+        Ok(PyChatStream { rx: Arc::new(Mutex::new(Some(rx))) })
+    }
+
+    fn with_cache(&mut self, py: Python<'_>, cache: Bound<'_, PyAny>) -> PyResult<()> {
+        let backend = unify_cache_backend(py, &cache)?;
+        self.inner = Arc::new(CachedModel::new(self.inner.clone(), backend));
+        Ok(())
+    }
+
+    /// Wrap with a SemanticCache — looks up responses by embedding cosine.
+    /// Use a conservative threshold (≥ 0.95) in production.
+    fn with_semantic_cache(&mut self, cache: PyRef<'_, PySemanticCache>) -> PyResult<()> {
+        self.inner = Arc::new(SemanticCachedModel::new(self.inner.clone(), cache.inner.clone()));
+        Ok(())
+    }
+
+    #[pyo3(signature = (max_times=5, min_delay_ms=200, max_delay_ms=30_000, factor=2.0, jitter=true))]
+    fn with_retry(&mut self, max_times: usize, min_delay_ms: u64, max_delay_ms: u64,
+                  factor: f32, jitter: bool) -> PyResult<()> {
+        let cfg = RetryConfig {
+            min_delay: std::time::Duration::from_millis(min_delay_ms),
+            max_delay: std::time::Duration::from_millis(max_delay_ms),
+            factor, max_times, jitter,
+        };
+        self.inner = Arc::new(RetryingChatModel::new(self.inner.clone(), cfg));
+        Ok(())
+    }
+
+    #[pyo3(signature = (requests_per_minute, burst=None))]
+    fn with_rate_limit(&mut self, requests_per_minute: u32, burst: Option<u32>) -> PyResult<()> {
+        let mut cfg = RateLimitConfig::per_minute(requests_per_minute);
+        if let Some(b) = burst { cfg = cfg.with_burst(b); }
+        self.inner = Arc::new(RateLimitedChatModel::new(self.inner.clone(), cfg));
+        Ok(())
+    }
+
+    fn instrument(&mut self, tracker: PyRef<'_, PyCostTracker>) -> PyResult<()> {
+        let bus = CallbackBus::new();
+        bus.subscribe(tracker.inner.clone());
+        let _g = rt().enter();
+        let (handle, join) = bus.start();
+        self.inner = Arc::new(InstrumentedChatModel::new(self.inner.clone(), handle));
+        self.bus_handle = Some(Arc::new(join));
+        Ok(())
+    }
+
+    fn __repr__(&self) -> String { format!("GeminiChat(model='{}')", self.model) }
+}
+
+impl PyGeminiChat {
+    pub(crate) fn chat_model(&self) -> std::sync::Arc<dyn litgraph_core::ChatModel> {
+        self.inner.clone()
+    }
+}
+
+#[pyclass(name = "BedrockChat", module = "litgraph.providers")]
+pub struct PyBedrockChat {
+    inner: Arc<dyn ChatModel>,
+    model_id: String,
+    bus_handle: Option<Arc<tokio::task::JoinHandle<()>>>,
+}
+
+#[pymethods]
+impl PyBedrockChat {
+    /// `access_key_id` / `secret_access_key` / `session_token` are static creds.
+    /// For instance-profile / SSO / IRSA, resolve creds with the AWS SDK in your
+    /// app and pass the materialized values here.
+    #[new]
+    #[pyo3(signature = (
+        access_key_id, secret_access_key, region, model_id,
+        session_token=None, timeout_s=120, max_tokens=4096,
+        endpoint_override=None, on_request=None,
+    ))]
+    fn new(
+        access_key_id: String,
+        secret_access_key: String,
+        region: String,
+        model_id: String,
+        session_token: Option<String>,
+        timeout_s: u64,
+        max_tokens: u32,
+        endpoint_override: Option<String>,
+        on_request: Option<Py<PyAny>>,
+    ) -> PyResult<Self> {
+        let creds = AwsCredentials { access_key_id, secret_access_key, session_token };
+        let mut cfg = BedrockConfig::new(creds, region, &model_id);
+        cfg.timeout = std::time::Duration::from_secs(timeout_s);
+        cfg.max_tokens = max_tokens;
+        if let Some(url) = endpoint_override { cfg = cfg.with_endpoint(url); }
+        if let Some(cb) = on_request {
+            cfg = cfg.with_on_request(wrap_py_inspector(cb));
+        }
+        let chat = BedrockChat::new(cfg).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        Ok(Self { inner: Arc::new(chat), model_id, bus_handle: None })
+    }
+
+    #[pyo3(signature = (messages, temperature=None, max_tokens=None))]
+    fn invoke<'py>(
+        &self,
+        py: Python<'py>,
+        messages: Bound<'py, PyList>,
+        temperature: Option<f32>,
+        max_tokens: Option<u32>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let msgs = parse_messages(&messages)?;
+        let opts = ChatOptions { temperature, max_tokens, ..Default::default() };
+        let chat = self.inner.clone();
+        let resp = py.allow_threads(|| {
+            block_on_compat(async move { chat.invoke(msgs, &opts).await })
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })?;
+        response_to_py_dict(py, &resp)
+    }
+
+    /// Bedrock streaming returns a single `Done` event in v1 (event-stream
+    /// frame parser is non-trivial; track the GH issue for status). Provided
+    /// for API parity so users can swap providers without rewriting consumers.
+    #[pyo3(signature = (messages, temperature=None, max_tokens=None))]
+    fn stream<'py>(
+        &self,
+        _py: Python<'py>,
+        messages: Bound<'py, PyList>,
+        temperature: Option<f32>,
+        max_tokens: Option<u32>,
+    ) -> PyResult<PyChatStream> {
+        let msgs = parse_messages(&messages)?;
+        let opts = ChatOptions { temperature, max_tokens, ..Default::default() };
+        let chat = self.inner.clone();
+        let rx = spawn_stream(chat, msgs, opts);
+        Ok(PyChatStream { rx: Arc::new(Mutex::new(Some(rx))) })
+    }
+
+    fn with_cache(&mut self, py: Python<'_>, cache: Bound<'_, PyAny>) -> PyResult<()> {
+        let backend = unify_cache_backend(py, &cache)?;
+        self.inner = Arc::new(CachedModel::new(self.inner.clone(), backend));
+        Ok(())
+    }
+
+    fn with_semantic_cache(&mut self, cache: PyRef<'_, PySemanticCache>) -> PyResult<()> {
+        self.inner = Arc::new(SemanticCachedModel::new(self.inner.clone(), cache.inner.clone()));
+        Ok(())
+    }
+
+    #[pyo3(signature = (max_times=5, min_delay_ms=200, max_delay_ms=30_000, factor=2.0, jitter=true))]
+    fn with_retry(&mut self, max_times: usize, min_delay_ms: u64, max_delay_ms: u64,
+                  factor: f32, jitter: bool) -> PyResult<()> {
+        let cfg = RetryConfig {
+            min_delay: std::time::Duration::from_millis(min_delay_ms),
+            max_delay: std::time::Duration::from_millis(max_delay_ms),
+            factor, max_times, jitter,
+        };
+        self.inner = Arc::new(RetryingChatModel::new(self.inner.clone(), cfg));
+        Ok(())
+    }
+
+    #[pyo3(signature = (requests_per_minute, burst=None))]
+    fn with_rate_limit(&mut self, requests_per_minute: u32, burst: Option<u32>) -> PyResult<()> {
+        let mut cfg = RateLimitConfig::per_minute(requests_per_minute);
+        if let Some(b) = burst { cfg = cfg.with_burst(b); }
+        self.inner = Arc::new(RateLimitedChatModel::new(self.inner.clone(), cfg));
+        Ok(())
+    }
+
+    fn instrument(&mut self, tracker: PyRef<'_, PyCostTracker>) -> PyResult<()> {
+        let bus = CallbackBus::new();
+        bus.subscribe(tracker.inner.clone());
+        let _g = rt().enter();
+        let (handle, join) = bus.start();
+        self.inner = Arc::new(InstrumentedChatModel::new(self.inner.clone(), handle));
+        self.bus_handle = Some(Arc::new(join));
+        Ok(())
+    }
+
+    fn __repr__(&self) -> String { format!("BedrockChat(model_id='{}')", self.model_id) }
+}
+
+impl PyBedrockChat {
+    pub(crate) fn chat_model(&self) -> std::sync::Arc<dyn litgraph_core::ChatModel> {
+        self.inner.clone()
+    }
+}
+
+/// Python-facing chat stream. Each `__next__` blocks on the receiver with GIL
+/// released, converts one `ChatStreamEvent` to a dict.
+#[pyclass(name = "ChatStream", module = "litgraph.providers")]
+pub struct PyChatStream {
+    rx: Arc<Mutex<Option<mpsc::Receiver<litgraph_core::Result<ChatStreamEvent>>>>>,
+}
+
+#[pymethods]
+impl PyChatStream {
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> { slf }
+
+    fn __next__<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let slot = self.rx.clone();
+        let ev = py.allow_threads(|| {
+            let mut guard = slot.lock().expect("poisoned");
+            let mut rx = match guard.take() {
+                Some(r) => r,
+                None => return None,
+            };
+            let got = block_on_compat(async { rx.recv().await });
+            *guard = Some(rx);
+            got
+        });
+        match ev {
+            Some(Ok(e)) => chat_event_to_py_dict(py, &e),
+            Some(Err(e)) => Err(PyRuntimeError::new_err(e.to_string())),
+            None => {
+                *self.rx.lock().expect("poisoned") = None;
+                Err(PyStopIteration::new_err("chat stream exhausted"))
+            }
+        }
+    }
+}
+
+/// Spawn the provider `stream()` on our runtime, forward events into an mpsc.
+fn spawn_stream(
+    chat: Arc<dyn ChatModel>,
+    messages: Vec<Message>,
+    opts: ChatOptions,
+) -> mpsc::Receiver<litgraph_core::Result<ChatStreamEvent>> {
+    let (tx, rx) = mpsc::channel::<litgraph_core::Result<ChatStreamEvent>>(64);
+    rt().spawn(async move {
+        match chat.stream(messages, &opts).await {
+            Err(e) => { let _ = tx.send(Err(e)).await; }
+            Ok(mut s) => {
+                while let Some(item) = s.next().await {
+                    if tx.send(item).await.is_err() { break; }
+                }
+            }
+        }
+    });
+    rx
+}
+
+fn chat_event_to_py_dict<'py>(py: Python<'py>, ev: &ChatStreamEvent) -> PyResult<Bound<'py, PyDict>> {
+    let d = PyDict::new_bound(py);
+    match ev {
+        ChatStreamEvent::Delta { text } => {
+            d.set_item("type", "delta")?;
+            d.set_item("text", text)?;
+        }
+        ChatStreamEvent::ToolCallDelta { index, id, name, arguments_delta } => {
+            d.set_item("type", "tool_call_delta")?;
+            d.set_item("index", *index)?;
+            if let Some(v) = id { d.set_item("id", v)?; }
+            if let Some(v) = name { d.set_item("name", v)?; }
+            if let Some(v) = arguments_delta { d.set_item("arguments_delta", v)?; }
+        }
+        ChatStreamEvent::Done { response } => {
+            d.set_item("type", "done")?;
+            d.set_item("text", response.message.text_content())?;
+            d.set_item("finish_reason", format!("{:?}", response.finish_reason).to_lowercase())?;
+            let usage = PyDict::new_bound(py);
+            usage.set_item("prompt", response.usage.prompt)?;
+            usage.set_item("completion", response.usage.completion)?;
+            usage.set_item("total", response.usage.total)?;
+            d.set_item("usage", usage)?;
+            d.set_item("model", &response.model)?;
+        }
+    }
+    Ok(d)
+}
+
+fn response_to_py_dict<'py>(
+    py: Python<'py>,
+    resp: &litgraph_core::ChatResponse,
+) -> PyResult<Bound<'py, PyDict>> {
+    let out = PyDict::new_bound(py);
+    out.set_item("text", resp.message.text_content())?;
+    out.set_item("finish_reason", format!("{:?}", resp.finish_reason).to_lowercase())?;
+    let usage = PyDict::new_bound(py);
+    usage.set_item("prompt", resp.usage.prompt)?;
+    usage.set_item("completion", resp.usage.completion)?;
+    usage.set_item("total", resp.usage.total)?;
+    usage.set_item("cache_creation", resp.usage.cache_creation)?;
+    usage.set_item("cache_read", resp.usage.cache_read)?;
+    out.set_item("usage", usage)?;
+    out.set_item("model", &resp.model)?;
+    Ok(out)
+}
+
+/// Public re-export so other modules (memory, agents, …) can reuse the same
+/// dict→Message conversion without duplicating it.
+pub(crate) fn parse_messages_from_pylist(py_msgs: &Bound<'_, PyList>) -> PyResult<Vec<Message>> {
+    parse_messages(py_msgs)
+}
+
+/// Render a slice of `Message` back to a Python list of `{role, content}` dicts.
+/// Multimodal content collapses to its concatenated text view — sufficient for
+/// the round-trip use case (memory snapshots, callback payloads). For an
+/// invoke() the full structured form is preserved internally regardless.
+pub(crate) fn messages_to_py_list<'py>(
+    py: Python<'py>,
+    msgs: &[Message],
+) -> PyResult<Bound<'py, PyList>> {
+    use pyo3::types::PyDict;
+    let list = PyList::empty_bound(py);
+    for m in msgs {
+        let d = PyDict::new_bound(py);
+        let role = match m.role {
+            litgraph_core::Role::System => "system",
+            litgraph_core::Role::User => "user",
+            litgraph_core::Role::Assistant => "assistant",
+            litgraph_core::Role::Tool => "tool",
+        };
+        d.set_item("role", role)?;
+        d.set_item("content", m.text_content())?;
+        if m.cache { d.set_item("cache", true)?; }
+        if let Some(id) = &m.tool_call_id { d.set_item("tool_call_id", id)?; }
+        list.append(d)?;
+    }
+    Ok(list)
+}
+
+fn parse_messages(py_msgs: &Bound<'_, PyList>) -> PyResult<Vec<Message>> {
+    use litgraph_core::{ContentPart, ImageSource};
+    let mut out = Vec::with_capacity(py_msgs.len());
+    for item in py_msgs.iter() {
+        let d: Bound<PyDict> = item.downcast_into()
+            .map_err(|_| PyValueError::new_err("message must be dict"))?;
+        let role_s: String = d
+            .get_item("role")?
+            .ok_or_else(|| PyValueError::new_err("missing 'role'"))?
+            .extract()?;
+        let role = match role_s.as_str() {
+            "system" => Role::System,
+            "user" => Role::User,
+            "assistant" => Role::Assistant,
+            "tool" => Role::Tool,
+            other => return Err(PyValueError::new_err(format!("bad role: {other}"))),
+        };
+        let content_obj = d
+            .get_item("content")?
+            .ok_or_else(|| PyValueError::new_err("missing 'content'"))?;
+
+        // Accept either:
+        //   1) plain string  → single Text part
+        //   2) list of dicts → multimodal parts
+        //      {"type": "text", "text": "..."}
+        //      {"type": "image_url", "image_url": {"url": "..."}}
+        //      {"type": "image", "image": {"media_type": "...", "data": "..."}}
+        let cache: bool = d
+            .get_item("cache")?
+            .map(|v| v.extract::<bool>().unwrap_or(false))
+            .unwrap_or(false);
+
+        if let Ok(s) = content_obj.extract::<String>() {
+            let mut m = Message::text(role, s);
+            m.cache = cache;
+            out.push(m);
+            continue;
+        }
+        let parts_list: Bound<PyList> = content_obj.downcast_into()
+            .map_err(|_| PyValueError::new_err("'content' must be a string or list of part dicts"))?;
+        let mut parts: Vec<ContentPart> = Vec::with_capacity(parts_list.len());
+        for raw_part in parts_list.iter() {
+            let pd: Bound<PyDict> = raw_part.downcast_into()
+                .map_err(|_| PyValueError::new_err("each content part must be a dict"))?;
+            let ptype: String = pd
+                .get_item("type")?
+                .ok_or_else(|| PyValueError::new_err("part missing 'type'"))?
+                .extract()?;
+            match ptype.as_str() {
+                "text" => {
+                    let t: String = pd
+                        .get_item("text")?
+                        .ok_or_else(|| PyValueError::new_err("text part missing 'text'"))?
+                        .extract()?;
+                    parts.push(ContentPart::Text { text: t });
+                }
+                "image_url" => {
+                    let inner: Bound<PyDict> = pd
+                        .get_item("image_url")?
+                        .ok_or_else(|| PyValueError::new_err("image_url part missing 'image_url'"))?
+                        .downcast_into()
+                        .map_err(|_| PyValueError::new_err("'image_url' must be a dict"))?;
+                    let url: String = inner
+                        .get_item("url")?
+                        .ok_or_else(|| PyValueError::new_err("image_url missing 'url'"))?
+                        .extract()?;
+                    parts.push(ContentPart::Image { source: ImageSource::Url { url } });
+                }
+                "image" => {
+                    let inner: Bound<PyDict> = pd
+                        .get_item("image")?
+                        .ok_or_else(|| PyValueError::new_err("image part missing 'image'"))?
+                        .downcast_into()
+                        .map_err(|_| PyValueError::new_err("'image' must be a dict"))?;
+                    let media_type: String = inner
+                        .get_item("media_type")?
+                        .ok_or_else(|| PyValueError::new_err("image missing 'media_type'"))?
+                        .extract()?;
+                    let data: String = inner
+                        .get_item("data")?
+                        .ok_or_else(|| PyValueError::new_err("image missing 'data'"))?
+                        .extract()?;
+                    parts.push(ContentPart::Image { source: ImageSource::Base64 { media_type, data } });
+                }
+                other => return Err(PyValueError::new_err(format!("unknown part type: {other}"))),
+            }
+        }
+        out.push(Message {
+            role,
+            content: parts,
+            tool_calls: vec![],
+            tool_call_id: None,
+            name: None,
+            cache,
+        });
+    }
+    Ok(out)
+}

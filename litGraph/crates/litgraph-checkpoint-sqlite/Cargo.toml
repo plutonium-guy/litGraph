@@ -1,0 +1,22 @@
+[package]
+name = "litgraph-checkpoint-sqlite"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "SQLite-backed Checkpointer for litGraph StateGraph — durable execution + HITL persistence."
+
+[dependencies]
+litgraph-graph.workspace = true
+async-trait.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync"] }
+rusqlite.workspace = true
+bincode.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }

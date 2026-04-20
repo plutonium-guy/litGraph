@@ -1,0 +1,168 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/litgraph-core",
+    "crates/litgraph-graph",
+    "crates/litgraph-retrieval",
+    "crates/litgraph-providers-openai",
+    "crates/litgraph-providers-anthropic",
+    "crates/litgraph-providers-gemini",
+    "crates/litgraph-providers-bedrock",
+    "crates/litgraph-providers-cohere",
+    "crates/litgraph-providers-voyage",
+    "crates/litgraph-providers-jina",
+    "crates/litgraph-stores-memory",
+    "crates/litgraph-stores-hnsw",
+    "crates/litgraph-stores-qdrant",
+    "crates/litgraph-stores-pgvector",
+    "crates/litgraph-stores-chroma",
+    "crates/litgraph-rerankers-cohere",
+    "crates/litgraph-rerankers-voyage",
+    "crates/litgraph-rerankers-jina",
+    "crates/litgraph-tools-search",
+    "crates/litgraph-tools-utils",
+    "crates/litgraph-splitters",
+    "crates/litgraph-loaders",
+    "crates/litgraph-agents",
+    "crates/litgraph-observability",
+    "crates/litgraph-cache",
+    "crates/litgraph-resilience",
+    "crates/litgraph-tokenizers",
+    "crates/litgraph-checkpoint-sqlite",
+    "crates/litgraph-checkpoint-postgres",
+    "crates/litgraph-checkpoint-redis",
+    "crates/litgraph-macros",
+    "crates/litgraph-bench",
+    "crates/litgraph-mcp",
+    "crates/litgraph-py",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/amiyamandal/litGraph"
+rust-version = "1.75"
+
+[workspace.dependencies]
+# Async + parallelism
+tokio = { version = "1.43", features = ["rt-multi-thread", "macros", "sync", "time", "io-util"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+tokio-stream = "0.1"
+futures = "0.3"
+futures-util = "0.3"
+async-stream = "0.3"
+
+# Caching
+moka = { version = "0.12", features = ["future"] }
+blake3 = "1"
+parking_lot = "0.12"
+
+# Crypto for AWS SigV4 (Bedrock)
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
+base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
+# Observability
+opentelemetry = "0.26"
+opentelemetry_sdk = { version = "0.26", features = ["rt-tokio"] }
+tracing-opentelemetry = "0.27"
+rayon = "1.10"
+async-trait = "0.1"
+
+# HTTP + SSE
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+eventsource-stream = "0.2"
+
+# Serde
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+schemars = "0.8"
+bincode = "1.3"
+rmp-serde = "1.3"
+
+# Graph
+petgraph = "0.6"
+
+# Errors + tracing
+thiserror = "1"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Retry + templating
+backon = { version = "1", features = ["tokio-sleep"] }
+minijinja = "2"
+
+# SQL + text
+rusqlite = { version = "0.32", features = ["bundled"] }
+tokio-postgres = { version = "0.7", features = ["with-chrono-0_4"] }
+deadpool-postgres = "0.14"
+redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
+regex = "1"
+unicode-segmentation = "1"
+tiktoken-rs = "0.6"
+evalexpr = "12"
+
+# Vector indexes
+instant-distance = "0.6"
+
+# Filesystem + globbing
+walkdir = "2"
+glob = "0.3"
+csv = "1.3"
+
+# Benchmarks + macros
+criterion = { version = "0.5", features = ["async_tokio"] }
+syn = { version = "2", features = ["full"] }
+quote = "1"
+proc-macro2 = "1"
+
+# Misc
+once_cell = "1"
+
+# PyO3
+pyo3 = { version = "0.22", features = ["abi3-py39", "anyhow", "macros"] }
+pyo3-async-runtimes = { version = "0.22", features = ["tokio-runtime"] }
+numpy = "0.22"
+
+# Internal crates
+litgraph-core = { path = "crates/litgraph-core", version = "0.1.0" }
+litgraph-graph = { path = "crates/litgraph-graph", version = "0.1.0" }
+litgraph-retrieval = { path = "crates/litgraph-retrieval", version = "0.1.0" }
+litgraph-providers-openai = { path = "crates/litgraph-providers-openai", version = "0.1.0" }
+litgraph-providers-anthropic = { path = "crates/litgraph-providers-anthropic", version = "0.1.0" }
+litgraph-providers-gemini = { path = "crates/litgraph-providers-gemini", version = "0.1.0" }
+litgraph-providers-bedrock = { path = "crates/litgraph-providers-bedrock", version = "0.1.0" }
+litgraph-providers-cohere = { path = "crates/litgraph-providers-cohere", version = "0.1.0" }
+litgraph-providers-voyage = { path = "crates/litgraph-providers-voyage", version = "0.1.0" }
+litgraph-providers-jina = { path = "crates/litgraph-providers-jina", version = "0.1.0" }
+litgraph-stores-memory = { path = "crates/litgraph-stores-memory", version = "0.1.0" }
+litgraph-stores-hnsw = { path = "crates/litgraph-stores-hnsw", version = "0.1.0" }
+litgraph-stores-qdrant = { path = "crates/litgraph-stores-qdrant", version = "0.1.0" }
+litgraph-stores-pgvector = { path = "crates/litgraph-stores-pgvector", version = "0.1.0" }
+litgraph-stores-chroma = { path = "crates/litgraph-stores-chroma", version = "0.1.0" }
+litgraph-rerankers-cohere = { path = "crates/litgraph-rerankers-cohere", version = "0.1.0" }
+litgraph-rerankers-voyage = { path = "crates/litgraph-rerankers-voyage", version = "0.1.0" }
+litgraph-rerankers-jina = { path = "crates/litgraph-rerankers-jina", version = "0.1.0" }
+litgraph-tools-search = { path = "crates/litgraph-tools-search", version = "0.1.0" }
+litgraph-tools-utils = { path = "crates/litgraph-tools-utils", version = "0.1.0" }
+litgraph-splitters = { path = "crates/litgraph-splitters", version = "0.1.0" }
+litgraph-loaders = { path = "crates/litgraph-loaders", version = "0.1.0" }
+litgraph-agents = { path = "crates/litgraph-agents", version = "0.1.0" }
+litgraph-observability = { path = "crates/litgraph-observability", version = "0.1.0" }
+litgraph-cache = { path = "crates/litgraph-cache", version = "0.1.0" }
+litgraph-resilience = { path = "crates/litgraph-resilience", version = "0.1.0" }
+litgraph-tokenizers = { path = "crates/litgraph-tokenizers", version = "0.1.0" }
+litgraph-macros = { path = "crates/litgraph-macros", version = "0.1.0" }
+litgraph-checkpoint-sqlite = { path = "crates/litgraph-checkpoint-sqlite", version = "0.1.0" }
+litgraph-checkpoint-postgres = { path = "crates/litgraph-checkpoint-postgres", version = "0.1.0" }
+litgraph-checkpoint-redis = { path = "crates/litgraph-checkpoint-redis", version = "0.1.0" }
+litgraph-mcp = { path = "crates/litgraph-mcp", version = "0.1.0" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+opt-level = 3

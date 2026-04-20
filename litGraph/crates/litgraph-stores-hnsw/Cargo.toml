@@ -1,0 +1,23 @@
+[package]
+name = "litgraph-stores-hnsw"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Embedded HNSW VectorStore for litGraph — pure Rust via instant-distance. Sub-millisecond search over 100k+ docs."
+
+[dependencies]
+litgraph-core.workspace = true
+litgraph-retrieval.workspace = true
+async-trait.workspace = true
+tokio = { workspace = true }
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+parking_lot.workspace = true
+rayon.workspace = true
+instant-distance.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }

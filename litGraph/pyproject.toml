@@ -1,0 +1,23 @@
+[build-system]
+requires = ["maturin>=1.13,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "litgraph"
+requires-python = ">=3.9"
+description = "Production-grade slim alternative to LangChain/LangGraph. Rust core, Python bindings."
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "License :: OSI Approved :: Apache Software License",
+]
+dynamic = ["version"]
+
+[tool.maturin]
+manifest-path = "crates/litgraph-py/Cargo.toml"
+module-name = "litgraph"
+features = ["pyo3/extension-module"]

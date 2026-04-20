@@ -1,0 +1,24 @@
+[package]
+name = "litgraph-stores-chroma"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "ChromaDB VectorStore for litGraph using the v1 HTTP API. Lazy collection get-or-create."
+
+[dependencies]
+litgraph-core.workspace = true
+litgraph-retrieval.workspace = true
+async-trait.workspace = true
+tokio = { workspace = true }
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+parking_lot.workspace = true
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }

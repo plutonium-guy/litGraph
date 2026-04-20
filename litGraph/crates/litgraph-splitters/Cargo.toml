@@ -1,0 +1,20 @@
+[package]
+name = "litgraph-splitters"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Text splitters — recursive character, token-sized, Markdown-aware. Rayon-parallel batch splitting."
+
+[dependencies]
+litgraph-core.workspace = true
+rayon.workspace = true
+tracing.workspace = true
+serde_json.workspace = true
+unicode-segmentation.workspace = true
+async-trait.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+async-trait.workspace = true
