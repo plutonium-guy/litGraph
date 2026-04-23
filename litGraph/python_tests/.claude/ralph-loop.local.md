@@ -1,10 +1,10 @@
 ---
 active: true
-iteration: 3
+iteration: 2
 session_id: 
 max_iterations: 0
 completion_promise: "DONE"
-started_at: "2026-04-18T05:04:27Z"
+started_at: "2026-04-22T13:04:47Z"
 ---
 
 I feel langchain and langraph is slow bloated framework. I think its not prod grade. Based on philosophy implementation should be easy. I want to build a similar framework with all of the capabilites, before implemenation create a feature list save it as md file. all heavy lifting implementaion should be in rust and use rust parallism too. do a research on this 

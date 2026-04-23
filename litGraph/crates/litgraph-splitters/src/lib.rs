@@ -5,10 +5,14 @@
 pub mod recursive;
 pub mod markdown;
 pub mod semantic;
+pub mod json;
+pub mod html_header;
 
 pub use recursive::{Language, RecursiveCharacterSplitter};
 pub use markdown::MarkdownHeaderSplitter;
 pub use semantic::SemanticChunker;
+pub use json::JsonSplitter;
+pub use html_header::HtmlHeaderSplitter;
 
 use litgraph_core::Document;
 use rayon::prelude::*;

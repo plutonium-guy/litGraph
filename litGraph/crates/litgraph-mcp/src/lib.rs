@@ -1,12 +1,18 @@
-//! Model Context Protocol (MCP) client for litGraph — stdio transport.
+//! Model Context Protocol (MCP) client for litGraph — stdio + HTTP transports.
 //!
 //! MCP is Anthropic's open JSON-RPC 2.0 protocol for connecting LLMs to
 //! external tools/resources/prompts. Servers exist for filesystem, github,
 //! slack, postgres, sqlite, fetch, brave-search, puppeteer, etc.
 //! See <https://modelcontextprotocol.io>.
 //!
-//! # What's supported (v1)
-//! - Stdio transport (spawn child process, line-delimited JSON-RPC).
+//! # Transports
+//! - `connect_stdio(program, args)` — spawn child process, line-delimited JSON-RPC.
+//! - `connect_http(url, headers)` — Streamable HTTP (per 2025-03-26 spec):
+//!   POST one JSON-RPC message, get one JSON response back. Server may set
+//!   `Mcp-Session-Id` on the initialize response; we echo it on every
+//!   subsequent request to keep stateful sessions alive.
+//!
+//! # What's supported
 //! - `initialize` handshake with capability declaration.
 //! - `tools/list` — query the server's tools.
 //! - `tools/call(name, args)` — execute a tool.
@@ -14,7 +20,10 @@
 //!   plugs straight into `ReactAgent` alongside our native tools.
 //!
 //! # Not yet supported
-//! - SSE / WebSocket transports.
+//! - SSE response bodies (`text/event-stream`) on POST. We accept-header only
+//!   `application/json`. Most hosted MCP servers honor this — if a server
+//!   strictly returns SSE we'd need to add a streaming parser.
+//! - WebSocket transport.
 //! - `resources/*` and `prompts/*` (less commonly used).
 //! - Server-initiated requests (sampling, roots, logging notifications).
 //!   Notifications from server are silently dropped — they never block
@@ -77,23 +86,106 @@ impl From<McpError> for Error {
     }
 }
 
-/// Spawn an MCP server as a child process and talk JSON-RPC over its stdio.
+/// Transport-specific state. Stdio holds the child + write half (the read
+/// half drives a background task that fills the PendingTable). HTTP holds
+/// the reqwest client + URL + session id (filled lazily after `initialize`).
+enum Transport {
+    Stdio {
+        stdin: Arc<AsyncMutex<ChildStdin>>,
+        /// Keep the Child alive — `Command::spawn` with `.kill_on_drop(true)`
+        /// will SIGKILL the process the moment this is dropped, so we MUST hold
+        /// it on the client (not the spawn-local). Wrapped in `Mutex<Option>` so
+        /// `Drop` can take it for an explicit kill if needed.
+        _child: Arc<Mutex<Option<Child>>>,
+    },
+    Http {
+        client: reqwest::Client,
+        url: String,
+        /// Set from the first response that carries `Mcp-Session-Id` (typically
+        /// `initialize`); echoed on every subsequent request.
+        session_id: Arc<Mutex<Option<String>>>,
+        /// Caller-supplied headers (e.g. `Authorization: Bearer ...`). Sent
+        /// on every request.
+        default_headers: Vec<(String, String)>,
+    },
+}
+
+impl Transport {
+    /// Send one JSON-RPC message. For stdio, returns `None` because the
+    /// reader task will dispatch any reply via the PendingTable. For HTTP,
+    /// returns `Some(value)` if the server replied with a JSON body; `None`
+    /// if the server returned an empty 2xx (notification ack).
+    async fn send(&self, bytes: Vec<u8>) -> std::result::Result<Option<Value>, McpError> {
+        match self {
+            Transport::Stdio { stdin, .. } => {
+                let mut s = stdin.lock().await;
+                s.write_all(&bytes)
+                    .await
+                    .map_err(|e| McpError::Transport(format!("write: {e}")))?;
+                s.write_all(b"\n")
+                    .await
+                    .map_err(|e| McpError::Transport(format!("write: {e}")))?;
+                s.flush()
+                    .await
+                    .map_err(|e| McpError::Transport(format!("flush: {e}")))?;
+                Ok(None)
+            }
+            Transport::Http { client, url, session_id, default_headers } => {
+                let mut req = client
+                    .post(url)
+                    .header("content-type", "application/json")
+                    .header("accept", "application/json")
+                    .body(bytes);
+                if let Some(sid) = session_id.lock().clone() {
+                    req = req.header("Mcp-Session-Id", sid);
+                }
+                for (k, v) in default_headers {
+                    req = req.header(k.as_str(), v.as_str());
+                }
+                let resp = req
+                    .send()
+                    .await
+                    .map_err(|e| McpError::Transport(format!("http: {e}")))?;
+                let status = resp.status();
+                // Capture session id BEFORE consuming the response body —
+                // any subsequent request needs to echo it.
+                if let Some(h) = resp.headers().get("Mcp-Session-Id") {
+                    if let Ok(s) = h.to_str() {
+                        *session_id.lock() = Some(s.to_string());
+                    }
+                }
+                let body_bytes = resp
+                    .bytes()
+                    .await
+                    .map_err(|e| McpError::Transport(format!("http body: {e}")))?;
+                if !status.is_success() {
+                    let snippet = String::from_utf8_lossy(&body_bytes);
+                    return Err(McpError::Transport(format!(
+                        "http {}: {}",
+                        status,
+                        snippet.chars().take(200).collect::<String>()
+                    )));
+                }
+                if body_bytes.is_empty() {
+                    return Ok(None);
+                }
+                let v: Value = serde_json::from_slice(&body_bytes)
+                    .map_err(|e| McpError::Protocol(format!("bad json response: {e}")))?;
+                Ok(Some(v))
+            }
+        }
+    }
+}
+
+/// JSON-RPC client over an MCP server. Built via `connect_stdio` or
+/// `connect_http`; thereafter both transports look identical to callers.
 ///
-/// The client owns:
-///   - `child_stdin` for sending requests
-///   - a background tokio task that reads `child_stdout` line-by-line and
-///     dispatches replies to per-request `oneshot` channels via `id`.
-///
-/// Drop = no explicit shutdown; the child gets reaped when its stdin closes.
+/// Drop = no explicit shutdown; for stdio, the child gets reaped when its
+/// stdin closes; for HTTP, the connection pool stays warm in reqwest.
 pub struct McpClient {
-    stdin: Arc<AsyncMutex<ChildStdin>>,
+    transport: Transport,
     table: Arc<Mutex<PendingTable>>,
     request_timeout: Duration,
-    /// Keep the Child alive — `Command::spawn` with `.kill_on_drop(true)`
-    /// will SIGKILL the process the moment this is dropped, so we MUST hold
-    /// it on the client (not the spawn-local). Wrapped in `Mutex<Option>` so
-    /// `Drop` can take it for an explicit kill if needed.
-    _child: Arc<Mutex<Option<Child>>>,
 }
 
 impl McpClient {
@@ -153,30 +245,7 @@ impl McpClient {
                                 continue;
                             }
                         };
-                        // Notifications (no `id`) are dropped; we don't ack
-                        // server-side initiated requests in v1.
-                        let id = match v.get("id").and_then(|i| i.as_u64()) {
-                            Some(id) => id,
-                            None => {
-                                debug!(method = ?v.get("method"), "mcp: notification ignored");
-                                continue;
-                            }
-                        };
-                        let mut t = table_for_reader.lock();
-                        if let Some(tx) = t.pending.remove(&id) {
-                            let result = if let Some(err) = v.get("error") {
-                                let code = err.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
-                                let msg = err
-                                    .get("message")
-                                    .and_then(|m| m.as_str())
-                                    .unwrap_or("")
-                                    .to_string();
-                                Err(McpError::Server { code, message: msg })
-                            } else {
-                                Ok(v.get("result").cloned().unwrap_or(Value::Null))
-                            };
-                            let _ = tx.send(result);
-                        }
+                        dispatch_response(&table_for_reader, v);
                     }
                     Ok(None) => {
                         debug!("mcp: child stdout closed");
@@ -196,15 +265,49 @@ impl McpClient {
         });
 
         let client = Self {
-            stdin: Arc::new(AsyncMutex::new(stdin)),
+            transport: Transport::Stdio {
+                stdin: Arc::new(AsyncMutex::new(stdin)),
+                _child: Arc::new(Mutex::new(Some(child))),
+            },
             table,
             request_timeout: Duration::from_secs(30),
-            _child: Arc::new(Mutex::new(Some(child))),
         };
 
-        // Initialize handshake. The server returns capabilities; we don't act
-        // on them in v1 but parsing succeeds.
-        let _: Value = client
+        client.handshake().await?;
+        Ok(client)
+    }
+
+    /// Connect to a hosted MCP server over HTTP. `url` is the JSON-RPC POST
+    /// endpoint (e.g. `https://mcp.example.com/v1`). `headers` is an
+    /// iterable of `(name, value)` for auth tokens etc; sent on every request.
+    pub async fn connect_http(
+        url: impl Into<String>,
+        headers: impl IntoIterator<Item = (String, String)>,
+    ) -> std::result::Result<Self, McpError> {
+        let client = reqwest::Client::builder()
+            .build()
+            .map_err(|e| McpError::Transport(format!("reqwest build: {e}")))?;
+        let table = Arc::new(Mutex::new(PendingTable {
+            next_id: 1,
+            pending: HashMap::new(),
+        }));
+        let client = Self {
+            transport: Transport::Http {
+                client,
+                url: url.into(),
+                session_id: Arc::new(Mutex::new(None)),
+                default_headers: headers.into_iter().collect(),
+            },
+            table,
+            request_timeout: Duration::from_secs(30),
+        };
+        client.handshake().await?;
+        Ok(client)
+    }
+
+    /// Run `initialize` + `notifications/initialized`. Shared by both transports.
+    async fn handshake(&self) -> std::result::Result<(), McpError> {
+        let _: Value = self
             .request(
                 "initialize",
                 json!({
@@ -215,8 +318,8 @@ impl McpClient {
             )
             .await?;
         // Per spec, send `notifications/initialized` (no id, no response).
-        client.notify("notifications/initialized", json!({})).await?;
-        Ok(client)
+        self.notify("notifications/initialized", json!({})).await?;
+        Ok(())
     }
 
     pub fn with_timeout(mut self, t: Duration) -> Self {
@@ -242,17 +345,24 @@ impl McpClient {
         });
         let bytes = serde_json::to_vec(&msg)
             .map_err(|e| McpError::Transport(format!("serialize: {e}")))?;
-        {
-            let mut s = self.stdin.lock().await;
-            s.write_all(&bytes)
-                .await
-                .map_err(|e| McpError::Transport(format!("write: {e}")))?;
-            s.write_all(b"\n")
-                .await
-                .map_err(|e| McpError::Transport(format!("write: {e}")))?;
-            s.flush()
-                .await
-                .map_err(|e| McpError::Transport(format!("flush: {e}")))?;
+        match self.transport.send(bytes).await {
+            Ok(Some(v)) => {
+                // HTTP path: the response is right here. Dispatch it through
+                // the same table so request/response correlation logic stays
+                // in one place. (Server might still echo our id, or send back
+                // a notification — `dispatch_response` handles both.)
+                dispatch_response(&self.table, v);
+            }
+            Ok(None) => {
+                // Stdio: reader task will fill the slot. HTTP empty body would
+                // be a protocol violation for a request, but the timeout below
+                // catches it.
+            }
+            Err(e) => {
+                // Drop the pending slot so it doesn't leak.
+                self.table.lock().pending.remove(&id);
+                return Err(e);
+            }
         }
         match tokio::time::timeout(self.request_timeout, rx).await {
             Ok(Ok(r)) => r,
@@ -268,16 +378,10 @@ impl McpClient {
         let msg = json!({ "jsonrpc": "2.0", "method": method, "params": params });
         let bytes = serde_json::to_vec(&msg)
             .map_err(|e| McpError::Transport(format!("serialize: {e}")))?;
-        let mut s = self.stdin.lock().await;
-        s.write_all(&bytes)
-            .await
-            .map_err(|e| McpError::Transport(format!("write: {e}")))?;
-        s.write_all(b"\n")
-            .await
-            .map_err(|e| McpError::Transport(format!("write: {e}")))?;
-        s.flush()
-            .await
-            .map_err(|e| McpError::Transport(format!("flush: {e}")))?;
+        // Notification: no id, no response expected. HTTP servers typically
+        // return 202 Accepted with empty body; we ignore any body that does
+        // come back (no id → can't correlate anyway).
+        let _ = self.transport.send(bytes).await?;
         Ok(())
     }
 
@@ -323,6 +427,34 @@ impl McpClient {
     }
 }
 
+/// Route one parsed JSON-RPC message to its waiter. Notifications (no `id`)
+/// are dropped silently. Used by the stdio reader task AND by HTTP's inline
+/// dispatch — both share the same correlation logic.
+fn dispatch_response(table: &Arc<Mutex<PendingTable>>, v: Value) {
+    let id = match v.get("id").and_then(|i| i.as_u64()) {
+        Some(id) => id,
+        None => {
+            debug!(method = ?v.get("method"), "mcp: notification ignored");
+            return;
+        }
+    };
+    let mut t = table.lock();
+    if let Some(tx) = t.pending.remove(&id) {
+        let result = if let Some(err) = v.get("error") {
+            let code = err.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
+            let msg = err
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("")
+                .to_string();
+            Err(McpError::Server { code, message: msg })
+        } else {
+            Ok(v.get("result").cloned().unwrap_or(Value::Null))
+        };
+        let _ = tx.send(result);
+    }
+}
+
 /// Adapter — exposes a single MCP-server-side tool through litGraph's `Tool`
 /// trait so `ReactAgent` can call it the same as a native tool.
 pub struct McpTool {
@@ -363,6 +495,7 @@ impl Tool for McpTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncReadExt;
 
     /// End-to-end: spawn `python3 fake_server.py` (a script that speaks the
     /// MCP wire format on stdio) and verify we can list + call its tools.
@@ -478,12 +611,233 @@ for line in sys.stdin:
             }
         });
         let client = McpClient {
-            stdin: Arc::new(AsyncMutex::new(stdin)),
+            transport: Transport::Stdio {
+                stdin: Arc::new(AsyncMutex::new(stdin)),
+                _child: Arc::new(Mutex::new(Some(child))),
+            },
             table,
             request_timeout: Duration::from_millis(150),
-            _child: Arc::new(Mutex::new(Some(child))),
         };
         let err = client.list_tools().await.unwrap_err();
         assert!(format!("{err}").to_lowercase().contains("timeout"), "got: {err}");
+    }
+
+    // ---------------------------------------------------------------- HTTP
+
+    /// Tiny TCP-level fake HTTP server for the MCP HTTP-transport tests.
+    /// Reads ONE request, dispatches by JSON-RPC method, writes one JSON
+    /// response (with optional `Mcp-Session-Id` header), closes the connection.
+    /// Configure with `behavior` callbacks so each test can shape the reply
+    /// without copy-pasting the socket plumbing.
+    struct FakeHttpServer {
+        url: String,
+        seen_session_ids: Arc<Mutex<Vec<Option<String>>>>,
+        seen_auth: Arc<Mutex<Vec<Option<String>>>>,
+        _shutdown: oneshot::Sender<()>,
+    }
+
+    fn parse_http_request(buf: &[u8]) -> Option<(String, Vec<u8>)> {
+        let split = buf.windows(4).position(|w| w == b"\r\n\r\n")?;
+        let head = std::str::from_utf8(&buf[..split]).ok()?.to_string();
+        let body = buf[split + 4..].to_vec();
+        Some((head, body))
+    }
+
+    fn header_value<'a>(head: &'a str, name: &str) -> Option<&'a str> {
+        for line in head.lines().skip(1) {
+            if let Some((k, v)) = line.split_once(':') {
+                if k.trim().eq_ignore_ascii_case(name) {
+                    return Some(v.trim());
+                }
+            }
+        }
+        None
+    }
+
+    async fn read_full_request(
+        stream: &mut tokio::net::TcpStream,
+    ) -> std::io::Result<(String, Vec<u8>)> {
+        let mut buf = Vec::with_capacity(4096);
+        let mut chunk = [0u8; 4096];
+        let head;
+        let mut body;
+        loop {
+            let n = stream.read(&mut chunk).await?;
+            if n == 0 {
+                return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "eof"));
+            }
+            buf.extend_from_slice(&chunk[..n]);
+            if let Some((h, b)) = parse_http_request(&buf) {
+                head = h;
+                body = b;
+                break;
+            }
+        }
+        // If body is shorter than Content-Length, read more.
+        let cl: usize = header_value(&head, "content-length")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        while body.len() < cl {
+            let n = stream.read(&mut chunk).await?;
+            if n == 0 {
+                break;
+            }
+            body.extend_from_slice(&chunk[..n]);
+        }
+        Ok((head, body))
+    }
+
+    /// Spawn a fake HTTP MCP server. `respond` returns the JSON body for a
+    /// given request; the server adds `Mcp-Session-Id: test-sid` on the
+    /// initialize reply only (so the client must echo it on later requests).
+    async fn fake_http_server() -> FakeHttpServer {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seen_session_ids: Arc<Mutex<Vec<Option<String>>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_auth: Arc<Mutex<Vec<Option<String>>>> = Arc::new(Mutex::new(Vec::new()));
+        let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
+
+        let session_log = seen_session_ids.clone();
+        let auth_log = seen_auth.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = &mut shutdown_rx => break,
+                    Ok((mut stream, _)) = listener.accept() => {
+                        let session_log = session_log.clone();
+                        let auth_log = auth_log.clone();
+                        tokio::spawn(async move {
+                            let (head, body) = match read_full_request(&mut stream).await {
+                                Ok(t) => t,
+                                Err(_) => return,
+                            };
+                            session_log.lock().push(
+                                header_value(&head, "Mcp-Session-Id").map(|s| s.to_string())
+                            );
+                            auth_log.lock().push(
+                                header_value(&head, "Authorization").map(|s| s.to_string())
+                            );
+                            let req: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+                            let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
+                            let rid = req.get("id").cloned();
+                            let mut extra_headers = String::new();
+                            let body_value = match method {
+                                "initialize" => {
+                                    extra_headers.push_str("Mcp-Session-Id: test-sid\r\n");
+                                    json!({
+                                        "jsonrpc":"2.0", "id": rid,
+                                        "result": {
+                                            "protocolVersion":"2024-11-05",
+                                            "capabilities":{"tools":{}},
+                                            "serverInfo":{"name":"fake-http","version":"0"},
+                                        }
+                                    })
+                                }
+                                "notifications/initialized" => {
+                                    // 202-style empty ack. Write headers + zero body.
+                                    let resp = "HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n";
+                                    let _ = stream.write_all(resp.as_bytes()).await;
+                                    return;
+                                }
+                                "tools/list" => json!({
+                                    "jsonrpc":"2.0", "id": rid,
+                                    "result": {"tools":[
+                                        {"name":"echo","description":"Echoes back.",
+                                         "inputSchema":{"type":"object","properties":{"text":{"type":"string"}},"required":["text"]}},
+                                    ]}
+                                }),
+                                "tools/call" => {
+                                    let p = req.get("params").cloned().unwrap_or(Value::Null);
+                                    let name = p.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                                    let args = p.get("arguments").cloned().unwrap_or(Value::Null);
+                                    if name == "echo" {
+                                        let text = args.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                                        json!({
+                                            "jsonrpc":"2.0", "id": rid,
+                                            "result": {"content":[{"type":"text","text": format!("you said: {text}")}], "isError": false}
+                                        })
+                                    } else {
+                                        json!({
+                                            "jsonrpc":"2.0", "id": rid,
+                                            "error": {"code":-32601,"message":"unknown tool"}
+                                        })
+                                    }
+                                }
+                                _ => json!({
+                                    "jsonrpc":"2.0", "id": rid,
+                                    "error": {"code":-32601,"message":"unknown method"}
+                                }),
+                            };
+                            let body_bytes = serde_json::to_vec(&body_value).unwrap();
+                            let resp = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{}\r\n",
+                                body_bytes.len(),
+                                extra_headers,
+                            );
+                            let _ = stream.write_all(resp.as_bytes()).await;
+                            let _ = stream.write_all(&body_bytes).await;
+                        });
+                    }
+                }
+            }
+        });
+
+        FakeHttpServer {
+            url: format!("http://127.0.0.1:{port}/mcp"),
+            seen_session_ids,
+            seen_auth,
+            _shutdown: shutdown_tx,
+        }
+    }
+
+    #[tokio::test]
+    async fn http_lists_and_calls_tools_against_fake_server() {
+        let server = fake_http_server().await;
+        let client = McpClient::connect_http(&server.url, std::iter::empty())
+            .await
+            .expect("connect_http should succeed");
+        let tools = client.list_tools().await.unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "echo");
+        let res = client.call_tool("echo", json!({"text": "world"})).await.unwrap();
+        assert_eq!(res["content"][0]["text"].as_str().unwrap(), "you said: world");
+    }
+
+    #[tokio::test]
+    async fn http_session_id_is_captured_then_echoed() {
+        let server = fake_http_server().await;
+        let client = McpClient::connect_http(&server.url, std::iter::empty()).await.unwrap();
+        // Trigger a couple more requests after handshake.
+        client.list_tools().await.unwrap();
+        client.call_tool("echo", json!({"text":"hi"})).await.unwrap();
+        let log = server.seen_session_ids.lock().clone();
+        // Order: initialize (no sid), notifications/initialized (sid set),
+        // tools/list (sid), tools/call (sid).
+        assert_eq!(log.len(), 4, "got: {:?}", log);
+        assert_eq!(log[0], None, "initialize must not carry a session id");
+        for (i, sid) in log.iter().enumerate().skip(1) {
+            assert_eq!(sid.as_deref(), Some("test-sid"), "request {i}: expected echoed sid");
+        }
+    }
+
+    #[tokio::test]
+    async fn http_default_headers_are_sent_on_every_request() {
+        let server = fake_http_server().await;
+        let headers = vec![("Authorization".to_string(), "Bearer secret-token".to_string())];
+        let client = McpClient::connect_http(&server.url, headers).await.unwrap();
+        client.list_tools().await.unwrap();
+        let log = server.seen_auth.lock().clone();
+        assert!(log.len() >= 2);
+        for (i, v) in log.iter().enumerate() {
+            assert_eq!(v.as_deref(), Some("Bearer secret-token"), "request {i}: missing auth");
+        }
+    }
+
+    #[tokio::test]
+    async fn http_server_error_surfaces_as_mcp_server_error() {
+        let server = fake_http_server().await;
+        let client = McpClient::connect_http(&server.url, std::iter::empty()).await.unwrap();
+        let err = client.call_tool("nope", json!({})).await.unwrap_err();
+        assert!(format!("{err}").contains("unknown tool"), "got: {err}");
     }
 }

@@ -13,6 +13,12 @@ pub struct Checkpoint {
     /// Bincode-serialized state snapshot (fast, compact).
     pub state: Vec<u8>,
     pub next_nodes: Vec<String>,
+    /// Pending Send-style fan-out commands queued for the next superstep.
+    /// Each carries a target node + a state override to fork into for that
+    /// specific sub-invocation (LangGraph `Send` semantics). `#[serde(default)]`
+    /// keeps old checkpoints (pre-iter-77) readable — they just had no sends.
+    #[serde(default)]
+    pub next_sends: Vec<crate::interrupt::Command>,
     pub pending_interrupt: Option<crate::interrupt::Interrupt>,
     pub ts_ms: u64,
 }

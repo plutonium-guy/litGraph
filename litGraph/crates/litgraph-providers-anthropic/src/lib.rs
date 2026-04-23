@@ -36,6 +36,14 @@ pub struct AnthropicConfig {
     pub anthropic_version: String,
     pub max_tokens: u32,
     pub on_request: Option<RequestInspector>,
+    /// Extended-thinking budget in tokens. `None` (default) = thinking
+    /// disabled. `Some(N)` enables Claude 4 Opus's reasoning trace and
+    /// requests up to N tokens of internal thinking before the visible
+    /// response. Required minimum is model-dependent (typically ≥ 1024);
+    /// the API rejects sub-minimum values, so don't second-guess too
+    /// aggressively. The thinking content arrives in `ChatResponse.message`
+    /// as additional text content prefixed with `[thinking]`.
+    pub thinking_budget_tokens: Option<u32>,
 }
 
 impl std::fmt::Debug for AnthropicConfig {
@@ -61,7 +69,16 @@ impl AnthropicConfig {
             anthropic_version: ANTHROPIC_VERSION.into(),
             max_tokens: 4096,
             on_request: None,
+            thinking_budget_tokens: None,
         }
+    }
+
+    /// Enable extended thinking with the given budget in tokens. Pass `None`
+    /// to disable. The Anthropic API enforces a model-specific minimum
+    /// (typically 1024) — values below it are rejected at request time.
+    pub fn with_thinking(mut self, budget_tokens: Option<u32>) -> Self {
+        self.thinking_budget_tokens = budget_tokens;
+        self
     }
 
     pub fn with_base_url(mut self, url: impl Into<String>) -> Self {
@@ -125,6 +142,14 @@ impl AnthropicChat {
         if let Some(t) = opts.temperature { body["temperature"] = json!(t); }
         if let Some(t) = opts.top_p { body["top_p"] = json!(t); }
         if let Some(ref s) = opts.stop { body["stop_sequences"] = json!(s); }
+        // Extended thinking — Claude 4 Opus reasoning trace. Only included
+        // when configured; the field's presence implies enablement.
+        if let Some(budget) = self.cfg.thinking_budget_tokens {
+            body["thinking"] = json!({
+                "type": "enabled",
+                "budget_tokens": budget,
+            });
+        }
 
         // Build the tools array. User tools first, then optionally a synthesized
         // `submit_response` tool for structured-output forcing.
@@ -389,12 +414,30 @@ fn parse_response(model: &str, v: Value) -> Result<ChatResponse> {
         .and_then(|c| c.as_array())
         .ok_or_else(|| Error::provider("missing content blocks"))?;
     let mut text = String::new();
+    let mut thinking = String::new();
     let mut tool_calls = Vec::new();
     let mut synthesized_struct_output: Option<Value> = None;
     for b in blocks {
         match b.get("type").and_then(|t| t.as_str()) {
             Some("text") => {
                 if let Some(t) = b.get("text").and_then(|v| v.as_str()) { text.push_str(t); }
+            }
+            // Extended-thinking block (Claude 4 Opus). Collect separately so
+            // the visible response stays in `text` and callers can opt-in to
+            // see the reasoning trace via the `[thinking]...[/thinking]` prefix.
+            Some("thinking") => {
+                if let Some(t) = b.get("thinking").and_then(|v| v.as_str()) {
+                    if !thinking.is_empty() { thinking.push('\n'); }
+                    thinking.push_str(t);
+                }
+            }
+            // Anthropic also emits "redacted_thinking" blocks when the model's
+            // reasoning is filtered for safety. Treat as opaque — note its
+            // presence so callers know thinking happened, without leaking the
+            // (intentionally hidden) content.
+            Some("redacted_thinking") => {
+                if !thinking.is_empty() { thinking.push('\n'); }
+                thinking.push_str("[redacted]");
             }
             Some("tool_use") => {
                 let name = b.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
@@ -419,6 +462,12 @@ fn parse_response(model: &str, v: Value) -> Result<ChatResponse> {
     if let Some(args) = synthesized_struct_output.take() {
         // Replace text with serialized JSON args.
         text = args.to_string();
+    }
+    // Surface extended-thinking trace as a prefix on the visible text so it
+    // round-trips through the cross-provider `ChatResponse.text` API. Callers
+    // who don't care can ignore it; callers who do can split on the markers.
+    if !thinking.is_empty() {
+        text = format!("[thinking]\n{thinking}\n[/thinking]\n{text}");
     }
     let mut finish = match v.get("stop_reason").and_then(|v| v.as_str()).unwrap_or("end_turn") {
         "max_tokens" => FinishReason::Length,
@@ -517,5 +566,83 @@ mod tests {
         assert_eq!(r.usage.cache_read, 500);
         assert_eq!(r.usage.prompt, 10);
         assert_eq!(r.usage.completion, 5);
+    }
+
+    #[test]
+    fn thinking_disabled_by_default_no_thinking_field_in_body() {
+        let chat = anthropic();
+        let body = chat.body(&[Message::user("hi")], &ChatOptions::default(), false);
+        assert!(body.get("thinking").is_none(),
+            "thinking field leaked into body when not configured");
+    }
+
+    #[test]
+    fn with_thinking_includes_enabled_block_in_body() {
+        let cfg = AnthropicConfig::new("k", "claude-opus-4-7-1m")
+            .with_thinking(Some(2048));
+        let chat = AnthropicChat::new(cfg).unwrap();
+        let body = chat.body(&[Message::user("hi")], &ChatOptions::default(), false);
+        let t = body["thinking"].as_object().expect("thinking must be object");
+        assert_eq!(t["type"], json!("enabled"));
+        assert_eq!(t["budget_tokens"], json!(2048));
+    }
+
+    #[test]
+    fn with_thinking_none_disables() {
+        let cfg = AnthropicConfig::new("k", "claude-opus-4-7-1m")
+            .with_thinking(Some(2048))
+            .with_thinking(None);  // disable again
+        let chat = AnthropicChat::new(cfg).unwrap();
+        let body = chat.body(&[Message::user("hi")], &ChatOptions::default(), false);
+        assert!(body.get("thinking").is_none());
+    }
+
+    #[test]
+    fn parse_response_extracts_thinking_block_into_text_prefix() {
+        let v = json!({
+            "content": [
+                {"type": "thinking", "thinking": "Let me work this out step by step..."},
+                {"type": "text", "text": "The answer is 42."},
+            ],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 10, "output_tokens": 5},
+        });
+        let r = parse_response("claude-opus-4-7", v).unwrap();
+        let txt = r.message.text_content();
+        assert!(txt.starts_with("[thinking]\nLet me work this out step by step...\n[/thinking]\n"));
+        assert!(txt.ends_with("The answer is 42."));
+    }
+
+    #[test]
+    fn parse_response_handles_redacted_thinking() {
+        let v = json!({
+            "content": [
+                {"type": "redacted_thinking", "data": "ENC..."},
+                {"type": "text", "text": "Done."},
+            ],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 5, "output_tokens": 1},
+        });
+        let r = parse_response("claude-opus-4-7", v).unwrap();
+        let txt = r.message.text_content();
+        // Redacted blocks are noted but don't leak content.
+        assert!(txt.contains("[thinking]\n[redacted]\n[/thinking]"));
+        assert!(txt.contains("Done."));
+    }
+
+    #[test]
+    fn parse_response_concatenates_multiple_thinking_blocks() {
+        let v = json!({
+            "content": [
+                {"type": "thinking", "thinking": "step 1"},
+                {"type": "thinking", "thinking": "step 2"},
+                {"type": "text", "text": "result"},
+            ],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+        });
+        let r = parse_response("claude-opus-4-7", v).unwrap();
+        let txt = r.message.text_content();
+        assert!(txt.contains("[thinking]\nstep 1\nstep 2\n[/thinking]"));
     }
 }

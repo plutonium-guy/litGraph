@@ -17,7 +17,7 @@ litgraph-graph.workspace = true
 litgraph-agents.workspace = true
 litgraph-retrieval.workspace = true
 litgraph-splitters.workspace = true
-litgraph-loaders.workspace = true
+litgraph-loaders = { workspace = true, features = ["pdf", "docx"] }
 litgraph-providers-openai.workspace = true
 litgraph-providers-anthropic.workspace = true
 litgraph-providers-gemini.workspace = true

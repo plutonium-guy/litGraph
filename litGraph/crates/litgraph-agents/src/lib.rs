@@ -9,5 +9,5 @@
 pub mod react;
 pub mod supervisor;
 
-pub use react::{ReactAgent, ReactAgentConfig, AgentState};
+pub use react::{AgentEvent, AgentEventStream, AgentState, ReactAgent, ReactAgentConfig};
 pub use supervisor::{SupervisorAgent, SupervisorConfig};

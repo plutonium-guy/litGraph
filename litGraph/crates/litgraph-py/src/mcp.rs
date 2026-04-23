@@ -2,7 +2,11 @@
 //!
 //! ```python
 //! from litgraph.mcp import McpClient
+//! # Local subprocess server:
 //! client = McpClient.connect_stdio("npx", ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"])
+//! # Hosted HTTP server (auth via headers):
+//! client = McpClient.connect_http("https://mcp.example.com/v1",
+//!                                 headers={"Authorization": "Bearer ..."})
 //! tools = client.tools()                       # ready for ReactAgent
 //! agent = ReactAgent(model=chat, tools=tools)
 //! ```
@@ -49,6 +53,42 @@ impl PyMcpClient {
             block_on_compat(async move {
                 let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
                 let c = McpClient::connect_stdio(&program, &arg_refs)
+                    .await
+                    .map_err(|e| litgraph_core::Error::other(e.to_string()))?;
+                Ok::<_, litgraph_core::Error>(c.with_timeout(Duration::from_secs(timeout_s)))
+            })
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })?;
+        Ok(Self { inner: Arc::new(inner) })
+    }
+
+    /// Connect to a hosted MCP server over HTTP (Streamable HTTP transport).
+    /// `url` is the JSON-RPC POST endpoint. `headers` is an optional dict of
+    /// header name → value sent on every request (typical use:
+    /// `{"Authorization": "Bearer ..."}`). The session id from the
+    /// `initialize` response is captured and echoed automatically.
+    #[staticmethod]
+    #[pyo3(signature = (url, headers=None, timeout_s=30))]
+    fn connect_http<'py>(
+        py: Python<'py>,
+        url: String,
+        headers: Option<Bound<'py, PyDict>>,
+        timeout_s: u64,
+    ) -> PyResult<Self> {
+        let header_pairs: Vec<(String, String)> = if let Some(d) = headers {
+            let mut v = Vec::with_capacity(d.len());
+            for (k, val) in d.iter() {
+                let kk: String = k.extract()?;
+                let vv: String = val.extract()?;
+                v.push((kk, vv));
+            }
+            v
+        } else {
+            Vec::new()
+        };
+        let inner: McpClient = py.allow_threads(|| {
+            block_on_compat(async move {
+                let c = McpClient::connect_http(url, header_pairs)
                     .await
                     .map_err(|e| litgraph_core::Error::other(e.to_string()))?;
                 Ok::<_, litgraph_core::Error>(c.with_timeout(Duration::from_secs(timeout_s)))
@@ -111,7 +151,7 @@ impl PyMcpClient {
         Ok(out)
     }
 
-    fn __repr__(&self) -> String { "McpClient(stdio)".into() }
+    fn __repr__(&self) -> String { "McpClient()".into() }
 }
 
 /// Python wrapper around a single MCP-server-side tool (an `Arc<dyn Tool>`).

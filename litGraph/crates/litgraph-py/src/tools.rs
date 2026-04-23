@@ -14,7 +14,7 @@ use litgraph_tools_search::{
 };
 use litgraph_tools_utils::{
     CalculatorTool, FsRoot, HttpRequestConfig, HttpRequestTool, ListDirectoryTool, ReadFileTool,
-    ShellTool, WriteFileTool,
+    ShellTool, SqliteQueryTool, WriteFileTool,
 };
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
@@ -33,7 +33,208 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyListDirectoryTool>()?;
     m.add_class::<PyShellTool>()?;
     m.add_class::<PyDuckDuckGoSearchTool>()?;
+    m.add_class::<PySqliteQueryTool>()?;
+    m.add_function(pyo3::wrap_pyfunction!(tool, m)?)?;
     Ok(())
+}
+
+/// Decorator that converts a Python function into a `FunctionTool` with the
+/// JSON Schema auto-derived from type hints + docstring. Behaviour:
+///
+/// - The function's `__name__` becomes the tool name (override with `name=`).
+/// - The function's docstring's first paragraph becomes the description.
+///   If no docstring, the description is the function name.
+/// - Each non-default parameter is `required`; `Optional[X]` and parameters
+///   with defaults are omitted from `required`.
+/// - Type → JSON-schema mapping: `str → string`, `int → integer`,
+///   `float → number`, `bool → boolean`, `list/tuple → array`, `dict → object`.
+///   Anything else → `string` (no failure: agents can usually still produce
+///   sensible strings; we don't want decoration to crash on exotic types).
+///
+/// ```python
+/// @tool
+/// def search(query: str, limit: int = 10) -> list[str]:
+///     "Search the docs for `query`."
+///     ...
+/// agent = ReactAgent(model=chat, tools=[search])  # search is now a FunctionTool
+/// ```
+#[pyfunction]
+#[pyo3(signature = (func, name=None))]
+fn tool<'py>(
+    py: Python<'py>,
+    func: Bound<'py, PyAny>,
+    name: Option<String>,
+) -> PyResult<PyFunctionTool> {
+    use pyo3::types::PyTuple;
+    let inspect = py.import_bound("inspect")?;
+    let sig = inspect.call_method1("signature", (&func,))?;
+    let parameters_attr = sig.getattr("parameters")?;
+    let items: Vec<(String, Bound<'_, PyAny>)> = parameters_attr
+        .call_method0("items")?
+        .iter()?
+        .map(|item| {
+            let pair: Bound<'_, PyTuple> = item?.downcast_into()
+                .map_err(|_| pyo3::exceptions::PyTypeError::new_err("bad signature item"))?;
+            let key: String = pair.get_item(0)?.extract()?;
+            let val = pair.get_item(1)?;
+            Ok((key, val))
+        })
+        .collect::<PyResult<_>>()?;
+
+    let mut props = serde_json::Map::new();
+    let mut required: Vec<Value> = Vec::new();
+    let empty = inspect.getattr("Parameter")?.getattr("empty")?;
+
+    for (param_name, param) in &items {
+        // Skip *args, **kwargs — they're variadic; agents shouldn't use them.
+        let kind: i32 = param.getattr("kind")?.extract().unwrap_or(0);
+        // VAR_POSITIONAL=2, VAR_KEYWORD=4 in Python's inspect.
+        if kind == 2 || kind == 4 { continue; }
+
+        let annotation = param.getattr("annotation")?;
+        let json_type = annotation_to_json_type(py, &annotation, &empty)?;
+
+        let mut prop = serde_json::Map::new();
+        prop.insert("type".into(), Value::String(json_type));
+        // For lists, add a permissive items schema (agents usually emit homogeneous arrays).
+        if let Some(t) = prop.get("type").and_then(|v| v.as_str()) {
+            if t == "array" {
+                prop.insert("items".into(), serde_json::json!({}));
+            }
+        }
+        props.insert(param_name.clone(), Value::Object(prop));
+
+        let default = param.getattr("default")?;
+        let has_default = !default.is(&empty);
+        if !has_default {
+            required.push(Value::String(param_name.clone()));
+        }
+    }
+
+    let schema = serde_json::json!({
+        "type": "object",
+        "properties": props,
+        "required": required,
+    });
+
+    let final_name = name
+        .or_else(|| func.getattr("__name__").ok().and_then(|n| n.extract::<String>().ok()))
+        .unwrap_or_else(|| "tool".into());
+    let description = func.getattr("__doc__").ok()
+        .and_then(|d| d.extract::<String>().ok())
+        .map(|d| {
+            // Take first paragraph (stop at first blank line) and trim.
+            d.split("\n\n").next().unwrap_or("").trim().to_string()
+        })
+        .filter(|d| !d.is_empty())
+        .unwrap_or_else(|| final_name.clone());
+
+    Ok(PyFunctionTool {
+        inner: Arc::new(FunctionToolImpl {
+            name: final_name,
+            description,
+            parameters: schema,
+            func: func.unbind(),
+        }),
+    })
+}
+
+/// Map a Python type annotation to a JSON-schema type string.
+/// Conservative + lossy on purpose — exotic types fall back to "string"
+/// rather than crashing decoration. The agent will usually figure it out.
+fn annotation_to_json_type(
+    py: Python<'_>,
+    annotation: &Bound<'_, PyAny>,
+    empty: &Bound<'_, PyAny>,
+) -> PyResult<String> {
+    if annotation.is(empty) { return Ok("string".into()); }
+
+    // Strip Optional[X] → X for type-name purposes; rely on `default=` to
+    // mark optional-ness in the JSON-schema `required` list.
+    let typing = py.import_bound("typing")?;
+    let get_origin = typing.getattr("get_origin")?;
+    let get_args = typing.getattr("get_args")?;
+    let union_type = typing.getattr("Union")?;
+
+    let origin = get_origin.call1((annotation,))?;
+    let args = get_args.call1((annotation,))?;
+    if !origin.is_none() && origin.is(&union_type) {
+        // Union: find the first non-None arg.
+        let none_type = py.None().into_bound(py).get_type();
+        for a in args.iter()? {
+            let a = a?;
+            if !a.is(&none_type) {
+                return annotation_to_json_type(py, &a, empty);
+            }
+        }
+    }
+    // For generics like `list[str]` or `dict[str, int]`, the origin tells us
+    // the container shape.
+    if !origin.is_none() {
+        if let Ok(name) = origin.getattr("__name__").and_then(|n| n.extract::<String>()) {
+            return Ok(match name.as_str() {
+                "list" | "tuple" | "set" | "frozenset" => "array",
+                "dict" => "object",
+                _ => "string",
+            }.into());
+        }
+    }
+    // Plain types (no generic args). `int`, `str`, etc.
+    if let Ok(name) = annotation.getattr("__name__").and_then(|n| n.extract::<String>()) {
+        return Ok(match name.as_str() {
+            "str" => "string",
+            "int" => "integer",
+            "float" => "number",
+            "bool" => "boolean",
+            "bytes" => "string",
+            "list" | "tuple" | "set" | "frozenset" => "array",
+            "dict" => "object",
+            _ => "string",
+        }.into());
+    }
+    Ok("string".into())
+}
+
+/// Read-only SQLite query tool with table allowlist + row caps. Three guard
+/// rails: engine-level READONLY open, statement-keyword gate (SELECT/WITH
+/// only by default; PRAGMA opt-in), table allowlist. Blocks `WITH ... DELETE`
+/// CTE writes via dedicated regex.
+#[pyclass(name = "SqliteQueryTool", module = "litgraph.tools")]
+#[derive(Clone)]
+pub struct PySqliteQueryTool { pub(crate) inner: Arc<SqliteQueryTool> }
+
+#[pymethods]
+impl PySqliteQueryTool {
+    #[new]
+    #[pyo3(signature = (
+        db_path, allowed_tables, read_only=true, max_rows=1000,
+        max_output_bytes=262_144, allow_pragma=false,
+    ))]
+    fn new(
+        db_path: String,
+        allowed_tables: Vec<String>,
+        read_only: bool,
+        max_rows: usize,
+        max_output_bytes: usize,
+        allow_pragma: bool,
+    ) -> PyResult<Self> {
+        let t = SqliteQueryTool::new(db_path, allowed_tables)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?
+            .with_read_only(read_only)
+            .with_max_rows(max_rows)
+            .with_max_output_bytes(max_output_bytes)
+            .with_pragma(allow_pragma);
+        Ok(Self { inner: Arc::new(t) })
+    }
+    #[getter] fn name(&self) -> &'static str { "sqlite_query" }
+    fn __repr__(&self) -> String {
+        format!("SqliteQueryTool(allowlist={}, read_only={})",
+            self.inner.allowed_tables.len(), self.inner.read_only)
+    }
+}
+
+impl PySqliteQueryTool {
+    pub(crate) fn as_tool(&self) -> Arc<dyn Tool> { self.inner.clone() as Arc<dyn Tool> }
 }
 
 /// DuckDuckGo Instant Answer search — no API key required. Limited results
@@ -283,7 +484,16 @@ impl Tool for FunctionToolImpl {
         let name = self.name.clone();
         let val: Result<Value, String> = Python::with_gil(|py| {
             let py_args = json_to_py(py, &args).map_err(|e| e.to_string())?;
-            let ret = self.func.call1(py, (py_args,)).map_err(|e| e.to_string())?;
+            // Tool args arrive as a JSON object — unpack to kwargs so a
+            // `def add(a, b)` tool gets `add(a=2, b=3)`, not `add({"a":2,"b":3})`.
+            // Non-object args (rare) fall back to single positional.
+            let ret = if let Ok(d) = py_args.downcast::<PyDict>() {
+                self.func
+                    .call_bound(py, pyo3::types::PyTuple::empty_bound(py), Some(d))
+                    .map_err(|e| e.to_string())?
+            } else {
+                self.func.call1(py, (py_args,)).map_err(|e| e.to_string())?
+            };
             let mut bound = ret.bind(py).clone();
             if bound.hasattr("__await__").map_err(|e| e.to_string())? {
                 let asyncio = py.import_bound("asyncio").map_err(|e| e.to_string())?;

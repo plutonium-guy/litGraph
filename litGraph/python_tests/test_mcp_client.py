@@ -165,6 +165,120 @@ def test_react_agent_accepts_mcp_tools_and_actually_calls_them():
         srv.shutdown()
 
 
+def _spawn_fake_mcp_http_server():
+    """Inline MCP-over-HTTP server for connect_http tests.
+
+    Mirrors the stdio server wire format but speaks JSON-RPC over POST
+    bodies. Sets `Mcp-Session-Id: test-sid` on the initialize response so
+    we can verify the client echoes it on later requests."""
+    import http.server
+    import threading
+
+    seen = {"session_ids": [], "auth": []}
+
+    class FakeMcpHttp(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            n = int(self.headers.get("content-length", "0"))
+            body = self.rfile.read(n)
+            seen["session_ids"].append(self.headers.get("Mcp-Session-Id"))
+            seen["auth"].append(self.headers.get("Authorization"))
+            req = json.loads(body) if body else {}
+            method = req.get("method")
+            rid = req.get("id")
+            extra_headers = []
+            if method == "initialize":
+                extra_headers.append(("Mcp-Session-Id", "test-sid"))
+                payload = {"jsonrpc": "2.0", "id": rid, "result": {
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {"tools": {}},
+                    "serverInfo": {"name": "fake-http", "version": "0"},
+                }}
+            elif method == "notifications/initialized":
+                self.send_response(202)
+                self.send_header("content-length", "0")
+                self.end_headers()
+                return
+            elif method == "tools/list":
+                payload = {"jsonrpc": "2.0", "id": rid, "result": {"tools": [
+                    {"name": "echo", "description": "Echo back text.",
+                     "inputSchema": {"type": "object",
+                                     "properties": {"text": {"type": "string"}},
+                                     "required": ["text"]}},
+                ]}}
+            elif method == "tools/call":
+                params = req.get("params", {})
+                if params.get("name") == "echo":
+                    text = params.get("arguments", {}).get("text", "")
+                    payload = {"jsonrpc": "2.0", "id": rid, "result": {
+                        "content": [{"type": "text", "text": "you said: " + text}],
+                        "isError": False,
+                    }}
+                else:
+                    payload = {"jsonrpc": "2.0", "id": rid,
+                               "error": {"code": -32601, "message": "unknown tool"}}
+            else:
+                payload = {"jsonrpc": "2.0", "id": rid,
+                           "error": {"code": -32601, "message": "unknown method"}}
+            body_out = json.dumps(payload).encode()
+            self.send_response(200)
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", str(len(body_out)))
+            for k, v in extra_headers:
+                self.send_header(k, v)
+            self.end_headers()
+            self.wfile.write(body_out)
+
+        def log_message(self, *a, **kw): pass
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), FakeMcpHttp)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv, srv.server_address[1], seen
+
+
+def test_connect_http_lists_and_calls_tools():
+    srv, port, _seen = _spawn_fake_mcp_http_server()
+    try:
+        client = McpClient.connect_http(f"http://127.0.0.1:{port}/mcp")
+        tools = client.list_tools()
+        assert [t["name"] for t in tools] == ["echo"]
+        out = client.call_tool("echo", {"text": "from-http"})
+        assert out["content"][0]["text"] == "you said: from-http"
+    finally:
+        srv.shutdown()
+
+
+def test_connect_http_session_id_echoed_after_initialize():
+    """Server returns Mcp-Session-Id on initialize; client must echo it on
+    every subsequent request — that's what makes stateful hosted servers work."""
+    srv, port, seen = _spawn_fake_mcp_http_server()
+    try:
+        client = McpClient.connect_http(f"http://127.0.0.1:{port}/mcp")
+        client.list_tools()
+        client.call_tool("echo", {"text": "x"})
+    finally:
+        srv.shutdown()
+    # Order: initialize, notifications/initialized, tools/list, tools/call.
+    assert len(seen["session_ids"]) == 4, seen["session_ids"]
+    assert seen["session_ids"][0] is None, "initialize must NOT carry a session id"
+    for sid in seen["session_ids"][1:]:
+        assert sid == "test-sid"
+
+
+def test_connect_http_default_headers_sent_on_every_request():
+    srv, port, seen = _spawn_fake_mcp_http_server()
+    try:
+        client = McpClient.connect_http(
+            f"http://127.0.0.1:{port}/mcp",
+            headers={"Authorization": "Bearer secret"},
+        )
+        client.list_tools()
+    finally:
+        srv.shutdown()
+    assert len(seen["auth"]) >= 2
+    for v in seen["auth"]:
+        assert v == "Bearer secret"
+
+
 if __name__ == "__main__":
     fns = [
         test_list_tools_returns_descriptors,
@@ -172,6 +286,9 @@ if __name__ == "__main__":
         test_call_unknown_tool_raises,
         test_tools_helper_returns_react_agent_compatible_list,
         test_react_agent_accepts_mcp_tools_and_actually_calls_them,
+        test_connect_http_lists_and_calls_tools,
+        test_connect_http_session_id_echoed_after_initialize,
+        test_connect_http_default_headers_sent_on_every_request,
     ]
     failed = []
     for fn in fns:

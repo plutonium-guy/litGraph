@@ -2,8 +2,8 @@
 //! rayon-parallel directory traversal on Rust threads.
 
 use litgraph_loaders::{
-    CsvLoader, DirectoryLoader, HtmlLoader, JsonLinesLoader, JsonLoader, Loader, MarkdownLoader,
-    TextLoader, WebLoader, default_dispatcher,
+    CsvLoader, DirectoryLoader, DocxLoader, HtmlLoader, JsonLinesLoader, JsonLoader, Loader,
+    MarkdownLoader, PdfLoader, TextLoader, WebLoader, default_dispatcher,
 };
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
@@ -20,7 +20,62 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyCsvLoader>()?;
     m.add_class::<PyHtmlLoader>()?;
     m.add_class::<PyJsonLoader>()?;
+    m.add_class::<PyPdfLoader>()?;
+    m.add_class::<PyDocxLoader>()?;
     Ok(())
+}
+
+/// PDF text loader — pure-Rust via lopdf. `per_page=True` (default) yields
+/// one Document per page with `metadata["page"]` 1-indexed; `per_page=False`
+/// returns a single Document joined with form-feed (`\f`) separators.
+///
+/// ```python
+/// from litgraph.loaders import PdfLoader
+/// docs = PdfLoader("report.pdf").load()
+/// # docs[0].metadata["page"] == 1, docs[0].metadata["source"] == "report.pdf"
+/// ```
+#[pyclass(name = "PdfLoader", module = "litgraph.loaders")]
+pub struct PyPdfLoader { inner: PdfLoader }
+
+#[pymethods]
+impl PyPdfLoader {
+    #[new]
+    #[pyo3(signature = (path, per_page=true))]
+    fn new(path: String, per_page: bool) -> Self {
+        Self { inner: PdfLoader::new(path).with_per_page(per_page) }
+    }
+
+    fn load<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        let docs = py.allow_threads(|| self.inner.load()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string())))?;
+        docs_to_pylist(py, docs)
+    }
+}
+
+/// DOCX text loader — extracts the flowing text from `word/document.xml`.
+/// Pure-Rust via `zip` + `quick-xml`; no native deps. Single Document per
+/// file (DOCX has no first-class page concept). Paragraph breaks become
+/// `\n`; explicit `<w:br/>` becomes `\n`; `<w:tab/>` becomes `\t`.
+///
+/// ```python
+/// from litgraph.loaders import DocxLoader
+/// docs = DocxLoader("memo.docx").load()
+/// ```
+#[pyclass(name = "DocxLoader", module = "litgraph.loaders")]
+pub struct PyDocxLoader { inner: DocxLoader }
+
+#[pymethods]
+impl PyDocxLoader {
+    #[new]
+    fn new(path: String) -> Self {
+        Self { inner: DocxLoader::new(path) }
+    }
+
+    fn load<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        let docs = py.allow_threads(|| self.inner.load()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string())))?;
+        docs_to_pylist(py, docs)
+    }
 }
 
 /// Single-file JSON loader. `pointer` (dot-separated, supports numeric array

@@ -101,6 +101,8 @@ fn row_to_checkpoint(row: &tokio_postgres::Row) -> std::result::Result<Checkpoin
         step: step as u64,
         state,
         next_nodes,
+        // Postgres backend doesn't persist next_sends yet — see SQLite note.
+        next_sends: Vec::new(),
         pending_interrupt,
         ts_ms: ts_ms as u64,
     })

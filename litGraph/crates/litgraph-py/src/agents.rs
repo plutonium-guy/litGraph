@@ -1,27 +1,31 @@
 //! `ReactAgent` + `SupervisorAgent` Python bindings.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use litgraph_agents::{ReactAgent, ReactAgentConfig, SupervisorAgent, SupervisorConfig};
+use futures::StreamExt;
+use litgraph_agents::{AgentEvent, ReactAgent, ReactAgentConfig, SupervisorAgent, SupervisorConfig};
 use litgraph_core::{ChatModel, ChatOptions, Message, Role};
-use pyo3::exceptions::{PyRuntimeError, PyValueError};
+use pyo3::exceptions::{PyRuntimeError, PyStopIteration, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
+use tokio::sync::mpsc;
 
 use crate::providers::{
     PyAnthropicChat, PyBedrockChat, PyCohereChat, PyGeminiChat, PyOpenAIChat,
 };
-use crate::runtime::block_on_compat;
+use crate::runtime::{block_on_compat, rt};
 use crate::tools::{
     PyBraveSearchTool, PyCalculatorTool, PyDuckDuckGoSearchTool, PyFunctionTool, PyHttpRequestTool,
-    PyListDirectoryTool, PyReadFileTool, PyShellTool, PyTavilySearchTool, PyWriteFileTool,
+    PyListDirectoryTool, PyReadFileTool, PyShellTool, PySqliteQueryTool, PyTavilySearchTool,
+    PyWriteFileTool,
 };
 use crate::mcp::PyMcpTool;
 
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyReactAgent>()?;
     m.add_class::<PySupervisorAgent>()?;
+    m.add_class::<PyAgentEventStream>()?;
     Ok(())
 }
 
@@ -87,11 +91,13 @@ impl PyReactAgent {
                 tool_vec.push(s.as_tool());
             } else if let Ok(d) = item.extract::<PyRef<PyDuckDuckGoSearchTool>>() {
                 tool_vec.push(d.as_tool());
+            } else if let Ok(sq) = item.extract::<PyRef<PySqliteQueryTool>>() {
+                tool_vec.push(sq.as_tool());
             } else {
                 return Err(PyValueError::new_err(
                     "tools must be FunctionTool, BraveSearchTool, TavilySearchTool, \
                      DuckDuckGoSearchTool, CalculatorTool, HttpRequestTool, ReadFileTool, \
-                     WriteFileTool, ListDirectoryTool, ShellTool, or McpTool",
+                     WriteFileTool, ListDirectoryTool, ShellTool, SqliteQueryTool, or McpTool",
                 ));
             }
         }
@@ -115,6 +121,58 @@ impl PyReactAgent {
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))
         })?;
         state_to_py_dict(py, &state)
+    }
+
+    /// Stream per-turn events. Returns an iterator of dicts — each carries a
+    /// `type` field (`iteration_start`, `llm_message`, `tool_call_start`,
+    /// `tool_call_result`, `final`, `max_iterations_reached`) plus
+    /// event-specific payload fields. Iteration terminates after `final` or
+    /// `max_iterations_reached`.
+    ///
+    /// ```python
+    /// for ev in agent.stream("what is 2+3"):
+    ///     print(ev["type"], ev)
+    /// ```
+    fn stream<'py>(&self, _py: Python<'py>, user: String) -> PyResult<Py<PyAgentEventStream>> {
+        let agent = self.inner.clone();
+        // Spawn the stream pump on the shared runtime so Python's __next__
+        // can block on the receiver. Buffer 64 events — plenty for agent
+        // granularity (token streaming this is NOT).
+        let (tx, rx) = mpsc::channel::<litgraph_graph::Result<AgentEvent>>(64);
+        rt().spawn(async move {
+            let mut s = agent.stream(user);
+            while let Some(ev) = s.next().await {
+                if tx.send(ev).await.is_err() {
+                    break;
+                }
+            }
+        });
+        Python::with_gil(|py| {
+            Py::new(py, PyAgentEventStream { rx: Arc::new(Mutex::new(Some(rx))) })
+        })
+    }
+
+    /// Token-streaming variant of `stream()`. Same event shape, plus a new
+    /// `token_delta` event ({"type":"token_delta", "text": "..."}) emitted
+    /// during each model turn as the LLM generates characters. Use this for
+    /// chat UIs that render the assistant reply progressively.
+    ///
+    /// Buffer is 256 (vs 64 for `stream()`) because token deltas can arrive
+    /// faster than Python can drain.
+    fn stream_tokens<'py>(&self, _py: Python<'py>, user: String) -> PyResult<Py<PyAgentEventStream>> {
+        let agent = self.inner.clone();
+        let (tx, rx) = mpsc::channel::<litgraph_graph::Result<AgentEvent>>(256);
+        rt().spawn(async move {
+            let mut s = agent.stream_tokens(user);
+            while let Some(ev) = s.next().await {
+                if tx.send(ev).await.is_err() {
+                    break;
+                }
+            }
+        });
+        Python::with_gil(|py| {
+            Py::new(py, PyAgentEventStream { rx: Arc::new(Mutex::new(Some(rx))) })
+        })
     }
 }
 
@@ -181,6 +239,94 @@ fn state_to_py_dict<'py>(
     }
     out.set_item("messages", msgs)?;
     Ok(out)
+}
+
+/// Python-facing agent event stream. Each `__next__` blocks on the receiver
+/// with GIL released, converts one `AgentEvent` into a dict.
+#[pyclass(name = "AgentEventStream", module = "litgraph.agents")]
+pub struct PyAgentEventStream {
+    rx: Arc<Mutex<Option<mpsc::Receiver<litgraph_graph::Result<AgentEvent>>>>>,
+}
+
+#[pymethods]
+impl PyAgentEventStream {
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> { slf }
+
+    fn __next__<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let slot = self.rx.clone();
+        let ev = py.allow_threads(|| {
+            let mut guard = slot.lock().expect("poisoned");
+            let mut rx = match guard.take() {
+                Some(r) => r,
+                None => return None,
+            };
+            let got = block_on_compat(async { rx.recv().await });
+            *guard = Some(rx);
+            got
+        });
+        match ev {
+            Some(Ok(e)) => agent_event_to_py_dict(py, &e),
+            Some(Err(e)) => Err(PyRuntimeError::new_err(e.to_string())),
+            None => {
+                *self.rx.lock().expect("poisoned") = None;
+                Err(PyStopIteration::new_err("agent event stream exhausted"))
+            }
+        }
+    }
+}
+
+fn agent_event_to_py_dict<'py>(
+    py: Python<'py>,
+    ev: &AgentEvent,
+) -> PyResult<Bound<'py, PyDict>> {
+    let d = PyDict::new_bound(py);
+    match ev {
+        AgentEvent::IterationStart { iteration } => {
+            d.set_item("type", "iteration_start")?;
+            d.set_item("iteration", *iteration)?;
+        }
+        AgentEvent::TokenDelta { text } => {
+            d.set_item("type", "token_delta")?;
+            d.set_item("text", text)?;
+        }
+        AgentEvent::LlmMessage { message } => {
+            d.set_item("type", "llm_message")?;
+            d.set_item("message", message_to_py_dict(py, message)?)?;
+        }
+        AgentEvent::ToolCallStart { call_id, name, arguments } => {
+            d.set_item("type", "tool_call_start")?;
+            d.set_item("call_id", call_id)?;
+            d.set_item("name", name)?;
+            d.set_item("arguments", arguments.to_string())?;
+        }
+        AgentEvent::ToolCallResult { call_id, name, result, is_error, duration_ms } => {
+            d.set_item("type", "tool_call_result")?;
+            d.set_item("call_id", call_id)?;
+            d.set_item("name", name)?;
+            d.set_item("result", result)?;
+            d.set_item("is_error", *is_error)?;
+            d.set_item("duration_ms", *duration_ms)?;
+        }
+        AgentEvent::Final { messages, iterations } => {
+            d.set_item("type", "final")?;
+            d.set_item("iterations", *iterations)?;
+            let msgs = PyList::empty_bound(py);
+            for m in messages {
+                msgs.append(message_to_py_dict(py, m)?)?;
+            }
+            d.set_item("messages", msgs)?;
+        }
+        AgentEvent::MaxIterationsReached { messages, iterations } => {
+            d.set_item("type", "max_iterations_reached")?;
+            d.set_item("iterations", *iterations)?;
+            let msgs = PyList::empty_bound(py);
+            for m in messages {
+                msgs.append(message_to_py_dict(py, m)?)?;
+            }
+            d.set_item("messages", msgs)?;
+        }
+    }
+    Ok(d)
 }
 
 fn message_to_py_dict<'py>(py: Python<'py>, m: &Message) -> PyResult<Bound<'py, PyDict>> {

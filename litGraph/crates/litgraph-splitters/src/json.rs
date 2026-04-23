@@ -57,9 +57,9 @@ impl JsonSplitter {
     fn flush_chunk(&self, path: &str, chunk: Map<String, Value>, out: &mut Vec<String>) {
         if chunk.is_empty() { return; }
         let mut wrapper = Map::new();
-        if !path.is_empty() {
-            wrapper.insert("_path".into(), Value::String(path.to_string()));
-        }
+        // Always tag with `_path` (empty for root) so consumers can identify
+        // every chunk's origin uniformly without checking for two markers.
+        wrapper.insert("_path".into(), Value::String(path.to_string()));
         for (k, v) in chunk {
             wrapper.insert(k, v);
         }

@@ -171,6 +171,29 @@ class JinaReranker:
         top_k: int,
     ) -> list[dict[str, Any]]: ...
 
+class HybridRetriever:
+    def __init__(
+        self,
+        children: list["VectorRetriever | RerankingRetriever | Bm25Index"],
+        rrf_k: float = 60.0,
+        per_child_k: int | None = None,
+    ) -> None: ...
+    def retrieve(self, query: str, k: int) -> list[dict[str, Any]]: ...
+
+def evaluate_retrieval(
+    retriever: "VectorRetriever | RerankingRetriever",
+    dataset: list[dict[str, Any]],
+    k: int = 10,
+    max_concurrency: int = 8,
+) -> dict[str, Any]: ...
+
+def evaluate_generation(
+    judge: Any,
+    cases: list[dict[str, Any]],
+    max_concurrency: int = 8,
+    skip_correctness: bool = False,
+) -> dict[str, Any]: ...
+
 class RerankingRetriever:
     def __init__(
         self,

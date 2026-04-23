@@ -19,7 +19,7 @@ pub mod instrument;
 pub mod otel;
 
 pub use callback::{Callback, CallbackBus, CallbackHandle};
-pub use cost::{CostTracker, PriceSheet, ModelPrice};
+pub use cost::{default_prices, CostTracker, ModelPrice, PriceSheet};
 pub use event::{Event, Phase};
 pub use instrument::InstrumentedChatModel;
 pub use otel::{LangSmithConfig, langsmith_otlp_endpoint, langsmith_otlp_headers};

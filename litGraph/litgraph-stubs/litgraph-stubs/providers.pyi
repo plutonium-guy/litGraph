@@ -51,6 +51,7 @@ class AnthropicChat:
         timeout_s: int = 120,
         max_tokens: int = 4096,
         on_request: Any | None = None,
+        thinking_budget: int | None = None,
     ) -> None: ...
     def invoke(
         self,

@@ -11,13 +11,36 @@
 
 use std::sync::Arc;
 
-use litgraph_observability::{CostTracker, ModelPrice, PriceSheet};
+use litgraph_observability::{default_prices as core_default_prices, CostTracker, ModelPrice, PriceSheet};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
+use pyo3::wrap_pyfunction;
 
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyCostTracker>()?;
+    m.add_function(wrap_pyfunction!(default_prices, m)?)?;
     Ok(())
+}
+
+/// Built-in price sheet for the major hosted-LLM endpoints (OpenAI, Anthropic,
+/// Gemini, Cohere, Voyage, Jina, Groq, Mistral, DeepSeek, xAI, Bedrock Titan).
+/// Per-million-token USD. Use as
+///
+/// ```python
+/// CostTracker(default_prices())
+/// ```
+///
+/// Override individual entries by mutating the returned dict before passing
+/// it to `CostTracker`. Versioned model IDs (e.g. `gpt-4o-2024-11-20`) match
+/// the short keys via case-insensitive longest-substring lookup at runtime.
+#[pyfunction]
+fn default_prices<'py>(py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+    let sheet = core_default_prices();
+    let d = PyDict::new_bound(py);
+    for (k, v) in sheet.iter() {
+        d.set_item(k, (v.prompt_per_mtok, v.completion_per_mtok))?;
+    }
+    Ok(d)
 }
 
 /// Accumulates token + USD usage across LLM calls. Subscribe to a provider via

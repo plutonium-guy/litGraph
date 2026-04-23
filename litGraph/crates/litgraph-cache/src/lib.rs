@@ -13,8 +13,12 @@ pub mod backend;
 pub mod cached_model;
 pub mod key;
 pub mod semantic;
+pub mod embedding_cache;
 
 pub use backend::{Cache, MemoryCache, SqliteCache};
 pub use cached_model::CachedModel;
 pub use key::cache_key;
 pub use semantic::{SemanticCache, SemanticCachedModel};
+pub use embedding_cache::{
+    embedding_key, CachedEmbeddings, EmbeddingCache, MemoryEmbeddingCache, SqliteEmbeddingCache,
+};

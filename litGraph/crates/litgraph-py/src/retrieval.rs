@@ -4,7 +4,9 @@ use std::sync::Arc;
 
 use litgraph_core::Document;
 use litgraph_retrieval::store::VectorStore;
-use litgraph_retrieval::{Bm25Index, Reranker, RerankingRetriever, Retriever, VectorRetriever};
+use litgraph_retrieval::{
+    Bm25Index, HybridRetriever, Reranker, RerankingRetriever, Retriever, VectorRetriever,
+};
 use litgraph_rerankers_cohere::{CohereConfig, CohereReranker};
 use litgraph_rerankers_jina::{JinaRerankConfig, JinaReranker};
 use litgraph_rerankers_voyage::{VoyageRerankConfig, VoyageReranker};
@@ -17,6 +19,7 @@ use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
+use crate::cache::PyCachedEmbeddings;
 use crate::embeddings::{
     PyBedrockEmbeddings, PyCohereEmbeddings, PyFunctionEmbeddings, PyGeminiEmbeddings,
     PyJinaEmbeddings, PyOpenAIEmbeddings, PyVoyageEmbeddings,
@@ -35,6 +38,9 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyVoyageReranker>()?;
     m.add_class::<PyJinaReranker>()?;
     m.add_class::<PyRerankingRetriever>()?;
+    m.add_class::<PyHybridRetriever>()?;
+    m.add_function(pyo3::wrap_pyfunction!(evaluate_retrieval, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(evaluate_generation, m)?)?;
     Ok(())
 }
 
@@ -77,6 +83,12 @@ impl PyBm25Index {
 
     fn __len__(&self) -> usize { self.inner.len() }
     fn __repr__(&self) -> String { format!("Bm25Index(docs={})", self.inner.len()) }
+}
+
+impl PyBm25Index {
+    pub(crate) fn as_retriever(&self) -> Arc<dyn Retriever> {
+        self.inner.clone() as Arc<dyn Retriever>
+    }
 }
 
 /// In-memory vector store. Use for tests + <10k-doc corpora. For production,
@@ -556,9 +568,11 @@ impl PyVectorRetriever {
             be.as_embeddings()
         } else if let Ok(je) = embeddings.extract::<PyRef<PyJinaEmbeddings>>() {
             je.as_embeddings()
+        } else if let Ok(ce) = embeddings.extract::<PyRef<PyCachedEmbeddings>>() {
+            ce.as_embeddings()
         } else {
             return Err(pyo3::exceptions::PyTypeError::new_err(
-                "embeddings must be FunctionEmbeddings, OpenAIEmbeddings, CohereEmbeddings, VoyageEmbeddings, GeminiEmbeddings, BedrockEmbeddings, or JinaEmbeddings",
+                "embeddings must be FunctionEmbeddings, OpenAIEmbeddings, CohereEmbeddings, VoyageEmbeddings, GeminiEmbeddings, BedrockEmbeddings, JinaEmbeddings, or CachedEmbeddings",
             ));
         };
         let s: Arc<dyn VectorStore> = if let Ok(mem) = store.extract::<PyRef<PyMemoryVectorStore>>() {
@@ -822,4 +836,199 @@ impl PyRerankingRetriever {
         })?;
         docs_to_pylist(py, results)
     }
+}
+
+impl PyRerankingRetriever {
+    pub(crate) fn as_retriever(&self) -> Arc<dyn Retriever> {
+        self.inner.clone() as Arc<dyn Retriever>
+    }
+}
+
+/// Evaluate a retriever against a labeled dataset of (query, relevant_ids).
+/// Returns a dict with `recall_macro` / `mrr_macro` / `ndcg_macro` /
+/// `n_queries` / `k` and a `per_query` list. `dataset` items shape:
+/// `{"query": str, "relevant_ids": [str]}`.
+#[pyfunction]
+#[pyo3(signature = (retriever, dataset, k=10, max_concurrency=8))]
+fn evaluate_retrieval<'py>(
+    py: Python<'py>,
+    retriever: Bound<'py, PyAny>,
+    dataset: Bound<'py, PyList>,
+    k: usize,
+    max_concurrency: usize,
+) -> PyResult<Bound<'py, PyDict>> {
+    let r_arc: Arc<dyn Retriever> = if let Ok(v) = retriever.extract::<PyRef<PyVectorRetriever>>() {
+        v.as_retriever()
+    } else if let Ok(rr) = retriever.extract::<PyRef<PyRerankingRetriever>>() {
+        rr.as_retriever()
+    } else {
+        return Err(pyo3::exceptions::PyTypeError::new_err(
+            "retriever must be VectorRetriever or RerankingRetriever",
+        ));
+    };
+
+    let mut cases: Vec<litgraph_retrieval::EvalCase> = Vec::with_capacity(dataset.len());
+    for item in dataset.iter() {
+        let d: Bound<PyDict> = item.downcast_into()
+            .map_err(|_| pyo3::exceptions::PyValueError::new_err("each dataset entry must be a dict"))?;
+        let query: String = d.get_item("query")?
+            .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("missing 'query'"))?
+            .extract()?;
+        let relevant_ids: Vec<String> = d.get_item("relevant_ids")?
+            .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("missing 'relevant_ids'"))?
+            .extract()?;
+        cases.push(litgraph_retrieval::EvalCase { query, relevant_ids });
+    }
+
+    let cfg = litgraph_retrieval::EvalConfig { k, max_concurrency };
+    let report = py.allow_threads(|| {
+        block_on_compat(async move {
+            litgraph_retrieval::evaluate_retrieval(r_arc, &cases, cfg).await
+        })
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    })?;
+
+    let out = PyDict::new_bound(py);
+    out.set_item("k", report.k)?;
+    out.set_item("n_queries", report.n_queries)?;
+    out.set_item("recall_macro", report.recall_macro)?;
+    out.set_item("mrr_macro", report.mrr_macro)?;
+    out.set_item("ndcg_macro", report.ndcg_macro)?;
+    let per_query = PyList::empty_bound(py);
+    for q in report.per_query {
+        let qd = PyDict::new_bound(py);
+        qd.set_item("query", q.query)?;
+        qd.set_item("recall", q.recall)?;
+        qd.set_item("mrr", q.mrr)?;
+        qd.set_item("ndcg", q.ndcg)?;
+        qd.set_item("returned_ids", q.returned_ids)?;
+        per_query.append(qd)?;
+    }
+    out.set_item("per_query", per_query)?;
+    Ok(out)
+}
+
+/// Hybrid retriever — fan out across N child retrievers concurrently,
+/// fuse via Reciprocal Rank Fusion (RRF). Direct win over LangChain's
+/// sequential ensemble pattern. Children can be any mix of
+/// VectorRetriever / RerankingRetriever / Bm25Index.
+#[pyclass(name = "HybridRetriever", module = "litgraph.retrieval")]
+pub struct PyHybridRetriever {
+    inner: Arc<HybridRetriever>,
+}
+
+#[pymethods]
+impl PyHybridRetriever {
+    /// `children` is a list of retrievers (heterogeneous OK). `rrf_k` is the
+    /// RRF discount constant (default 60.0; lower = sharper rank emphasis).
+    /// `per_child_k` controls over-fetch from each branch (default `k * 2`).
+    #[new]
+    #[pyo3(signature = (children, rrf_k=60.0, per_child_k=None))]
+    fn new(
+        children: Bound<'_, PyList>,
+        rrf_k: f32,
+        per_child_k: Option<usize>,
+    ) -> PyResult<Self> {
+        if children.len() < 2 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "HybridRetriever needs at least 2 children",
+            ));
+        }
+        let mut child_arcs: Vec<Arc<dyn Retriever>> = Vec::with_capacity(children.len());
+        for item in children.iter() {
+            let r: Arc<dyn Retriever> = if let Ok(v) = item.extract::<PyRef<PyVectorRetriever>>() {
+                v.as_retriever()
+            } else if let Ok(rr) = item.extract::<PyRef<PyRerankingRetriever>>() {
+                rr.as_retriever()
+            } else if let Ok(b) = item.extract::<PyRef<PyBm25Index>>() {
+                b.as_retriever()
+            } else {
+                return Err(pyo3::exceptions::PyTypeError::new_err(
+                    "each child must be VectorRetriever, RerankingRetriever, or Bm25Index",
+                ));
+            };
+            child_arcs.push(r);
+        }
+        let mut h = HybridRetriever::new(child_arcs).with_rrf_k(rrf_k);
+        if let Some(p) = per_child_k { h = h.with_per_child_k(p); }
+        Ok(Self { inner: Arc::new(h) })
+    }
+
+    fn retrieve<'py>(&self, py: Python<'py>, query: String, k: usize) -> PyResult<Bound<'py, PyList>> {
+        let r = self.inner.clone();
+        let results = py.allow_threads(move || {
+            block_on_compat(async move { r.retrieve(&query, k).await })
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })?;
+        docs_to_pylist(py, results)
+    }
+
+    fn __repr__(&self) -> String {
+        format!("HybridRetriever(children={}, rrf_k={})",
+            self.inner.children.len(), self.inner.rrf_k)
+    }
+}
+
+/// LLM-judge generation eval — faithfulness + answer-relevance + (optional)
+/// correctness. Each case dispatches concurrent LLM calls bounded by
+/// `max_concurrency`. Returns macro-averaged scores plus per-case breakdowns.
+///
+/// `judge` is any provider (use a CHEAP model — gpt-4o-mini, claude-haiku —
+/// since each case = 2 or 3 LLM calls). `cases` shape:
+/// `[{"query": str, "answer": str, "contexts": [str], "reference_answer"?: str}]`.
+#[pyfunction]
+#[pyo3(signature = (judge, cases, max_concurrency=8, skip_correctness=false))]
+fn evaluate_generation<'py>(
+    py: Python<'py>,
+    judge: Bound<'py, PyAny>,
+    cases: Bound<'py, PyList>,
+    max_concurrency: usize,
+    skip_correctness: bool,
+) -> PyResult<Bound<'py, PyDict>> {
+    let chat = crate::agents::extract_chat_model(&judge)?;
+
+    let mut parsed: Vec<litgraph_retrieval::GenerationCase> = Vec::with_capacity(cases.len());
+    for item in cases.iter() {
+        let d: Bound<PyDict> = item.downcast_into()
+            .map_err(|_| pyo3::exceptions::PyValueError::new_err("each case must be a dict"))?;
+        let query: String = d.get_item("query")?
+            .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("missing 'query'"))?
+            .extract()?;
+        let answer: String = d.get_item("answer")?
+            .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("missing 'answer'"))?
+            .extract()?;
+        let contexts: Vec<String> = d.get_item("contexts")?
+            .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("missing 'contexts'"))?
+            .extract()?;
+        let reference_answer: Option<String> = d.get_item("reference_answer")?
+            .map(|v| v.extract()).transpose()?;
+        parsed.push(litgraph_retrieval::GenerationCase {
+            query, answer, contexts, reference_answer,
+        });
+    }
+
+    let cfg = litgraph_retrieval::GenEvalConfig { max_concurrency, skip_correctness };
+    let report = py.allow_threads(|| {
+        block_on_compat(async move {
+            litgraph_retrieval::evaluate_generation(chat, &parsed, cfg).await
+        })
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    })?;
+
+    let out = PyDict::new_bound(py);
+    out.set_item("n_cases", report.n_cases)?;
+    out.set_item("faithfulness_macro", report.faithfulness_macro)?;
+    out.set_item("answer_relevance_macro", report.answer_relevance_macro)?;
+    out.set_item("correctness_macro", report.correctness_macro)?;
+    let per_case = PyList::empty_bound(py);
+    for c in report.per_case {
+        let d = PyDict::new_bound(py);
+        d.set_item("query", c.query)?;
+        d.set_item("faithfulness", c.faithfulness)?;
+        d.set_item("answer_relevance", c.answer_relevance)?;
+        d.set_item("correctness", c.correctness)?;
+        per_case.append(d)?;
+    }
+    out.set_item("per_case", per_case)?;
+    Ok(out)
 }

@@ -10,13 +10,14 @@ description = "Model Context Protocol (MCP) client for litGraph — stdio transp
 [dependencies]
 litgraph-core.workspace = true
 async-trait.workspace = true
-tokio = { workspace = true, features = ["process", "io-util", "macros", "sync", "time"] }
+tokio = { workspace = true, features = ["process", "io-util", "macros", "sync", "time", "net"] }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 parking_lot.workspace = true
+reqwest.workspace = true
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util", "process", "io-util"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util", "process", "io-util", "net"] }
 tempfile = "3"

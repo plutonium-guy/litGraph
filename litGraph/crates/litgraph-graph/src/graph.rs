@@ -87,6 +87,36 @@ where
         self
     }
 
+    /// Embed a compiled subgraph as a single node. When the parent reaches
+    /// this node, the subgraph runs to completion using the **current parent
+    /// state** as its initial state; the subgraph's final state is then
+    /// emitted as a `NodeOutput::update` and reduced back into the parent
+    /// via the parent's reducer.
+    ///
+    /// Same-shape composition: the subgraph's state type must match the
+    /// parent's. For different-shape composition, write a regular node that
+    /// projects/expands state and calls `compiled.invoke(...)` itself.
+    ///
+    /// Useful for hierarchical / multi-agent workflows: each "team" is a
+    /// CompiledGraph; the top-level coordinator embeds them as nodes.
+    pub fn add_subgraph(
+        &mut self,
+        name: impl Into<String>,
+        sub: Arc<CompiledGraph<S>>,
+    ) -> &mut Self {
+        self.add_fallible_node(name, move |state: S| {
+            let sub = sub.clone();
+            Box::pin(async move {
+                let final_state = sub.invoke(state, None).await
+                    .map_err(|e| GraphError::Other(format!("subgraph: {e}")))?;
+                let v = serde_json::to_value(&final_state)
+                    .map_err(|e| GraphError::Other(format!("subgraph state serialize: {e}")))?;
+                Ok(crate::NodeOutput::update(v))
+            })
+        });
+        self
+    }
+
     pub fn add_conditional_edges<F>(&mut self, from: impl Into<String>, router: F) -> &mut Self
     where
         F: Fn(&S) -> Vec<String> + Send + Sync + 'static,
@@ -193,6 +223,6 @@ where
         // Apply resume value as a state update via reducer, then continue.
         let state = (self.inner.reducer)(state, resume_value)?;
         let mut sched = Scheduler::new(self.inner.clone(), self.checkpointer.clone(), Some(thread_id));
-        sched.resume_from(state, cp.next_nodes).await
+        sched.resume_from_with_sends(state, cp.next_nodes, cp.next_sends).await
     }
 }

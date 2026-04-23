@@ -455,7 +455,7 @@ pub struct PyAnthropicChat {
 #[pymethods]
 impl PyAnthropicChat {
     #[new]
-    #[pyo3(signature = (api_key, model, base_url=None, timeout_s=120, max_tokens=4096, on_request=None))]
+    #[pyo3(signature = (api_key, model, base_url=None, timeout_s=120, max_tokens=4096, on_request=None, thinking_budget=None))]
     fn new(
         api_key: String,
         model: String,
@@ -463,6 +463,7 @@ impl PyAnthropicChat {
         timeout_s: u64,
         max_tokens: u32,
         on_request: Option<Py<PyAny>>,
+        thinking_budget: Option<u32>,
     ) -> PyResult<Self> {
         let mut cfg = AnthropicConfig::new(api_key, &model);
         cfg.timeout = std::time::Duration::from_secs(timeout_s);
@@ -470,6 +471,9 @@ impl PyAnthropicChat {
         if let Some(url) = base_url { cfg = cfg.with_base_url(url); }
         if let Some(cb) = on_request {
             cfg = cfg.with_on_request(wrap_py_inspector(cb));
+        }
+        if thinking_budget.is_some() {
+            cfg = cfg.with_thinking(thinking_budget);
         }
         let chat = AnthropicChat::new(cfg).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         Ok(Self { inner: Arc::new(chat), model, bus_handle: None })

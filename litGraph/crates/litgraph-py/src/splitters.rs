@@ -4,7 +4,8 @@ use std::sync::Arc;
 
 use litgraph_core::{Document, Embeddings};
 use litgraph_splitters::{
-    Language, MarkdownHeaderSplitter, RecursiveCharacterSplitter, SemanticChunker, Splitter,
+    HtmlHeaderSplitter, JsonSplitter, Language, MarkdownHeaderSplitter, RecursiveCharacterSplitter,
+    SemanticChunker, Splitter,
 };
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
@@ -21,7 +22,76 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyRecursiveSplitter>()?;
     m.add_class::<PyMarkdownSplitter>()?;
     m.add_class::<PySemanticChunker>()?;
+    m.add_class::<PyJsonSplitter>()?;
+    m.add_class::<PyHtmlHeaderSplitter>()?;
     Ok(())
+}
+
+/// HTML header-aware splitter — emits one chunk per `<h1..h6>` section
+/// (depth bounded by `max_depth`). Each chunk carries its heading
+/// breadcrumb in metadata (`h1`, `h2`, …). Mirrors `MarkdownHeaderSplitter`.
+#[pyclass(name = "HtmlHeaderSplitter", module = "litgraph.splitters")]
+pub struct PyHtmlHeaderSplitter {
+    inner: HtmlHeaderSplitter,
+}
+
+#[pymethods]
+impl PyHtmlHeaderSplitter {
+    #[new]
+    #[pyo3(signature = (max_depth=3, strip_headers=false))]
+    fn new(max_depth: u8, strip_headers: bool) -> Self {
+        let inner = HtmlHeaderSplitter::new(max_depth).strip_headers(strip_headers);
+        Self { inner }
+    }
+
+    fn split_text(&self, py: Python<'_>, text: String) -> Vec<String> {
+        py.allow_threads(|| self.inner.split_text(&text))
+    }
+
+    fn split_documents<'py>(
+        &self,
+        py: Python<'py>,
+        docs: Bound<'py, PyList>,
+    ) -> PyResult<Bound<'py, PyList>> {
+        let parsed: Vec<Document> = parse_docs(&docs)?;
+        let chunks = py.allow_threads(|| self.inner.split_documents(&parsed));
+        docs_to_pylist(py, chunks)
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "HtmlHeaderSplitter(max_depth={}, strip_headers={})",
+            self.inner.max_depth, self.inner.strip_headers
+        )
+    }
+}
+
+/// Recursive JSON splitter — keeps each chunk under `max_chunk_size` while
+/// preserving structural validity (each chunk is parseable JSON) and
+/// path context (chunks carry a `_path` field pointing back to their
+/// originating subtree). Mirrors LangChain's `RecursiveJsonSplitter`.
+#[pyclass(name = "JsonSplitter", module = "litgraph.splitters")]
+pub struct PyJsonSplitter {
+    inner: JsonSplitter,
+}
+
+#[pymethods]
+impl PyJsonSplitter {
+    #[new]
+    #[pyo3(signature = (max_chunk_size=2000))]
+    fn new(max_chunk_size: usize) -> Self {
+        Self { inner: JsonSplitter::new(max_chunk_size) }
+    }
+
+    /// Split a JSON-serialized string into a list of valid JSON-serialized
+    /// chunks. Invalid JSON inputs are returned unchanged as a single chunk.
+    fn split_text(&self, py: Python<'_>, text: String) -> Vec<String> {
+        py.allow_threads(|| self.inner.split_text(&text))
+    }
+
+    fn __repr__(&self) -> String {
+        format!("JsonSplitter(max_chunk_size={})", self.inner.max_chunk_size)
+    }
 }
 
 #[pyclass(name = "RecursiveCharacterSplitter", module = "litgraph.splitters")]

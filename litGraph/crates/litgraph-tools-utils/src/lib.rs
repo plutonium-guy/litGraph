@@ -10,8 +10,10 @@ mod calculator;
 mod http_request;
 mod filesystem;
 mod shell;
+mod sqlite_query;
 
 pub use calculator::CalculatorTool;
 pub use http_request::{HttpRequestTool, HttpRequestConfig};
 pub use filesystem::{FsRoot, ListDirectoryTool, ReadFileTool, WriteFileTool};
 pub use shell::ShellTool;
+pub use sqlite_query::SqliteQueryTool;

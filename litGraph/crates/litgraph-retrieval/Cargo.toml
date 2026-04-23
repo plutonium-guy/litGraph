@@ -21,3 +21,4 @@ unicode-segmentation.workspace = true
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }
 async-trait.workspace = true
+parking_lot.workspace = true

@@ -15,7 +15,9 @@
 
 use std::sync::{Arc, Mutex};
 
-use litgraph_graph::{CompiledGraph, END as GEND, GraphEvent, NodeOutput, START as GSTART, StateGraph};
+use litgraph_graph::{
+    Command, CompiledGraph, END as GEND, GraphEvent, NodeOutput, START as GSTART, StateGraph,
+};
 use pyo3::exceptions::{PyRuntimeError, PyStopIteration, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
@@ -30,7 +32,40 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyStateGraph>()?;
     m.add_class::<PyCompiledGraph>()?;
     m.add_class::<PyGraphStream>()?;
+    m.add_class::<PySend>()?;
     Ok(())
+}
+
+/// LangGraph-style `Send` — fan-out command that runs `goto` with a
+/// per-invocation state override. Returned in a node's `__sends__` list to
+/// trigger map-reduce-style parallel sub-invocations.
+///
+/// ```python
+/// def split(state):
+///     return {
+///         "__update__": {"items": [1, 2, 3]},
+///         "__sends__": [Send("worker", {"item": i}) for i in [1, 2, 3]],
+///     }
+/// ```
+#[pyclass(name = "Send", module = "litgraph.graph")]
+pub struct PySend {
+    #[pyo3(get)]
+    goto: String,
+    #[pyo3(get)]
+    update: Py<PyAny>,
+}
+
+#[pymethods]
+impl PySend {
+    #[new]
+    fn new(goto: String, update: Py<PyAny>) -> Self {
+        Self { goto, update }
+    }
+
+    fn __repr__(&self, py: Python<'_>) -> String {
+        let upd = self.update.bind(py).str().map(|s| s.to_string()).unwrap_or_else(|_| "?".into());
+        format!("Send(goto='{}', update={})", self.goto, upd)
+    }
 }
 
 /// Python StateGraph builder. State is always a JSON object (`dict`).
@@ -57,6 +92,16 @@ impl PyStateGraph {
     /// Register a node. `func` is any Python callable `dict -> dict` (or None
     /// for an empty update). Sync only for now — async Python support lands
     /// with pyo3-async-runtimes bridging in a later iteration.
+    ///
+    /// **Return value contract** (in priority order):
+    /// - `None` → empty update, no routing change
+    /// - `dict` containing any of `__sends__` / `__goto__` / `__update__`
+    ///   → parsed as a structured NodeOutput. `__sends__` is a list of
+    ///   `Send(goto, update)` instances (or `{"goto": ..., "update": ...}`
+    ///   dicts) that fan out parallel sub-invocations with per-item state.
+    ///   `__goto__` is a list[str] of explicit successors. `__update__` is
+    ///   the state delta dict.
+    /// - any other `dict` → treated as the state delta (legacy behavior).
     fn add_node(&mut self, name: String, func: Py<PyAny>) -> PyResult<()> {
         let g = self.inner.as_mut()
             .ok_or_else(|| PyRuntimeError::new_err("graph already compiled"))?;
@@ -67,9 +112,9 @@ impl PyStateGraph {
             let fn_ref = fn_ref.clone();
             let node_name = node_name.clone();
             Box::pin(async move {
-                let result = call_py_callable_returning_json(&fn_ref, state).await;
-                match result {
-                    Ok(v) => Ok(NodeOutput::update(v)),
+                let raw = call_py_callable_returning_raw(&fn_ref, state).await;
+                match raw {
+                    Ok(node_output) => Ok(node_output),
                     Err(e) => Err(litgraph_graph::GraphError::Other(
                         format!("node `{node_name}` failed: {e}"),
                     )),
@@ -83,6 +128,22 @@ impl PyStateGraph {
         let g = self.inner.as_mut()
             .ok_or_else(|| PyRuntimeError::new_err("graph already compiled"))?;
         g.add_edge(from, to);
+        Ok(())
+    }
+
+    /// Embed a `CompiledGraph` as a single node in this graph. When the
+    /// parent reaches `name`, the subgraph runs to completion on the current
+    /// parent state; its final state becomes the node's update.
+    ///
+    /// ```python
+    /// team = sub_graph.compile()
+    /// parent.add_subgraph("team", team)
+    /// parent.add_edge("coordinator", "team")
+    /// ```
+    fn add_subgraph(&mut self, name: String, sub: PyRef<'_, PyCompiledGraph>) -> PyResult<()> {
+        let g = self.inner.as_mut()
+            .ok_or_else(|| PyRuntimeError::new_err("graph already compiled"))?;
+        g.add_subgraph(name, sub.inner.clone());
         Ok(())
     }
 
@@ -349,29 +410,111 @@ pub(crate) fn json_to_py<'py>(py: Python<'py>, v: &Value) -> PyResult<Bound<'py,
 }
 
 /// Call a Python callable; transparently support `async def` nodes by detecting
-/// the returned coroutine and driving it via `asyncio.run()`. The GIL is held
-/// for the duration — that's fine because the graph executor already serializes
-/// Python calls (rayon would deadlock on contended Python state otherwise).
-pub(crate) async fn call_py_callable_returning_json(
+/// the returned coroutine and driving it via `asyncio.run()`. Interprets the
+/// dict's special `__sends__` / `__goto__` / `__update__` keys (if any) and
+/// returns a structured `NodeOutput`. Plain-dict returns (no special keys)
+/// become a state-update-only `NodeOutput` — preserves the legacy node
+/// contract. The GIL is held for the duration — that's fine because the graph
+/// executor already serializes Python calls (rayon would deadlock on
+/// contended Python state otherwise).
+pub(crate) async fn call_py_callable_returning_raw(
     func: &Arc<Py<PyAny>>,
     state: Value,
-) -> Result<Value, String> {
+) -> Result<NodeOutput, String> {
     Python::with_gil(|py| {
         let py_state = json_to_py(py, &state).map_err(|e| e.to_string())?;
         let ret = func.call1(py, (py_state,)).map_err(|e| e.to_string())?;
         let mut bound = ret.bind(py).clone();
         if bound.hasattr("__await__").map_err(|e| e.to_string())? {
-            // `asyncio.run(coro)` creates a fresh event loop, drives the
-            // coroutine to completion, then tears the loop down. Simpler than
-            // bridging tokio↔asyncio and avoids the "no running event loop"
-            // error path you hit when no loop exists on the calling thread.
             let asyncio = py.import_bound("asyncio").map_err(|e| e.to_string())?;
-            let result = asyncio
+            bound = asyncio
                 .call_method1("run", (bound,))
                 .map_err(|e| e.to_string())?;
-            bound = result;
         }
-        py_to_json(py, &bound).map_err(|e| e.to_string())
+
+        // None → empty NodeOutput.
+        if bound.is_none() {
+            return Ok(NodeOutput::empty());
+        }
+
+        // Dict path: look for special keys. If absent, treat the whole dict
+        // as the state update (legacy contract).
+        if let Ok(d) = bound.downcast::<PyDict>() {
+            let has_sends = d.contains("__sends__").unwrap_or(false);
+            let has_goto = d.contains("__goto__").unwrap_or(false);
+            let has_update = d.contains("__update__").unwrap_or(false);
+            if !(has_sends || has_goto || has_update) {
+                let v = py_to_json(py, &bound).map_err(|e| e.to_string())?;
+                return Ok(NodeOutput::update(v));
+            }
+
+            let update_value = if has_update {
+                let u = d.get_item("__update__").map_err(|e| e.to_string())?;
+                if let Some(u) = u {
+                    py_to_json(py, &u).map_err(|e| e.to_string())?
+                } else {
+                    Value::Null
+                }
+            } else {
+                Value::Null
+            };
+            let mut out = if matches!(update_value, Value::Null) {
+                NodeOutput::empty()
+            } else {
+                NodeOutput::update(update_value)
+            };
+
+            if has_goto {
+                let g = d.get_item("__goto__").map_err(|e| e.to_string())?;
+                if let Some(g) = g {
+                    if let Ok(s) = g.extract::<String>() {
+                        out = out.goto(s);
+                    } else if let Ok(list) = g.downcast::<PyList>() {
+                        for item in list.iter() {
+                            if let Ok(s) = item.extract::<String>() {
+                                out = out.goto(s);
+                            }
+                        }
+                    } else {
+                        return Err("__goto__ must be a str or list[str]".into());
+                    }
+                }
+            }
+
+            if has_sends {
+                let s = d.get_item("__sends__").map_err(|e| e.to_string())?;
+                if let Some(s) = s {
+                    let list = s.downcast::<PyList>()
+                        .map_err(|_| "__sends__ must be a list".to_string())?;
+                    for item in list.iter() {
+                        let cmd = if let Ok(send) = item.extract::<PyRef<PySend>>() {
+                            let upd = py_to_json(py, send.update.bind(py))
+                                .map_err(|e| e.to_string())?;
+                            Command { goto: send.goto.clone(), update: upd }
+                        } else if let Ok(d) = item.downcast::<PyDict>() {
+                            let goto: String = d
+                                .get_item("goto").map_err(|e| e.to_string())?
+                                .ok_or_else(|| "__sends__ dict missing 'goto'".to_string())?
+                                .extract().map_err(|e: PyErr| e.to_string())?;
+                            let upd = match d.get_item("update").map_err(|e| e.to_string())? {
+                                Some(u) => py_to_json(py, &u).map_err(|e| e.to_string())?,
+                                None => Value::Null,
+                            };
+                            Command { goto, update: upd }
+                        } else {
+                            return Err("__sends__ items must be Send or dict".into());
+                        };
+                        out = out.send(cmd);
+                    }
+                }
+            }
+            return Ok(out);
+        }
+
+        // Non-dict, non-None — wrap under "value" key as a state update so
+        // weird returns don't crash the graph.
+        let v = py_to_json(py, &bound).map_err(|e| e.to_string())?;
+        Ok(NodeOutput::update(serde_json::json!({"value": v})))
     })
 }
 

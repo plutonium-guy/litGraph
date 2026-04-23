@@ -10,6 +10,11 @@ class FunctionTool:
         func: Callable[[dict[str, Any]], Any | Awaitable[Any]],
     ) -> None: ...
 
+def tool(
+    func: Callable[..., Any],
+    name: str | None = None,
+) -> FunctionTool: ...
+
 class BraveSearchTool:
     name: str
     def __init__(
@@ -35,6 +40,18 @@ class DuckDuckGoSearchTool:
         self,
         base_url: str | None = None,
         timeout_s: int = 20,
+    ) -> None: ...
+
+class SqliteQueryTool:
+    name: str
+    def __init__(
+        self,
+        db_path: str,
+        allowed_tables: list[str],
+        read_only: bool = True,
+        max_rows: int = 1000,
+        max_output_bytes: int = 262_144,
+        allow_pragma: bool = False,
     ) -> None: ...
 
 class CalculatorTool:

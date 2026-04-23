@@ -31,6 +31,10 @@ struct Payload {
     next_nodes: Vec<String>,
     pending_interrupt: Option<Interrupt>,
     ts_ms: u64,
+    /// Pending Send fan-out commands; `#[serde(default)]` so legacy bincode
+    /// payloads (pre-iter-77) still decode — they'll just have no sends.
+    #[serde(default)]
+    next_sends: Vec<litgraph_graph::Command>,
 }
 
 pub struct RedisCheckpointer {
@@ -56,6 +60,7 @@ fn decode(thread_id: String, step: u64, bytes: Vec<u8>) -> std::result::Result<C
         step,
         state: p.state,
         next_nodes: p.next_nodes,
+        next_sends: p.next_sends,
         pending_interrupt: p.pending_interrupt,
         ts_ms: p.ts_ms,
     })
@@ -69,6 +74,7 @@ impl Checkpointer for RedisCheckpointer {
             next_nodes: cp.next_nodes,
             pending_interrupt: cp.pending_interrupt,
             ts_ms: cp.ts_ms,
+            next_sends: cp.next_sends,
         };
         let bytes = bincode::serialize(&payload).map_err(err)?;
         let mut conn = self.conn.clone();

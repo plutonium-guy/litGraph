@@ -68,7 +68,14 @@ fn row_to_checkpoint(row: &rusqlite::Row) -> rusqlite::Result<Checkpoint> {
     let ts_ms: i64 = row.get(5)?;
     let next_nodes: Vec<String> = serde_json::from_str(&next_nodes_json).unwrap_or_default();
     let pending_interrupt = pending_json.and_then(|s| serde_json::from_str(&s).ok());
-    Ok(Checkpoint { thread_id, step: step as u64, state, next_nodes, pending_interrupt, ts_ms: ts_ms as u64 })
+    // Sqlite backend doesn't persist next_sends yet (interrupt-during-fan-out
+    // is rare); rebuild with empty sends. Add a column when fan-out + resume
+    // becomes a load-bearing pattern for SQLite users.
+    Ok(Checkpoint {
+        thread_id, step: step as u64, state, next_nodes,
+        next_sends: Vec::new(),
+        pending_interrupt, ts_ms: ts_ms as u64,
+    })
 }
 
 #[async_trait]
@@ -177,6 +184,7 @@ mod tests {
             step: 1,
             state: vec![1, 2, 3],
             next_nodes: vec!["a".into()],
+            next_sends: Vec::new(),
             pending_interrupt: None,
             ts_ms: 1000,
         };
@@ -196,6 +204,7 @@ mod tests {
                 step: s,
                 state: vec![s as u8],
                 next_nodes: vec![],
+                next_sends: Vec::new(),
                 pending_interrupt: None,
                 ts_ms: s,
             })

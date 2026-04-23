@@ -16,6 +16,16 @@ use serde_json::Value;
 pub mod html;
 pub use html::HtmlLoader;
 
+#[cfg(feature = "pdf")]
+pub mod pdf;
+#[cfg(feature = "pdf")]
+pub use pdf::PdfLoader;
+
+#[cfg(feature = "docx")]
+pub mod docx;
+#[cfg(feature = "docx")]
+pub use docx::DocxLoader;
+
 #[derive(Debug, thiserror::Error)]
 pub enum LoaderError {
     #[error("io: {0}")]

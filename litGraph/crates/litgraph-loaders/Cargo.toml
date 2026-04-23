@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "Document loaders for litGraph — text, markdown, JSONL, directory glob. Rayon-parallel ingestion."
+description = "Document loaders for litGraph — text, markdown, JSONL, directory glob, PDF (opt-in). Rayon-parallel ingestion."
 
 [dependencies]
 litgraph-core.workspace = true
@@ -20,6 +20,19 @@ csv.workspace = true
 regex.workspace = true
 once_cell = "1"
 reqwest = { workspace = true, features = ["blocking"] }
+# PDF text extraction is opt-in. lopdf is pure-Rust + handles font encoding so
+# we don't need cargo install poppler / wasm-bindgen / native deps.
+lopdf = { version = "0.40", optional = true }
+# DOCX = zip of XMLs; extract text from `word/document.xml` with quick-xml.
+zip = { version = "2", default-features = false, features = ["deflate"], optional = true }
+quick-xml = { version = "0.36", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
+lopdf = "0.40"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+[features]
+default = []
+pdf = ["dep:lopdf"]
+docx = ["dep:zip", "dep:quick-xml"]
