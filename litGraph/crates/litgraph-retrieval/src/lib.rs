@@ -13,6 +13,7 @@ pub mod multi_query;
 pub mod compression;
 pub mod self_query;
 pub mod time_weighted;
+pub mod transformers;
 
 pub use store::{VectorStore, Filter};
 pub use retriever::{Retriever, VectorRetriever};
@@ -36,3 +37,4 @@ pub use eval::{
 pub use eval_gen::{
     evaluate_generation, GenEvalConfig, GenReport, GenerationCase, PerCaseGenMetrics,
 };
+pub use transformers::{embedding_redundant_filter, long_context_reorder, mmr_select};

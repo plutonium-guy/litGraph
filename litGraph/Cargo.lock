@@ -1632,6 +1632,7 @@ dependencies = [
  "async-trait",
  "futures",
  "minijinja",
+ "regex",
  "schemars",
  "serde",
  "serde_json",

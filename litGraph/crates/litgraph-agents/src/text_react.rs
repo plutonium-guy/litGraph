@@ -44,13 +44,17 @@
 //! the Observation must be fed back before the next step.
 
 use std::collections::HashMap;
+use std::pin::Pin;
 use std::sync::Arc;
 
+use async_stream::try_stream;
+use futures::Stream;
 use litgraph_core::react_format_instructions;
 use litgraph_core::react_parser::{parse_react_step, ReactStep};
 use litgraph_core::tool::Tool;
 use litgraph_core::{ChatModel, ChatOptions, Message, Role};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use tracing::debug;
 
 /// One turn of a text-ReAct trace. Exposed for debugging / observability
@@ -93,6 +97,75 @@ pub enum StoppedReason {
     ParseError,
     ToolNotFound,
 }
+
+/// Per-turn event surfaced by `TextReActAgent::stream()`. Variants are
+/// stable (tagged with `type` in JSON). Fires in the order the agent
+/// processes each turn:
+///
+/// `IterationStart` → `LlmResponse` → either `ParseError` (terminal) or
+/// `ParsedAction` + `ToolStart` + `ToolResult` → loop, or `ParsedFinal`
+/// → `Final` (terminal). `MaxIterations` is the alt terminal.
+///
+/// Unlike `react::AgentEvent` (parallel tool calls), text-mode is serial
+/// — exactly one ToolStart/ToolResult pair per Action turn.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum TextReactEvent {
+    /// New model turn beginning. 1-based.
+    IterationStart { iteration: u32 },
+    /// Raw assistant prose returned by the LLM, before parsing. Useful
+    /// for UIs that show the model's reasoning verbatim.
+    LlmResponse { iteration: u32, text: String },
+    /// The response parsed as a tool-call step. Fires before `ToolStart`.
+    ParsedAction {
+        iteration: u32,
+        thought: Option<String>,
+        tool: String,
+        input: Value,
+    },
+    /// The response parsed as a final-answer step. Terminal-adjacent
+    /// (followed by `Final`).
+    ParsedFinal {
+        iteration: u32,
+        thought: Option<String>,
+        answer: String,
+    },
+    /// Parser couldn't extract Action/Action Input/Final Answer. Terminal.
+    ParseError { iteration: u32, error: String, raw_response: String },
+    /// Tool invocation kicked off.
+    ToolStart {
+        iteration: u32,
+        tool: String,
+        input: Value,
+    },
+    /// Tool invocation finished. `is_error=true` if the tool raised — the
+    /// agent will continue and let the LLM react to the failure.
+    ToolResult {
+        iteration: u32,
+        tool: String,
+        observation: String,
+        is_error: bool,
+        duration_ms: u64,
+    },
+    /// Terminal — agent reached Final Answer.
+    Final {
+        answer: String,
+        iterations: u32,
+    },
+    /// Terminal — `max_iterations` reached without Final Answer.
+    MaxIterations { iterations: u32 },
+    /// Terminal — `tool_not_found` (LLM named an unknown tool). Fires
+    /// AFTER the corresponding `ParsedAction` so subscribers see the
+    /// invalid call before the stop.
+    ToolNotFound {
+        iteration: u32,
+        tool: String,
+        available: Vec<String>,
+    },
+}
+
+pub type TextReactEventStream =
+    Pin<Box<dyn Stream<Item = litgraph_core::Result<TextReactEvent>> + Send>>;
 
 #[derive(Clone)]
 pub struct TextReactAgentConfig {
@@ -275,6 +348,128 @@ impl TextReActAgent {
             trace,
             iterations: max_iters,
             stopped_reason: StoppedReason::MaxIterations,
+        })
+    }
+
+    /// Stream per-turn `TextReactEvent`s for progressive UIs.
+    ///
+    /// Same loop as `invoke()` but yields each milestone as it happens:
+    /// `IterationStart` → `LlmResponse` → `ParsedAction` → `ToolStart` →
+    /// `ToolResult` → ... → `ParsedFinal` → `Final`. Stops with one of
+    /// `Final`, `MaxIterations`, `ParseError`, or `ToolNotFound`.
+    ///
+    /// Caller drains the stream to completion; the agent does NOT cancel
+    /// on drop mid-turn (the tool invocation runs to completion). For
+    /// cancellation, use `tokio::time::timeout` around the consumer.
+    pub fn stream(self: Arc<Self>, user_input: impl Into<String>) -> TextReactEventStream {
+        let user_input = user_input.into();
+        let agent = self;
+        Box::pin(try_stream! {
+            let mut messages: Vec<Message> = Vec::new();
+            if let Some(sp) = agent.config.system_prompt.as_ref() {
+                messages.push(Message::system(sp.clone()));
+            }
+            if agent.config.auto_format_instructions {
+                let tool_lines: Vec<String> = agent
+                    .tools
+                    .values()
+                    .map(|t| {
+                        let schema = t.schema();
+                        format!("{}: {}", schema.name, schema.description)
+                    })
+                    .collect();
+                let tool_refs: Vec<&str> = tool_lines.iter().map(|s| s.as_str()).collect();
+                let instr = react_format_instructions(&tool_refs);
+                messages.push(Message::system(instr));
+            }
+            messages.push(Message::user(user_input));
+
+            let max_iters = agent.config.max_iterations;
+            for iter_idx in 0..max_iters {
+                let iteration = iter_idx + 1;
+                yield TextReactEvent::IterationStart { iteration };
+
+                let resp = agent
+                    .model
+                    .invoke(messages.clone(), &agent.config.chat_options)
+                    .await?;
+                let raw = resp.message.text_content();
+                yield TextReactEvent::LlmResponse {
+                    iteration,
+                    text: raw.clone(),
+                };
+                messages.push(Message::assistant(raw.clone()));
+
+                let step = match parse_react_step(&raw) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        yield TextReactEvent::ParseError {
+                            iteration,
+                            error: e.to_string(),
+                            raw_response: raw,
+                        };
+                        return;
+                    }
+                };
+
+                match step {
+                    ReactStep::Final { thought, answer } => {
+                        yield TextReactEvent::ParsedFinal {
+                            iteration,
+                            thought,
+                            answer: answer.clone(),
+                        };
+                        yield TextReactEvent::Final {
+                            answer,
+                            iterations: iteration,
+                        };
+                        return;
+                    }
+                    ReactStep::Action { thought, tool, input } => {
+                        yield TextReactEvent::ParsedAction {
+                            iteration,
+                            thought,
+                            tool: tool.clone(),
+                            input: input.clone(),
+                        };
+                        let tool_ref = agent.tools.get(&tool);
+                        let Some(t) = tool_ref else {
+                            yield TextReactEvent::ToolNotFound {
+                                iteration,
+                                tool: tool.clone(),
+                                available: agent.tools.keys().cloned().collect(),
+                            };
+                            return;
+                        };
+                        yield TextReactEvent::ToolStart {
+                            iteration,
+                            tool: tool.clone(),
+                            input: input.clone(),
+                        };
+                        let started = std::time::Instant::now();
+                        let (observation, is_error) = match t.run(input).await {
+                            Ok(v) => {
+                                let s = match &v {
+                                    Value::String(s) => s.clone(),
+                                    _ => v.to_string(),
+                                };
+                                (s, false)
+                            }
+                            Err(e) => (format!("tool error: {e}"), true),
+                        };
+                        let duration_ms = started.elapsed().as_millis() as u64;
+                        yield TextReactEvent::ToolResult {
+                            iteration,
+                            tool: tool.clone(),
+                            observation: observation.clone(),
+                            is_error,
+                            duration_ms,
+                        };
+                        messages.push(Message::user(format!("Observation: {observation}")));
+                    }
+                }
+            }
+            yield TextReactEvent::MaxIterations { iterations: max_iters };
         })
     }
 }
@@ -534,6 +729,191 @@ mod tests {
                 assert!(observation.contains("kaboom"));
             }
             _ => panic!("expected action turn with error"),
+        }
+    }
+
+    // -------- streaming tests ---------------------------------------------
+
+    use futures::StreamExt;
+
+    async fn collect_stream(agent: Arc<TextReActAgent>, input: &str) -> Vec<TextReactEvent> {
+        let mut s = agent.stream(input.to_string());
+        let mut out = Vec::new();
+        while let Some(ev) = s.next().await {
+            out.push(ev.unwrap());
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn stream_emits_iteration_then_response_then_final() {
+        let chat = Arc::new(ScriptedChat::new(vec![
+            "Thought: I know\nFinal Answer: 42",
+        ]));
+        let agent = Arc::new(TextReActAgent::new(
+            chat,
+            vec![],
+            TextReactAgentConfig::default(),
+        ));
+        let events = collect_stream(agent, "q").await;
+        // Expect: IterationStart → LlmResponse → ParsedFinal → Final.
+        assert!(matches!(events[0], TextReactEvent::IterationStart { iteration: 1 }));
+        assert!(matches!(events[1], TextReactEvent::LlmResponse { iteration: 1, .. }));
+        assert!(matches!(events[2], TextReactEvent::ParsedFinal { iteration: 1, .. }));
+        match &events[3] {
+            TextReactEvent::Final { answer, iterations } => {
+                assert_eq!(answer, "42");
+                assert_eq!(*iterations, 1);
+            }
+            other => panic!("expected Final, got {:?}", other),
+        }
+        assert_eq!(events.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn stream_emits_action_then_tool_start_then_tool_result() {
+        let chat = Arc::new(ScriptedChat::new(vec![
+            "Action: spin\nAction Input: {\"x\": 1}",
+            "Final Answer: ok",
+        ]));
+        let agent = Arc::new(TextReActAgent::new(
+            chat,
+            vec![echo("spin", "spun")],
+            TextReactAgentConfig::default(),
+        ));
+        let events = collect_stream(agent, "q").await;
+        // Iter 1: IterationStart, LlmResponse, ParsedAction, ToolStart, ToolResult.
+        // Iter 2: IterationStart, LlmResponse, ParsedFinal, Final.
+        let kinds: Vec<&str> = events
+            .iter()
+            .map(|e| match e {
+                TextReactEvent::IterationStart { .. } => "iteration_start",
+                TextReactEvent::LlmResponse { .. } => "llm_response",
+                TextReactEvent::ParsedAction { .. } => "parsed_action",
+                TextReactEvent::ParsedFinal { .. } => "parsed_final",
+                TextReactEvent::ParseError { .. } => "parse_error",
+                TextReactEvent::ToolStart { .. } => "tool_start",
+                TextReactEvent::ToolResult { .. } => "tool_result",
+                TextReactEvent::Final { .. } => "final",
+                TextReactEvent::MaxIterations { .. } => "max_iterations",
+                TextReactEvent::ToolNotFound { .. } => "tool_not_found",
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "iteration_start",
+                "llm_response",
+                "parsed_action",
+                "tool_start",
+                "tool_result",
+                "iteration_start",
+                "llm_response",
+                "parsed_final",
+                "final",
+            ]
+        );
+        match &events[3] {
+            TextReactEvent::ToolStart { tool, input, .. } => {
+                assert_eq!(tool, "spin");
+                assert_eq!(input["x"], 1);
+            }
+            _ => panic!("wrong event"),
+        }
+        match &events[4] {
+            TextReactEvent::ToolResult { observation, is_error, .. } => {
+                assert_eq!(observation, "spun");
+                assert!(!is_error);
+            }
+            _ => panic!("wrong event"),
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_terminates_on_parse_error_without_final_event() {
+        let chat = Arc::new(ScriptedChat::new(vec!["just prose no labels"]));
+        let agent = Arc::new(TextReActAgent::new(
+            chat,
+            vec![],
+            TextReactAgentConfig::default(),
+        ));
+        let events = collect_stream(agent, "q").await;
+        let last = events.last().unwrap();
+        assert!(matches!(last, TextReactEvent::ParseError { .. }));
+        // No Final/MaxIterations event after a ParseError.
+        assert!(!events.iter().any(|e| matches!(e, TextReactEvent::Final { .. })));
+    }
+
+    #[tokio::test]
+    async fn stream_emits_tool_not_found_when_unknown_tool_named() {
+        let chat = Arc::new(ScriptedChat::new(vec![
+            "Action: nope\nAction Input: {}",
+        ]));
+        let agent = Arc::new(TextReActAgent::new(
+            chat,
+            vec![echo("known", "k")],
+            TextReactAgentConfig::default(),
+        ));
+        let events = collect_stream(agent, "q").await;
+        let last = events.last().unwrap();
+        match last {
+            TextReactEvent::ToolNotFound { tool, available, .. } => {
+                assert_eq!(tool, "nope");
+                assert_eq!(available, &vec!["known".to_string()]);
+            }
+            other => panic!("expected ToolNotFound, got {:?}", other),
+        }
+        // ParsedAction was emitted BEFORE ToolNotFound (subscriber sees the
+        // bad call before the stop).
+        assert!(matches!(
+            events[events.len() - 2],
+            TextReactEvent::ParsedAction { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn stream_emits_max_iterations_when_loop_exhausts() {
+        let chat = Arc::new(ScriptedChat::new(vec![
+            "Action: spin\nAction Input: {}",
+            "Action: spin\nAction Input: {}",
+            "Action: spin\nAction Input: {}",
+        ]));
+        let cfg = TextReactAgentConfig {
+            max_iterations: 2,
+            ..Default::default()
+        };
+        let agent = Arc::new(TextReActAgent::new(
+            chat,
+            vec![echo("spin", "spun")],
+            cfg,
+        ));
+        let events = collect_stream(agent, "q").await;
+        let last = events.last().unwrap();
+        assert!(matches!(last, TextReactEvent::MaxIterations { iterations: 2 }));
+    }
+
+    #[tokio::test]
+    async fn stream_tool_result_carries_duration_ms() {
+        let chat = Arc::new(ScriptedChat::new(vec![
+            "Action: spin\nAction Input: {}",
+            "Final Answer: ok",
+        ]));
+        let agent = Arc::new(TextReActAgent::new(
+            chat,
+            vec![echo("spin", "spun")],
+            TextReactAgentConfig::default(),
+        ));
+        let events = collect_stream(agent, "q").await;
+        let tr = events
+            .iter()
+            .find(|e| matches!(e, TextReactEvent::ToolResult { .. }))
+            .unwrap();
+        match tr {
+            TextReactEvent::ToolResult { duration_ms, .. } => {
+                // Just check the field is present (echo returns instantly so 0 is OK).
+                let _ = *duration_ms;
+            }
+            _ => unreachable!(),
         }
     }
 }

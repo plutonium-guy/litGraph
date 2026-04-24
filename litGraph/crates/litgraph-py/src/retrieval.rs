@@ -5,7 +5,8 @@ use std::sync::Arc;
 use litgraph_core::Document;
 use litgraph_retrieval::store::VectorStore;
 use litgraph_retrieval::{
-    AttributeInfo, Bm25Index, ChildSplitter, Compressor, ContextualCompressionRetriever, DocStore,
+    embedding_redundant_filter, long_context_reorder, mmr_select, AttributeInfo, Bm25Index,
+    ChildSplitter, Compressor, ContextualCompressionRetriever, DocStore,
     EmbeddingsFilterCompressor, HybridRetriever, LlmExtractCompressor, MemoryDocStore,
     MultiQueryRetriever, ParentDocumentRetriever, PipelineCompressor, Reranker,
     RerankingRetriever, Retriever, SelfQueryRetriever, TimeWeightedRetriever, VectorRetriever,
@@ -55,7 +56,84 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyTimeWeightedRetriever>()?;
     m.add_function(pyo3::wrap_pyfunction!(evaluate_retrieval, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(evaluate_generation, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(mmr_select_py, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(embedding_redundant_filter_py, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(long_context_reorder_py, m)?)?;
     Ok(())
+}
+
+/// Maximal Marginal Relevance — pick `k` candidates that are both
+/// relevant to `query_embedding` and diverse from each other.
+///
+/// Args:
+///   query_embedding: list[float] — the query's embedding
+///   candidates: list[dict] — documents (with content, optional id/metadata)
+///   candidate_embeddings: list[list[float]] — same length as candidates
+///   k: number of documents to return
+///   lambda_mult: 0.0–1.0 — 1.0 = pure relevance, 0.0 = pure diversity
+///
+/// ```python
+/// from litgraph.retrieval import mmr_select
+/// docs = mmr_select(qe, retrieved_docs, retrieved_embs, k=5, lambda_mult=0.5)
+/// ```
+#[pyfunction(name = "mmr_select")]
+#[pyo3(signature = (query_embedding, candidates, candidate_embeddings, k, lambda_mult=0.5))]
+fn mmr_select_py<'py>(
+    py: Python<'py>,
+    query_embedding: Vec<f32>,
+    candidates: Bound<'py, PyList>,
+    candidate_embeddings: Vec<Vec<f32>>,
+    k: usize,
+    lambda_mult: f32,
+) -> PyResult<Bound<'py, PyList>> {
+    let docs = parse_docs(&candidates)?;
+    let out = mmr_select(
+        &query_embedding,
+        &docs,
+        &candidate_embeddings,
+        k,
+        lambda_mult,
+    );
+    docs_to_pylist(py, out)
+}
+
+/// Drop documents whose embedding is within `threshold` cosine
+/// similarity of an earlier kept document. Higher threshold → keeps
+/// more docs. LangChain default ~0.95.
+///
+/// ```python
+/// from litgraph.retrieval import embedding_redundant_filter
+/// kept = embedding_redundant_filter(docs, embeddings, threshold=0.95)
+/// ```
+#[pyfunction(name = "embedding_redundant_filter")]
+#[pyo3(signature = (candidates, embeddings, threshold=0.95))]
+fn embedding_redundant_filter_py<'py>(
+    py: Python<'py>,
+    candidates: Bound<'py, PyList>,
+    embeddings: Vec<Vec<f32>>,
+    threshold: f32,
+) -> PyResult<Bound<'py, PyList>> {
+    let docs = parse_docs(&candidates)?;
+    let out = embedding_redundant_filter(&docs, &embeddings, threshold);
+    docs_to_pylist(py, out)
+}
+
+/// Reorder a relevance-sorted list to mitigate "lost in the middle"
+/// (Liu et al 2023). Top docs end up at edges; least relevant in the
+/// middle. Pure permutation — no embeddings needed.
+///
+/// ```python
+/// from litgraph.retrieval import long_context_reorder
+/// reordered = long_context_reorder(retrieved_docs)
+/// ```
+#[pyfunction(name = "long_context_reorder")]
+fn long_context_reorder_py<'py>(
+    py: Python<'py>,
+    docs: Bound<'py, PyList>,
+) -> PyResult<Bound<'py, PyList>> {
+    let parsed = parse_docs(&docs)?;
+    let out = long_context_reorder(&parsed);
+    docs_to_pylist(py, out)
 }
 
 /// Pure-Rust BM25 index. Rayon-parallel scoring. Release GIL during `search`.

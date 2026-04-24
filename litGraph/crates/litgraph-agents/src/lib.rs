@@ -13,5 +13,6 @@ pub mod text_react;
 pub use react::{AgentEvent, AgentEventStream, AgentState, ReactAgent, ReactAgentConfig};
 pub use supervisor::{SupervisorAgent, SupervisorConfig};
 pub use text_react::{
-    StoppedReason, TextReActAgent, TextReactAgentConfig, TextReactResult, TextReactTurn,
+    StoppedReason, TextReActAgent, TextReactAgentConfig, TextReactEvent, TextReactEventStream,
+    TextReactResult, TextReactTurn,
 };

@@ -14,6 +14,7 @@ pub mod xml_parser;
 pub mod list_parser;
 pub mod react_parser;
 pub mod format_instructions;
+pub mod evaluators;
 
 pub use error::{Error, Result};
 pub use structured::StructuredChatModel;
@@ -26,6 +27,10 @@ pub use format_instructions::{
     boolean_format_instructions, comma_list_format_instructions,
     markdown_list_format_instructions, numbered_list_format_instructions,
     react_format_instructions, xml_format_instructions,
+};
+pub use evaluators::{
+    contains_all, contains_any, embedding_cosine, exact_match, exact_match_strict,
+    jaccard_similarity, json_validity, levenshtein, levenshtein_ratio, regex_match,
 };
 pub use memory::{
     BufferMemory, ConversationMemory, MemorySnapshot, TokenBufferMemory, TokenCounter,

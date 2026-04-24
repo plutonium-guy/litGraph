@@ -13,8 +13,9 @@ use litgraph_tools_search::{
     BraveSearch, BraveSearchConfig, DuckDuckGoConfig, DuckDuckGoSearch, TavilyConfig, TavilySearch,
 };
 use litgraph_tools_utils::{
-    CalculatorTool, FsRoot, HttpRequestConfig, HttpRequestTool, ListDirectoryTool, ReadFileTool,
-    ShellTool, SqliteQueryTool, WriteFileTool,
+    CachedTool, CalculatorTool, DalleConfig, DalleImageTool, FsRoot, HttpRequestConfig,
+    HttpRequestTool, ListDirectoryTool, PythonReplConfig, PythonReplTool, ReadFileTool, ShellTool,
+    SqliteQueryTool, TtsAudioTool, TtsConfig, WhisperConfig, WhisperTranscribeTool, WriteFileTool,
 };
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
@@ -34,8 +35,70 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyShellTool>()?;
     m.add_class::<PyDuckDuckGoSearchTool>()?;
     m.add_class::<PySqliteQueryTool>()?;
+    m.add_class::<PyWhisperTranscribeTool>()?;
+    m.add_class::<PyDalleImageTool>()?;
+    m.add_class::<PyTtsAudioTool>()?;
+    m.add_class::<PyCachedTool>()?;
+    m.add_class::<PyPythonReplTool>()?;
     m.add_function(pyo3::wrap_pyfunction!(tool, m)?)?;
     Ok(())
+}
+
+/// Extract an `Arc<dyn Tool>` from any of the supported `Py*Tool` types.
+/// Centralizes the type-dispatch so wrappers (CachedTool, etc) and
+/// agent constructors don't duplicate it.
+pub(crate) fn extract_tool_arc(bound: &Bound<'_, PyAny>) -> PyResult<Arc<dyn Tool>> {
+    if let Ok(t) = bound.extract::<PyRef<PyFunctionTool>>() {
+        return Ok(t.as_tool());
+    }
+    if let Ok(t) = bound.extract::<PyRef<PyBraveSearchTool>>() {
+        return Ok(t.as_tool());
+    }
+    if let Ok(t) = bound.extract::<PyRef<PyTavilySearchTool>>() {
+        return Ok(t.as_tool());
+    }
+    if let Ok(t) = bound.extract::<PyRef<PyDuckDuckGoSearchTool>>() {
+        return Ok(t.as_tool());
+    }
+    if let Ok(t) = bound.extract::<PyRef<PyCalculatorTool>>() {
+        return Ok(t.as_tool());
+    }
+    if let Ok(t) = bound.extract::<PyRef<PyHttpRequestTool>>() {
+        return Ok(t.as_tool());
+    }
+    if let Ok(t) = bound.extract::<PyRef<PyReadFileTool>>() {
+        return Ok(t.as_tool());
+    }
+    if let Ok(t) = bound.extract::<PyRef<PyWriteFileTool>>() {
+        return Ok(t.as_tool());
+    }
+    if let Ok(t) = bound.extract::<PyRef<PyListDirectoryTool>>() {
+        return Ok(t.as_tool());
+    }
+    if let Ok(t) = bound.extract::<PyRef<PyShellTool>>() {
+        return Ok(t.as_tool());
+    }
+    if let Ok(t) = bound.extract::<PyRef<PySqliteQueryTool>>() {
+        return Ok(t.as_tool());
+    }
+    if let Ok(t) = bound.extract::<PyRef<PyWhisperTranscribeTool>>() {
+        return Ok(t.as_tool());
+    }
+    if let Ok(t) = bound.extract::<PyRef<PyDalleImageTool>>() {
+        return Ok(t.as_tool());
+    }
+    if let Ok(t) = bound.extract::<PyRef<PyTtsAudioTool>>() {
+        return Ok(t.as_tool());
+    }
+    if let Ok(t) = bound.extract::<PyRef<PyCachedTool>>() {
+        return Ok(t.as_tool());
+    }
+    if let Ok(t) = bound.extract::<PyRef<PyPythonReplTool>>() {
+        return Ok(t.as_tool());
+    }
+    Err(pyo3::exceptions::PyValueError::new_err(
+        "expected a litgraph.tools tool (FunctionTool, BraveSearchTool, ...)",
+    ))
 }
 
 /// Decorator that converts a Python function into a `FunctionTool` with the
@@ -234,6 +297,286 @@ impl PySqliteQueryTool {
 }
 
 impl PySqliteQueryTool {
+    pub(crate) fn as_tool(&self) -> Arc<dyn Tool> { self.inner.clone() as Arc<dyn Tool> }
+}
+
+/// Whisper transcription tool — POST audio file to OpenAI-compatible
+/// `/audio/transcriptions` endpoint. Works with OpenAI directly + every
+/// provider that mimics that surface (Groq, Together, OpenRouter,
+/// self-hosted whisper.cpp + vLLM-with-Whisper).
+///
+/// Tool args (the LLM passes these as JSON):
+///   - audio_path (required): local file path
+///   - language (optional): ISO-639-1 code like "en"
+///   - prompt (optional): transcript-style hint to bias the recognizer
+///   - response_format: "json" (default) | "text" | "verbose_json"
+///
+/// ```python
+/// from litgraph.tools import WhisperTranscribeTool
+/// from litgraph.agents import ReactAgent
+///
+/// whisper = WhisperTranscribeTool(api_key=os.environ["OPENAI_API_KEY"])
+/// agent = ReactAgent(model, tools=[whisper])
+/// result = agent.invoke("Transcribe /tmp/podcast.mp3 and summarize it.")
+/// ```
+#[pyclass(name = "WhisperTranscribeTool", module = "litgraph.tools")]
+#[derive(Clone)]
+pub struct PyWhisperTranscribeTool { pub(crate) inner: Arc<WhisperTranscribeTool> }
+
+#[pymethods]
+impl PyWhisperTranscribeTool {
+    #[new]
+    #[pyo3(signature = (api_key, model="whisper-1", base_url=None, timeout_s=120, max_file_size_bytes=26_214_400))]
+    fn new(
+        api_key: String,
+        model: &str,
+        base_url: Option<String>,
+        timeout_s: u64,
+        max_file_size_bytes: u64,
+    ) -> PyResult<Self> {
+        let mut cfg = WhisperConfig::new(api_key)
+            .with_model(model)
+            .with_timeout(std::time::Duration::from_secs(timeout_s))
+            .with_max_file_size(max_file_size_bytes);
+        if let Some(url) = base_url { cfg = cfg.with_base_url(url); }
+        let t = WhisperTranscribeTool::new(cfg)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        Ok(Self { inner: Arc::new(t) })
+    }
+    #[getter] fn name(&self) -> &'static str { "whisper_transcribe" }
+    fn __repr__(&self) -> String { "WhisperTranscribeTool()".into() }
+}
+
+impl PyWhisperTranscribeTool {
+    pub(crate) fn as_tool(&self) -> Arc<dyn Tool> { self.inner.clone() as Arc<dyn Tool> }
+}
+
+/// DALL-E / image-generation tool — POST text prompts to a DALL-E
+/// compatible `/images/generations` endpoint. Works with OpenAI directly
+/// + self-hosted Stable Diffusion through OpenAI-compat proxies.
+///
+/// Tool args (the LLM passes these as JSON):
+///   - prompt (required): description of the desired image
+///   - size (optional): "1024x1024" (default), "1024x1792", "1792x1024"
+///   - quality (optional): "standard" | "hd" (DALL-E 3 only; hd ~2x cost)
+///   - n (optional): 1..10 (DALL-E 3 enforces 1)
+///   - response_format (optional): "url" (default, ~1h CDN URL) | "b64_json" (inline base64)
+///
+/// Returns: `{"images": [{"url"|"b64_json": "..."}, ...]}`.
+///
+/// ```python
+/// from litgraph.tools import DalleImageTool
+/// from litgraph.agents import ReactAgent
+///
+/// dalle = DalleImageTool(api_key=os.environ["OPENAI_API_KEY"])
+/// agent = ReactAgent(model, tools=[dalle])
+/// result = agent.invoke("draw me a watercolor cat in a sunbeam.")
+/// ```
+#[pyclass(name = "DalleImageTool", module = "litgraph.tools")]
+#[derive(Clone)]
+pub struct PyDalleImageTool { pub(crate) inner: Arc<DalleImageTool> }
+
+#[pymethods]
+impl PyDalleImageTool {
+    #[new]
+    #[pyo3(signature = (api_key, model="dall-e-3", base_url=None, timeout_s=120))]
+    fn new(
+        api_key: String,
+        model: &str,
+        base_url: Option<String>,
+        timeout_s: u64,
+    ) -> PyResult<Self> {
+        let mut cfg = DalleConfig::new(api_key)
+            .with_model(model)
+            .with_timeout(std::time::Duration::from_secs(timeout_s));
+        if let Some(url) = base_url { cfg = cfg.with_base_url(url); }
+        let t = DalleImageTool::new(cfg)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        Ok(Self { inner: Arc::new(t) })
+    }
+    #[getter] fn name(&self) -> &'static str { "image_generate" }
+    fn __repr__(&self) -> String { "DalleImageTool()".into() }
+}
+
+impl PyDalleImageTool {
+    pub(crate) fn as_tool(&self) -> Arc<dyn Tool> { self.inner.clone() as Arc<dyn Tool> }
+}
+
+/// Text-to-speech tool — POST text to OpenAI-compatible `/audio/speech`,
+/// write the binary audio response to disk, return the file path. Closes
+/// the audio-OUTPUT modality.
+///
+/// Tool args (the LLM passes these as JSON):
+///   - text (required): what to say
+///   - voice (required): "alloy" | "echo" | "fable" | "onyx" | "nova" | "shimmer"
+///   - output_path (required): local file path for the audio file
+///   - format (optional): "mp3" (default) | "opus" | "aac" | "flac" | "wav" | "pcm"
+///   - speed (optional): 0.25..4.0 (default 1.0)
+///   - model (optional): "tts-1" (default) | "tts-1-hd"
+///
+/// Returns: `{"audio_path": "/tmp/x.mp3", "format": "mp3", "size_bytes": N}`.
+///
+/// ```python
+/// from litgraph.tools import TtsAudioTool
+/// from litgraph.agents import ReactAgent
+///
+/// tts = TtsAudioTool(api_key=os.environ["OPENAI_API_KEY"])
+/// agent = ReactAgent(model, tools=[tts])
+/// result = agent.invoke("Read this paragraph aloud and save to /tmp/out.mp3: ...")
+/// ```
+#[pyclass(name = "TtsAudioTool", module = "litgraph.tools")]
+#[derive(Clone)]
+pub struct PyTtsAudioTool { pub(crate) inner: Arc<TtsAudioTool> }
+
+#[pymethods]
+impl PyTtsAudioTool {
+    #[new]
+    #[pyo3(signature = (
+        api_key,
+        model="tts-1",
+        base_url=None,
+        timeout_s=120,
+        max_text_len=4096,
+    ))]
+    fn new(
+        api_key: String,
+        model: &str,
+        base_url: Option<String>,
+        timeout_s: u64,
+        max_text_len: usize,
+    ) -> PyResult<Self> {
+        let mut cfg = TtsConfig::new(api_key)
+            .with_model(model)
+            .with_timeout(std::time::Duration::from_secs(timeout_s))
+            .with_max_text_len(max_text_len);
+        if let Some(url) = base_url { cfg = cfg.with_base_url(url); }
+        let t = TtsAudioTool::new(cfg)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        Ok(Self { inner: Arc::new(t) })
+    }
+    #[getter] fn name(&self) -> &'static str { "tts_speak" }
+    fn __repr__(&self) -> String { "TtsAudioTool()".into() }
+}
+
+impl PyTtsAudioTool {
+    pub(crate) fn as_tool(&self) -> Arc<dyn Tool> { self.inner.clone() as Arc<dyn Tool> }
+}
+
+/// TTL + LRU cache wrapper around any tool. Identical-arg calls within
+/// the TTL window return the cached prior result without invoking the
+/// inner tool. Use for: web search, DB queries, deterministic API
+/// lookups. Don't use for: side-effecting tools (write_file, shell,
+/// post-to-slack), non-deterministic tools (random sampling, current-
+/// time lookup).
+///
+/// ```python
+/// from litgraph.tools import BraveSearchTool, CachedTool
+/// raw = BraveSearchTool(api_key=...)
+/// cached = CachedTool(raw, ttl_seconds=3600, max_entries=256)
+/// agent = ReactAgent(model, tools=[cached])
+/// ```
+///
+/// Cache key = `{tool_name}\0{canonical_json(args)}` — `{"a":1,"b":2}`
+/// and `{"b":2,"a":1}` collide as the same entry.
+#[pyclass(name = "CachedTool", module = "litgraph.tools")]
+#[derive(Clone)]
+pub struct PyCachedTool { pub(crate) inner: Arc<CachedTool> }
+
+#[pymethods]
+impl PyCachedTool {
+    #[new]
+    #[pyo3(signature = (tool, ttl_seconds=3600, max_entries=256))]
+    fn new(tool: Bound<'_, PyAny>, ttl_seconds: u64, max_entries: usize) -> PyResult<Self> {
+        let inner_tool = extract_tool_arc(&tool)?;
+        let cached = CachedTool::wrap(
+            inner_tool,
+            std::time::Duration::from_secs(ttl_seconds),
+            max_entries,
+        );
+        Ok(Self { inner: cached })
+    }
+
+    /// Drop all entries — useful for tests + manual invalidation.
+    fn clear(&self) {
+        self.inner.clear();
+    }
+
+    /// Number of cached entries (TTL-expired entries removed lazily, so
+    /// this may overcount briefly until the next access).
+    fn __len__(&self) -> usize {
+        self.inner.len()
+    }
+
+    fn __repr__(&self) -> String {
+        format!("CachedTool(inner_size={})", self.inner.len())
+    }
+}
+
+impl PyCachedTool {
+    pub(crate) fn as_tool(&self) -> Arc<dyn Tool> { self.inner.clone() as Arc<dyn Tool> }
+}
+
+/// Execute a Python snippet in a sandboxed subprocess. The agent passes
+/// `code` (Python source) and gets back `{exit_code, stdout, stderr,
+/// elapsed_ms}`. Use for: math beyond Calculator's expression grammar,
+/// data wrangling, JSON / CSV transforms, regex extraction.
+///
+/// Sandbox properties:
+/// - subprocess (NOT eval) — failures stay in the child
+/// - parent env stripped — only PATH/HOME/LANG/LC_ALL/TMPDIR pass through
+/// - `with_extra_env` opts in additional vars (use sparingly — secrets!)
+/// - working_dir is mandatory; child's CWD is set there
+/// - timeout via SIGKILL (default 30s; per-call override capped at config)
+/// - stdout/stderr each capped (default 64 KiB)
+/// - stdin closed; code can't `input()`-block
+///
+/// **NOT** sandboxed against: network access, filesystem reads outside
+/// working_dir (HOME is in scope), CPU/RAM exhaustion (timeout-only).
+/// Run in a chroot/jail/container for adversarial input.
+///
+/// ```python
+/// from litgraph.tools import PythonReplTool
+/// import tempfile
+/// repl = PythonReplTool(working_dir=tempfile.mkdtemp())
+/// agent = ReactAgent(model, tools=[repl])
+/// result = agent.invoke("compute the mean of [3, 5, 8, 13, 21]")
+/// ```
+#[pyclass(name = "PythonReplTool", module = "litgraph.tools")]
+#[derive(Clone)]
+pub struct PyPythonReplTool { pub(crate) inner: Arc<PythonReplTool> }
+
+#[pymethods]
+impl PyPythonReplTool {
+    #[new]
+    #[pyo3(signature = (
+        working_dir,
+        python="python3",
+        timeout_s=30,
+        max_output_bytes=65536,
+        extra_env=None,
+    ))]
+    fn new(
+        working_dir: String,
+        python: &str,
+        timeout_s: u64,
+        max_output_bytes: usize,
+        extra_env: Option<Vec<String>>,
+    ) -> PyResult<Self> {
+        let mut cfg = PythonReplConfig::new(&working_dir)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?
+            .with_python(python)
+            .with_timeout(std::time::Duration::from_secs(timeout_s))
+            .with_max_output_bytes(max_output_bytes);
+        if let Some(keys) = extra_env {
+            cfg = cfg.with_extra_env(keys);
+        }
+        Ok(Self { inner: Arc::new(PythonReplTool::new(cfg)) })
+    }
+    #[getter] fn name(&self) -> &'static str { "python_repl" }
+    fn __repr__(&self) -> String { "PythonReplTool()".into() }
+}
+
+impl PyPythonReplTool {
     pub(crate) fn as_tool(&self) -> Arc<dyn Tool> { self.inner.clone() as Arc<dyn Tool> }
 }
 

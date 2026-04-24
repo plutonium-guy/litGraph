@@ -7,7 +7,9 @@ use std::sync::{Arc, Mutex};
 
 use futures::StreamExt;
 use litgraph_cache::{CachedModel, SemanticCachedModel};
-use litgraph_resilience::{RateLimitConfig, RateLimitedChatModel, RetryConfig, RetryingChatModel};
+use litgraph_resilience::{
+    FallbackChatModel, RateLimitConfig, RateLimitedChatModel, RetryConfig, RetryingChatModel,
+};
 use litgraph_core::model::ChatStreamEvent;
 use litgraph_core::{ChatModel, ChatOptions, Message, Role};
 use litgraph_observability::{CallbackBus, InstrumentedChatModel};
@@ -35,6 +37,7 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyCohereChat>()?;
     m.add_class::<PyChatStream>()?;
     m.add_class::<PyStructuredChatModel>()?;
+    m.add_class::<PyFallbackChat>()?;
     m.add_function(wrap_pyfunction!(with_structured_output, m)?)?;
     m.add_function(wrap_pyfunction!(ollama_chat, m)?)?;
     m.add_function(wrap_pyfunction!(groq_chat, m)?)?;
@@ -1390,4 +1393,90 @@ fn with_structured_output<'py>(
     let _ = py;
     let s = StructuredChatModel::new(inner, schema_value, schema_name).with_strict(strict);
     Ok(PyStructuredChatModel { inner: Arc::new(s) })
+}
+
+/// Auto-failover chat model. Wraps an ordered list of chat models. On
+/// transient failure (rate-limit / timeout / 5xx), routes to the next
+/// model in the list. The LAST model's error is propagated.
+///
+/// Use for provider failover (GPT-4 primary, Claude backup), cost
+/// shedding (GPT-4 primary, GPT-3.5 backup), or region failover.
+///
+/// `fall_through_on_all=True` falls through on EVERY error (including
+/// 4xx / parse errors). Default `False` is safer because a malformed
+/// request will likely fail the same way against backup providers.
+///
+/// ```python
+/// from litgraph.providers import OpenAIChat, AnthropicChat, FallbackChat
+/// chat = FallbackChat([
+///     OpenAIChat(api_key=..., model="gpt-4o"),
+///     AnthropicChat(api_key=..., model="claude-sonnet-4-6"),
+/// ])
+/// resp = chat.invoke([{"role": "user", "content": "hi"}])
+/// ```
+#[pyclass(name = "FallbackChat", module = "litgraph.providers")]
+pub struct PyFallbackChat {
+    inner: Arc<dyn ChatModel>,
+    name_label: String,
+}
+
+#[pymethods]
+impl PyFallbackChat {
+    #[new]
+    #[pyo3(signature = (models, fall_through_on_all=false))]
+    fn new(models: Bound<'_, PyList>, fall_through_on_all: bool) -> PyResult<Self> {
+        if models.is_empty() {
+            return Err(PyValueError::new_err(
+                "FallbackChat: chain must have at least one model",
+            ));
+        }
+        let mut inners: Vec<Arc<dyn ChatModel>> = Vec::with_capacity(models.len());
+        let mut labels: Vec<String> = Vec::with_capacity(models.len());
+        for item in models.iter() {
+            let m = crate::agents::extract_chat_model(&item)?;
+            labels.push(m.name().to_string());
+            inners.push(m);
+        }
+        let mut chain = FallbackChatModel::new(inners);
+        if fall_through_on_all {
+            chain = chain.fall_through_on_all();
+        }
+        let name_label = format!("fallback({})", labels.join(", "));
+        Ok(Self {
+            inner: Arc::new(chain),
+            name_label,
+        })
+    }
+
+    #[pyo3(signature = (messages, temperature=None, max_tokens=None))]
+    fn invoke<'py>(
+        &self,
+        py: Python<'py>,
+        messages: Bound<'py, PyList>,
+        temperature: Option<f32>,
+        max_tokens: Option<u32>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let msgs = parse_messages(&messages)?;
+        let opts = ChatOptions {
+            temperature,
+            max_tokens,
+            ..Default::default()
+        };
+        let m = self.inner.clone();
+        let resp = py.allow_threads(|| {
+            block_on_compat(async move { m.invoke(msgs, &opts).await })
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })?;
+        response_to_py_dict(py, &resp)
+    }
+
+    fn __repr__(&self) -> String {
+        self.name_label.clone()
+    }
+}
+
+impl PyFallbackChat {
+    pub(crate) fn chat_model(&self) -> Arc<dyn ChatModel> {
+        self.inner.clone()
+    }
 }

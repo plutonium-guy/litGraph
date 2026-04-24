@@ -219,6 +219,123 @@ impl ChatModel for RateLimitedChatModel {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Cross-provider fallback
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Chat model wrapper that tries a chain of inner models in order. On
+/// transient failure (rate-limit / timeout / 5xx) — or any error if
+/// `fall_through_on_all` is true — moves to the next model. The LAST
+/// model's error is propagated to the caller.
+///
+/// LangChain `Runnable.with_fallbacks([backup1, backup2])` parity. Real
+/// prod patterns:
+/// - **Provider failover**: GPT-4 primary, Claude backup, Gemini tertiary.
+///   When OpenAI has an outage, requests transparently route to Anthropic.
+/// - **Cost shedding**: GPT-4 primary, GPT-3.5 backup. On rate-limit,
+///   degrade to the cheaper model rather than block the user.
+/// - **Region failover**: us-east primary, us-west backup. On region
+///   outage, re-route within minutes.
+///
+/// # When to use vs `RetryingChatModel`
+///
+/// - `RetryingChatModel`: same provider, retry transient errors with
+///   exponential backoff. Use for "OpenAI 429s — try again in 500ms".
+/// - `FallbackChatModel`: DIFFERENT provider, immediate switch. Use for
+///   "OpenAI is down — try Anthropic right now". Compose them: wrap
+///   each inner provider in `RetryingChatModel`, then wrap the chain in
+///   `FallbackChatModel`.
+///
+/// # Streaming
+///
+/// `stream()` only tries the FIRST inner model — token streams can't
+/// gracefully fail-over mid-stream once the first chunk arrives. For
+/// streaming with fallback, capture the failure pre-stream-start at the
+/// consumer layer and re-call.
+pub struct FallbackChatModel {
+    /// Ordered list of providers. First is primary; rest are backups.
+    pub inners: Vec<Arc<dyn ChatModel>>,
+    /// If true, fall through on ANY error (not just transient ones).
+    /// Default false — preserves the "bad request → fail fast" semantics
+    /// of `RetryingChatModel`.
+    pub fall_through_on_all: bool,
+}
+
+impl FallbackChatModel {
+    /// Build a fallback chain. Panics if `inners` is empty (a chain with
+    /// no providers can't satisfy any request).
+    pub fn new(inners: Vec<Arc<dyn ChatModel>>) -> Self {
+        assert!(
+            !inners.is_empty(),
+            "FallbackChatModel: chain must have at least one model"
+        );
+        Self {
+            inners,
+            fall_through_on_all: false,
+        }
+    }
+
+    /// Configure to fall through on every error (4xx and parse failures
+    /// included). Use when the backup providers are TRULY equivalent
+    /// substitutes; default `false` is safer because a malformed request
+    /// against provider A will likely fail the same way against provider B.
+    pub fn fall_through_on_all(mut self) -> Self {
+        self.fall_through_on_all = true;
+        self
+    }
+}
+
+#[async_trait]
+impl ChatModel for FallbackChatModel {
+    fn name(&self) -> &str {
+        // Names of every backed model would be churn; use a stable label.
+        "fallback"
+    }
+
+    async fn invoke(
+        &self,
+        messages: Vec<Message>,
+        opts: &ChatOptions,
+    ) -> Result<ChatResponse> {
+        let last_idx = self.inners.len() - 1;
+        let mut last_err: Option<Error> = None;
+        for (i, inner) in self.inners.iter().enumerate() {
+            match inner.invoke(messages.clone(), opts).await {
+                Ok(resp) => {
+                    if i > 0 {
+                        debug!(
+                            primary_failed = %last_err.as_ref().map(|e| e.to_string()).unwrap_or_default(),
+                            fallback_idx = i,
+                            "fallback succeeded"
+                        );
+                    }
+                    return Ok(resp);
+                }
+                Err(e) => {
+                    let should_fall = self.fall_through_on_all || is_transient(&e);
+                    if i == last_idx || !should_fall {
+                        // Last model failed OR error is terminal — propagate.
+                        warn!(model_idx = i, error = %e, "FallbackChatModel exhausted or terminal");
+                        return Err(e);
+                    }
+                    debug!(model_idx = i, error = %e, "FallbackChatModel falling through");
+                    last_err = Some(e);
+                }
+            }
+        }
+        unreachable!("loop returns or sets last_err on every iteration");
+    }
+
+    async fn stream(
+        &self,
+        messages: Vec<Message>,
+        opts: &ChatOptions,
+    ) -> Result<ChatStream> {
+        // Only first model. See module doc.
+        self.inners[0].stream(messages, opts).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -370,5 +487,166 @@ mod tests {
         let total = start.elapsed();
         assert!(total >= Duration::from_millis(1490) && total < Duration::from_millis(2000),
             "4 calls @ 2 RPS should take ~1.5s, took {:?}", total);
+    }
+
+    // ---- FallbackChatModel tests ----------------------------------------
+
+    /// Deterministic model that records its name on every call and either
+    /// errors or returns success based on the constructor.
+    struct CannedModel {
+        label: &'static str,
+        result: CannedResult,
+        called: AtomicU32,
+    }
+
+    enum CannedResult {
+        Ok,
+        RateLimited,
+        Provider5xx,
+        BadRequest,
+    }
+
+    #[async_trait]
+    impl ChatModel for CannedModel {
+        fn name(&self) -> &str {
+            self.label
+        }
+        async fn invoke(&self, _m: Vec<Message>, _o: &ChatOptions) -> Result<ChatResponse> {
+            self.called.fetch_add(1, Ordering::SeqCst);
+            match self.result {
+                CannedResult::Ok => Ok(ChatResponse {
+                    message: Message::assistant(self.label.to_string()),
+                    finish_reason: FinishReason::Stop,
+                    usage: TokenUsage::default(),
+                    model: self.label.to_string(),
+                }),
+                CannedResult::RateLimited => Err(Error::RateLimited { retry_after_ms: None }),
+                CannedResult::Provider5xx => Err(Error::provider("503 service unavailable")),
+                CannedResult::BadRequest => Err(Error::invalid("malformed prompt")),
+            }
+        }
+        async fn stream(&self, _m: Vec<Message>, _o: &ChatOptions) -> Result<ChatStream> {
+            unimplemented!()
+        }
+    }
+
+    fn canned(label: &'static str, result: CannedResult) -> Arc<CannedModel> {
+        Arc::new(CannedModel {
+            label,
+            result,
+            called: AtomicU32::new(0),
+        })
+    }
+
+    #[tokio::test]
+    async fn fallback_uses_primary_when_it_succeeds() {
+        let primary = canned("primary", CannedResult::Ok);
+        let backup = canned("backup", CannedResult::Ok);
+        let chain = FallbackChatModel::new(vec![
+            primary.clone() as Arc<dyn ChatModel>,
+            backup.clone() as Arc<dyn ChatModel>,
+        ]);
+        let resp = chain.invoke(vec![], &ChatOptions::default()).await.unwrap();
+        assert_eq!(resp.message.text_content(), "primary");
+        assert_eq!(primary.called.load(Ordering::SeqCst), 1);
+        assert_eq!(backup.called.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn fallback_falls_through_on_rate_limit() {
+        let primary = canned("primary", CannedResult::RateLimited);
+        let backup = canned("backup", CannedResult::Ok);
+        let chain = FallbackChatModel::new(vec![
+            primary.clone() as Arc<dyn ChatModel>,
+            backup.clone() as Arc<dyn ChatModel>,
+        ]);
+        let resp = chain.invoke(vec![], &ChatOptions::default()).await.unwrap();
+        assert_eq!(resp.message.text_content(), "backup");
+        assert_eq!(primary.called.load(Ordering::SeqCst), 1);
+        assert_eq!(backup.called.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn fallback_falls_through_on_5xx() {
+        let primary = canned("primary", CannedResult::Provider5xx);
+        let backup = canned("backup", CannedResult::Ok);
+        let chain = FallbackChatModel::new(vec![
+            primary.clone() as Arc<dyn ChatModel>,
+            backup.clone() as Arc<dyn ChatModel>,
+        ]);
+        let resp = chain.invoke(vec![], &ChatOptions::default()).await.unwrap();
+        assert_eq!(resp.message.text_content(), "backup");
+    }
+
+    #[tokio::test]
+    async fn fallback_propagates_terminal_error_by_default() {
+        // Bad request — same prompt would fail on backup too. Default is
+        // fail-fast (don't waste tokens trying provider B).
+        let primary = canned("primary", CannedResult::BadRequest);
+        let backup = canned("backup", CannedResult::Ok);
+        let chain = FallbackChatModel::new(vec![
+            primary.clone() as Arc<dyn ChatModel>,
+            backup.clone() as Arc<dyn ChatModel>,
+        ]);
+        let err = chain.invoke(vec![], &ChatOptions::default()).await.unwrap_err();
+        assert!(matches!(err, Error::InvalidInput(_)));
+        assert_eq!(primary.called.load(Ordering::SeqCst), 1);
+        assert_eq!(backup.called.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn fallback_with_fall_through_on_all_tries_backup_on_terminal_too() {
+        let primary = canned("primary", CannedResult::BadRequest);
+        let backup = canned("backup", CannedResult::Ok);
+        let chain = FallbackChatModel::new(vec![
+            primary.clone() as Arc<dyn ChatModel>,
+            backup.clone() as Arc<dyn ChatModel>,
+        ])
+        .fall_through_on_all();
+        let resp = chain.invoke(vec![], &ChatOptions::default()).await.unwrap();
+        assert_eq!(resp.message.text_content(), "backup");
+        assert_eq!(primary.called.load(Ordering::SeqCst), 1);
+        assert_eq!(backup.called.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn fallback_propagates_last_error_when_all_models_fail() {
+        let p = canned("p", CannedResult::RateLimited);
+        let b1 = canned("b1", CannedResult::Provider5xx);
+        let b2 = canned("b2", CannedResult::RateLimited);
+        let chain = FallbackChatModel::new(vec![
+            p.clone() as Arc<dyn ChatModel>,
+            b1.clone() as Arc<dyn ChatModel>,
+            b2.clone() as Arc<dyn ChatModel>,
+        ]);
+        let err = chain.invoke(vec![], &ChatOptions::default()).await.unwrap_err();
+        // Last error (b2's RateLimited) is what surfaces.
+        assert!(matches!(err, Error::RateLimited { .. }));
+        assert_eq!(p.called.load(Ordering::SeqCst), 1);
+        assert_eq!(b1.called.load(Ordering::SeqCst), 1);
+        assert_eq!(b2.called.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn fallback_walks_chain_until_one_succeeds() {
+        let p = canned("p", CannedResult::RateLimited);
+        let b1 = canned("b1", CannedResult::Provider5xx);
+        let b2 = canned("b2", CannedResult::Ok);
+        let chain = FallbackChatModel::new(vec![
+            p.clone() as Arc<dyn ChatModel>,
+            b1.clone() as Arc<dyn ChatModel>,
+            b2.clone() as Arc<dyn ChatModel>,
+        ]);
+        let resp = chain.invoke(vec![], &ChatOptions::default()).await.unwrap();
+        assert_eq!(resp.message.text_content(), "b2");
+        assert_eq!(p.called.load(Ordering::SeqCst), 1);
+        assert_eq!(b1.called.load(Ordering::SeqCst), 1);
+        assert_eq!(b2.called.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "chain must have at least one model")]
+    async fn fallback_panics_on_empty_chain() {
+        let _ = FallbackChatModel::new(vec![]);
     }
 }

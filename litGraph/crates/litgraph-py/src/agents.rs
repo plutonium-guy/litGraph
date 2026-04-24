@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use futures::StreamExt;
 use litgraph_agents::{
     AgentEvent, ReactAgent, ReactAgentConfig, StoppedReason, SupervisorAgent, SupervisorConfig,
-    TextReActAgent, TextReactAgentConfig, TextReactTurn,
+    TextReActAgent, TextReactAgentConfig, TextReactEvent, TextReactTurn,
 };
 use litgraph_core::{ChatModel, ChatOptions, Message, Role};
 use pyo3::exceptions::{PyRuntimeError, PyStopIteration, PyValueError};
@@ -17,13 +17,14 @@ use tokio::sync::mpsc;
 use crate::graph::json_to_py;
 
 use crate::providers::{
-    PyAnthropicChat, PyBedrockChat, PyBedrockConverseChat, PyCohereChat, PyGeminiChat,
-    PyOpenAIChat, PyOpenAIResponses, PyStructuredChatModel,
+    PyAnthropicChat, PyBedrockChat, PyBedrockConverseChat, PyCohereChat, PyFallbackChat,
+    PyGeminiChat, PyOpenAIChat, PyOpenAIResponses, PyStructuredChatModel,
 };
 use crate::runtime::{block_on_compat, rt};
 use crate::tools::{
-    PyBraveSearchTool, PyCalculatorTool, PyDuckDuckGoSearchTool, PyFunctionTool, PyHttpRequestTool,
-    PyListDirectoryTool, PyReadFileTool, PyShellTool, PySqliteQueryTool, PyTavilySearchTool,
+    PyBraveSearchTool, PyCachedTool, PyCalculatorTool, PyDalleImageTool, PyDuckDuckGoSearchTool,
+    PyFunctionTool, PyHttpRequestTool, PyListDirectoryTool, PyPythonReplTool, PyReadFileTool,
+    PyShellTool, PySqliteQueryTool, PyTavilySearchTool, PyTtsAudioTool, PyWhisperTranscribeTool,
     PyWriteFileTool,
 };
 use crate::mcp::PyMcpTool;
@@ -33,6 +34,7 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PySupervisorAgent>()?;
     m.add_class::<PyAgentEventStream>()?;
     m.add_class::<PyTextReActAgent>()?;
+    m.add_class::<PyTextReactEventStream>()?;
     Ok(())
 }
 
@@ -63,11 +65,23 @@ fn extract_tools(tools: &Bound<'_, PyList>) -> PyResult<Vec<Arc<dyn litgraph_cor
             tool_vec.push(d.as_tool());
         } else if let Ok(sq) = item.extract::<PyRef<PySqliteQueryTool>>() {
             tool_vec.push(sq.as_tool());
+        } else if let Ok(wh) = item.extract::<PyRef<PyWhisperTranscribeTool>>() {
+            tool_vec.push(wh.as_tool());
+        } else if let Ok(dl) = item.extract::<PyRef<PyDalleImageTool>>() {
+            tool_vec.push(dl.as_tool());
+        } else if let Ok(tt) = item.extract::<PyRef<PyTtsAudioTool>>() {
+            tool_vec.push(tt.as_tool());
+        } else if let Ok(ct) = item.extract::<PyRef<PyCachedTool>>() {
+            tool_vec.push(ct.as_tool());
+        } else if let Ok(pr) = item.extract::<PyRef<PyPythonReplTool>>() {
+            tool_vec.push(pr.as_tool());
         } else {
             return Err(PyValueError::new_err(
                 "tools must be FunctionTool, BraveSearchTool, TavilySearchTool, \
                  DuckDuckGoSearchTool, CalculatorTool, HttpRequestTool, ReadFileTool, \
-                 WriteFileTool, ListDirectoryTool, ShellTool, SqliteQueryTool, or McpTool",
+                 WriteFileTool, ListDirectoryTool, ShellTool, SqliteQueryTool, \
+                 WhisperTranscribeTool, DalleImageTool, TtsAudioTool, CachedTool, \
+                 PythonReplTool, or McpTool",
             ));
         }
     }
@@ -91,9 +105,11 @@ pub(crate) fn extract_chat_model(bound: &Bound<'_, PyAny>) -> PyResult<Arc<dyn C
         Ok(c.chat_model())
     } else if let Ok(s) = bound.extract::<PyRef<PyStructuredChatModel>>() {
         Ok(s.chat_model())
+    } else if let Ok(f) = bound.extract::<PyRef<PyFallbackChat>>() {
+        Ok(f.chat_model())
     } else {
         Err(PyValueError::new_err(
-            "model must be OpenAIChat, OpenAIResponses, AnthropicChat, GeminiChat, BedrockChat, CohereChat, or StructuredChatModel",
+            "model must be OpenAIChat, OpenAIResponses, AnthropicChat, GeminiChat, BedrockChat, CohereChat, StructuredChatModel, or FallbackChat",
         ))
     }
 }
@@ -144,11 +160,23 @@ impl PyReactAgent {
                 tool_vec.push(d.as_tool());
             } else if let Ok(sq) = item.extract::<PyRef<PySqliteQueryTool>>() {
                 tool_vec.push(sq.as_tool());
+            } else if let Ok(wh) = item.extract::<PyRef<PyWhisperTranscribeTool>>() {
+                tool_vec.push(wh.as_tool());
+            } else if let Ok(dl) = item.extract::<PyRef<PyDalleImageTool>>() {
+                tool_vec.push(dl.as_tool());
+            } else if let Ok(tt) = item.extract::<PyRef<PyTtsAudioTool>>() {
+                tool_vec.push(tt.as_tool());
+            } else if let Ok(ct) = item.extract::<PyRef<PyCachedTool>>() {
+                tool_vec.push(ct.as_tool());
+            } else if let Ok(pr) = item.extract::<PyRef<PyPythonReplTool>>() {
+                tool_vec.push(pr.as_tool());
             } else {
                 return Err(PyValueError::new_err(
                     "tools must be FunctionTool, BraveSearchTool, TavilySearchTool, \
                      DuckDuckGoSearchTool, CalculatorTool, HttpRequestTool, ReadFileTool, \
-                     WriteFileTool, ListDirectoryTool, ShellTool, SqliteQueryTool, or McpTool",
+                     WriteFileTool, ListDirectoryTool, ShellTool, SqliteQueryTool, \
+                     WhisperTranscribeTool, DalleImageTool, TtsAudioTool, CachedTool, \
+                     PythonReplTool, or McpTool",
                 ));
             }
         }
@@ -486,6 +514,174 @@ impl PyTextReActAgent {
         out.set_item("trace", trace)?;
         Ok(out)
     }
+
+    /// Stream per-turn events. Returns an iterator of dicts; each carries
+    /// a `type` field. Variants:
+    ///   - `iteration_start` {iteration}
+    ///   - `llm_response` {iteration, text}
+    ///   - `parsed_action` {iteration, thought, tool, input}
+    ///   - `parsed_final` {iteration, thought, answer}
+    ///   - `parse_error` {iteration, error, raw_response}  [terminal]
+    ///   - `tool_start` {iteration, tool, input}
+    ///   - `tool_result` {iteration, tool, observation, is_error, duration_ms}
+    ///   - `tool_not_found` {iteration, tool, available}  [terminal]
+    ///   - `final` {answer, iterations}                   [terminal]
+    ///   - `max_iterations` {iterations}                  [terminal]
+    ///
+    /// ```python
+    /// for ev in agent.stream("solve this"):
+    ///     print(ev["type"], ev)
+    /// ```
+    fn stream<'py>(&self, _py: Python<'py>, user: String) -> PyResult<Py<PyTextReactEventStream>> {
+        let agent = self.inner.clone();
+        let (tx, rx) = mpsc::channel::<litgraph_core::Result<TextReactEvent>>(64);
+        rt().spawn(async move {
+            let mut s = agent.stream(user);
+            while let Some(ev) = s.next().await {
+                if tx.send(ev).await.is_err() {
+                    break;
+                }
+            }
+        });
+        Python::with_gil(|py| {
+            Py::new(
+                py,
+                PyTextReactEventStream {
+                    rx: Arc::new(Mutex::new(Some(rx))),
+                },
+            )
+        })
+    }
+}
+
+/// Iterator of TextReActAgent events. `__next__` blocks on the receiver
+/// with the GIL released, returns one event dict, or raises StopIteration.
+#[pyclass(name = "TextReactEventStream", module = "litgraph.agents")]
+pub struct PyTextReactEventStream {
+    rx: Arc<Mutex<Option<mpsc::Receiver<litgraph_core::Result<TextReactEvent>>>>>,
+}
+
+#[pymethods]
+impl PyTextReactEventStream {
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __next__<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let slot = self.rx.clone();
+        let ev = py.allow_threads(|| {
+            let mut guard = slot.lock().expect("poisoned");
+            let mut rx = match guard.take() {
+                Some(r) => r,
+                None => return None,
+            };
+            let got = block_on_compat(async { rx.recv().await });
+            *guard = Some(rx);
+            got
+        });
+        match ev {
+            Some(Ok(e)) => text_react_event_to_py(py, &e),
+            Some(Err(e)) => Err(PyRuntimeError::new_err(e.to_string())),
+            None => {
+                *self.rx.lock().expect("poisoned") = None;
+                Err(PyStopIteration::new_err("text-react event stream exhausted"))
+            }
+        }
+    }
+}
+
+fn text_react_event_to_py<'py>(
+    py: Python<'py>,
+    ev: &TextReactEvent,
+) -> PyResult<Bound<'py, PyDict>> {
+    let d = PyDict::new_bound(py);
+    match ev {
+        TextReactEvent::IterationStart { iteration } => {
+            d.set_item("type", "iteration_start")?;
+            d.set_item("iteration", *iteration)?;
+        }
+        TextReactEvent::LlmResponse { iteration, text } => {
+            d.set_item("type", "llm_response")?;
+            d.set_item("iteration", *iteration)?;
+            d.set_item("text", text)?;
+        }
+        TextReactEvent::ParsedAction {
+            iteration,
+            thought,
+            tool,
+            input,
+        } => {
+            d.set_item("type", "parsed_action")?;
+            d.set_item("iteration", *iteration)?;
+            d.set_item("thought", thought.clone())?;
+            d.set_item("tool", tool)?;
+            d.set_item("input", json_to_py(py, input)?)?;
+        }
+        TextReactEvent::ParsedFinal {
+            iteration,
+            thought,
+            answer,
+        } => {
+            d.set_item("type", "parsed_final")?;
+            d.set_item("iteration", *iteration)?;
+            d.set_item("thought", thought.clone())?;
+            d.set_item("answer", answer)?;
+        }
+        TextReactEvent::ParseError {
+            iteration,
+            error,
+            raw_response,
+        } => {
+            d.set_item("type", "parse_error")?;
+            d.set_item("iteration", *iteration)?;
+            d.set_item("error", error)?;
+            d.set_item("raw_response", raw_response)?;
+        }
+        TextReactEvent::ToolStart {
+            iteration,
+            tool,
+            input,
+        } => {
+            d.set_item("type", "tool_start")?;
+            d.set_item("iteration", *iteration)?;
+            d.set_item("tool", tool)?;
+            d.set_item("input", json_to_py(py, input)?)?;
+        }
+        TextReactEvent::ToolResult {
+            iteration,
+            tool,
+            observation,
+            is_error,
+            duration_ms,
+        } => {
+            d.set_item("type", "tool_result")?;
+            d.set_item("iteration", *iteration)?;
+            d.set_item("tool", tool)?;
+            d.set_item("observation", observation)?;
+            d.set_item("is_error", *is_error)?;
+            d.set_item("duration_ms", *duration_ms)?;
+        }
+        TextReactEvent::Final { answer, iterations } => {
+            d.set_item("type", "final")?;
+            d.set_item("answer", answer)?;
+            d.set_item("iterations", *iterations)?;
+        }
+        TextReactEvent::MaxIterations { iterations } => {
+            d.set_item("type", "max_iterations")?;
+            d.set_item("iterations", *iterations)?;
+        }
+        TextReactEvent::ToolNotFound {
+            iteration,
+            tool,
+            available,
+        } => {
+            d.set_item("type", "tool_not_found")?;
+            d.set_item("iteration", *iteration)?;
+            d.set_item("tool", tool)?;
+            d.set_item("available", available.clone())?;
+        }
+    }
+    Ok(d)
 }
 
 fn text_react_turn_to_py<'py>(

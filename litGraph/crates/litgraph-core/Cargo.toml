@@ -16,6 +16,7 @@ schemars.workspace = true
 thiserror.workspace = true
 minijinja.workspace = true
 tracing.workspace = true
+regex.workspace = true
 tokio = { workspace = true, optional = true }
 
 [features]
