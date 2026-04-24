@@ -16,6 +16,8 @@ members = [
     "crates/litgraph-stores-qdrant",
     "crates/litgraph-stores-pgvector",
     "crates/litgraph-stores-chroma",
+    "crates/litgraph-stores-weaviate",
+    "crates/litgraph-memory-sqlite",
     "crates/litgraph-rerankers-cohere",
     "crates/litgraph-rerankers-voyage",
     "crates/litgraph-rerankers-jina",
@@ -144,6 +146,8 @@ litgraph-stores-hnsw = { path = "crates/litgraph-stores-hnsw", version = "0.1.0"
 litgraph-stores-qdrant = { path = "crates/litgraph-stores-qdrant", version = "0.1.0" }
 litgraph-stores-pgvector = { path = "crates/litgraph-stores-pgvector", version = "0.1.0" }
 litgraph-stores-chroma = { path = "crates/litgraph-stores-chroma", version = "0.1.0" }
+litgraph-stores-weaviate = { path = "crates/litgraph-stores-weaviate", version = "0.1.0" }
+litgraph-memory-sqlite = { path = "crates/litgraph-memory-sqlite", version = "0.1.0" }
 litgraph-rerankers-cohere = { path = "crates/litgraph-rerankers-cohere", version = "0.1.0" }
 litgraph-rerankers-voyage = { path = "crates/litgraph-rerankers-voyage", version = "0.1.0" }
 litgraph-rerankers-jina = { path = "crates/litgraph-rerankers-jina", version = "0.1.0" }

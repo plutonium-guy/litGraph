@@ -12,10 +12,10 @@ use litgraph_core::model::ChatStreamEvent;
 use litgraph_core::{ChatModel, ChatOptions, Message, Role};
 use litgraph_observability::{CallbackBus, InstrumentedChatModel};
 use litgraph_providers_anthropic::{AnthropicChat, AnthropicConfig};
-use litgraph_providers_bedrock::{AwsCredentials, BedrockChat, BedrockConfig};
+use litgraph_providers_bedrock::{AwsCredentials, BedrockChat, BedrockConfig, BedrockConverseChat};
 use litgraph_providers_cohere::{CohereChat, CohereChatConfig};
 use litgraph_providers_gemini::{GeminiChat, GeminiConfig};
-use litgraph_providers_openai::{OpenAIChat, OpenAIConfig};
+use litgraph_providers_openai::{OpenAIChat, OpenAIConfig, OpenAIResponses, OpenAIResponsesConfig};
 use pyo3::exceptions::{PyRuntimeError, PyStopIteration, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
@@ -27,11 +27,15 @@ use crate::runtime::{block_on_compat, rt};
 
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyOpenAIChat>()?;
+    m.add_class::<PyOpenAIResponses>()?;
     m.add_class::<PyAnthropicChat>()?;
     m.add_class::<PyGeminiChat>()?;
     m.add_class::<PyBedrockChat>()?;
+    m.add_class::<PyBedrockConverseChat>()?;
     m.add_class::<PyCohereChat>()?;
     m.add_class::<PyChatStream>()?;
+    m.add_class::<PyStructuredChatModel>()?;
+    m.add_function(wrap_pyfunction!(with_structured_output, m)?)?;
     m.add_function(wrap_pyfunction!(ollama_chat, m)?)?;
     m.add_function(wrap_pyfunction!(groq_chat, m)?)?;
     m.add_function(wrap_pyfunction!(together_chat, m)?)?;
@@ -445,6 +449,77 @@ impl PyOpenAIChat {
     }
 }
 
+/// OpenAI's `/v1/responses` endpoint — the new agentic chat API. Same
+/// `ChatModel` surface as `OpenAIChat`; supports server-side stateful
+/// chains via `previous_response_id` and a top-level `instructions` field.
+/// Streaming is not yet implemented (the Responses SSE event taxonomy
+/// differs from chat completions); use `invoke()`.
+///
+/// ```python
+/// from litgraph.providers import OpenAIResponses
+/// chat = OpenAIResponses(api_key=..., model="gpt-4o",
+///                        instructions="Be terse.",
+///                        previous_response_id="resp_abc")  # optional
+/// out = chat.invoke([{"role": "user", "content": "hi"}])
+/// ```
+#[pyclass(name = "OpenAIResponses", module = "litgraph.providers")]
+pub struct PyOpenAIResponses {
+    inner: Arc<dyn ChatModel>,
+    model: String,
+}
+
+#[pymethods]
+impl PyOpenAIResponses {
+    #[new]
+    #[pyo3(signature = (api_key, model, base_url=None, timeout_s=120,
+                        instructions=None, previous_response_id=None,
+                        on_request=None))]
+    fn new(
+        api_key: String,
+        model: String,
+        base_url: Option<String>,
+        timeout_s: u64,
+        instructions: Option<String>,
+        previous_response_id: Option<String>,
+        on_request: Option<Py<PyAny>>,
+    ) -> PyResult<Self> {
+        let mut cfg = OpenAIResponsesConfig::new(api_key, &model);
+        cfg.timeout = std::time::Duration::from_secs(timeout_s);
+        if let Some(url) = base_url { cfg = cfg.with_base_url(url); }
+        if let Some(s) = instructions { cfg = cfg.with_instructions(s); }
+        if let Some(id) = previous_response_id { cfg = cfg.with_previous_response_id(id); }
+        if let Some(cb) = on_request { cfg = cfg.with_on_request(wrap_py_inspector(cb)); }
+        let chat = OpenAIResponses::new(cfg).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        Ok(Self { inner: Arc::new(chat), model })
+    }
+
+    #[pyo3(signature = (messages, temperature=None, max_tokens=None))]
+    fn invoke<'py>(
+        &self,
+        py: Python<'py>,
+        messages: Bound<'py, PyList>,
+        temperature: Option<f32>,
+        max_tokens: Option<u32>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let msgs = parse_messages(&messages)?;
+        let opts = ChatOptions { temperature, max_tokens, ..Default::default() };
+        let chat = self.inner.clone();
+        let resp = py.allow_threads(|| {
+            block_on_compat(async move { chat.invoke(msgs, &opts).await })
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })?;
+        response_to_py_dict(py, &resp)
+    }
+
+    fn __repr__(&self) -> String { format!("OpenAIResponses(model='{}')", self.model) }
+}
+
+impl PyOpenAIResponses {
+    pub(crate) fn chat_model(&self) -> std::sync::Arc<dyn litgraph_core::ChatModel> {
+        self.inner.clone()
+    }
+}
+
 #[pyclass(name = "AnthropicChat", module = "litgraph.providers")]
 pub struct PyAnthropicChat {
     inner: Arc<dyn ChatModel>,
@@ -592,6 +667,48 @@ impl PyGeminiChat {
         on_request: Option<Py<PyAny>>,
     ) -> PyResult<Self> {
         let mut cfg = GeminiConfig::new(api_key, &model);
+        cfg.timeout = std::time::Duration::from_secs(timeout_s);
+        if let Some(url) = base_url { cfg = cfg.with_base_url(url); }
+        if let Some(cb) = on_request {
+            cfg = cfg.with_on_request(wrap_py_inspector(cb));
+        }
+        let chat = GeminiChat::new(cfg).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        Ok(Self { inner: Arc::new(chat), model, bus_handle: None })
+    }
+
+    /// Vertex AI mode — enterprise-grade Gemini via Google Cloud. Uses
+    /// OAuth2 Bearer auth (from a service account / ADC / gcloud), the
+    /// region-specific `{location}-aiplatform.googleapis.com` endpoint,
+    /// and a project+location-scoped URL path. Required by orgs with
+    /// VPC Service Controls / Cloud Audit / per-request IAM requirements.
+    ///
+    /// `access_token` is a Google OAuth2 token — caller mints it
+    /// externally (this adapter does NOT refresh). Typical sources:
+    /// `gcloud auth print-access-token`, Application Default Credentials,
+    /// workload identity on GKE/GCE, or a signed JWT → token exchange.
+    ///
+    /// ```python
+    /// from litgraph.providers import GeminiChat
+    /// chat = GeminiChat.vertex(
+    ///     project="my-gcp-project",
+    ///     location="us-central1",
+    ///     access_token="ya29.a0A...",
+    ///     model="gemini-1.5-pro",
+    /// )
+    /// out = chat.invoke([{"role":"user","content":"hi"}])
+    /// ```
+    #[staticmethod]
+    #[pyo3(signature = (project, location, access_token, model, base_url=None, timeout_s=120, on_request=None))]
+    fn vertex(
+        project: String,
+        location: String,
+        access_token: String,
+        model: String,
+        base_url: Option<String>,
+        timeout_s: u64,
+        on_request: Option<Py<PyAny>>,
+    ) -> PyResult<Self> {
+        let mut cfg = GeminiConfig::new_vertex(project, location, access_token, &model);
         cfg.timeout = std::time::Duration::from_secs(timeout_s);
         if let Some(url) = base_url { cfg = cfg.with_base_url(url); }
         if let Some(cb) = on_request {
@@ -815,6 +932,96 @@ impl PyBedrockChat {
 
 impl PyBedrockChat {
     pub(crate) fn chat_model(&self) -> std::sync::Arc<dyn litgraph_core::ChatModel> {
+        self.inner.clone()
+    }
+}
+
+/// AWS Bedrock Converse API — works across ALL model families (Llama, Titan,
+/// Mistral, Command, Nova, Anthropic) via one unified wire format. Direct
+/// Bedrock `/converse` parity. Use this when you want to swap between model
+/// families without rewriting prompt-adapter code.
+///
+/// Streaming not yet implemented — call `invoke()`.
+///
+/// ```python
+/// from litgraph.providers import BedrockConverseChat
+/// chat = BedrockConverseChat(
+///     access_key_id="AKIA...",
+///     secret_access_key="...",
+///     region="us-east-1",
+///     model_id="meta.llama3-70b-instruct-v1:0",
+/// )
+/// out = chat.invoke([{"role": "user", "content": "hello"}])
+/// ```
+#[pyclass(name = "BedrockConverseChat", module = "litgraph.providers")]
+pub struct PyBedrockConverseChat {
+    inner: Arc<dyn ChatModel>,
+    model: String,
+}
+
+#[pymethods]
+impl PyBedrockConverseChat {
+    #[new]
+    #[pyo3(signature = (
+        access_key_id, secret_access_key, region, model_id,
+        session_token=None, endpoint_override=None, timeout_s=120, max_tokens=4096,
+        on_request=None,
+    ))]
+    fn new(
+        access_key_id: String,
+        secret_access_key: String,
+        region: String,
+        model_id: String,
+        session_token: Option<String>,
+        endpoint_override: Option<String>,
+        timeout_s: u64,
+        max_tokens: u32,
+        on_request: Option<Py<PyAny>>,
+    ) -> PyResult<Self> {
+        let creds = AwsCredentials {
+            access_key_id,
+            secret_access_key,
+            session_token,
+        };
+        let mut cfg = BedrockConfig::new(creds, region, &model_id);
+        cfg.timeout = std::time::Duration::from_secs(timeout_s);
+        cfg.max_tokens = max_tokens;
+        if let Some(url) = endpoint_override {
+            cfg = cfg.with_endpoint(url);
+        }
+        if let Some(cb) = on_request {
+            cfg = cfg.with_on_request(wrap_py_inspector(cb));
+        }
+        let chat = BedrockConverseChat::new(cfg)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        Ok(Self { inner: Arc::new(chat), model: model_id })
+    }
+
+    #[pyo3(signature = (messages, temperature=None, max_tokens=None))]
+    fn invoke<'py>(
+        &self,
+        py: Python<'py>,
+        messages: Bound<'py, PyList>,
+        temperature: Option<f32>,
+        max_tokens: Option<u32>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let msgs = parse_messages(&messages)?;
+        let opts = ChatOptions { temperature, max_tokens, ..Default::default() };
+        let chat = self.inner.clone();
+        let resp = py.allow_threads(|| {
+            block_on_compat(async move { chat.invoke(msgs, &opts).await })
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })?;
+        response_to_py_dict(py, &resp)
+    }
+
+    fn __repr__(&self) -> String {
+        format!("BedrockConverseChat(model='{}')", self.model)
+    }
+}
+
+impl PyBedrockConverseChat {
+    pub(crate) fn chat_model(&self) -> Arc<dyn ChatModel> {
         self.inner.clone()
     }
 }
@@ -1050,4 +1257,137 @@ fn parse_messages(py_msgs: &Bound<'_, PyList>) -> PyResult<Vec<Message>> {
         });
     }
     Ok(out)
+}
+
+// ---------- StructuredChatModel (iter 89) ----------
+
+use litgraph_core::StructuredChatModel;
+
+/// Wraps a chat model with a JSON Schema. `invoke_structured()` returns
+/// the parsed dict directly; `invoke()` returns a normal ChatResponse but
+/// the text is guaranteed to be valid JSON matching the schema (errors
+/// otherwise — fail fast at the wrapper, not in user code).
+///
+/// Direct LangChain `ChatModel.with_structured_output(schema)` parity.
+///
+/// ```python
+/// from litgraph.providers import OpenAIChat, with_structured_output
+/// chat = OpenAIChat(api_key=..., model="gpt-4o")
+/// schema = {
+///     "type": "object",
+///     "properties": {
+///         "name": {"type": "string"},
+///         "age": {"type": "integer"},
+///     },
+///     "required": ["name", "age"],
+/// }
+/// structured = with_structured_output(chat, schema, name="Person")
+/// out = structured.invoke_structured([{"role": "user", "content": "Ada Lovelace, age 36"}])
+/// # out == {"name": "Ada Lovelace", "age": 36}
+/// ```
+#[pyclass(name = "StructuredChatModel", module = "litgraph.providers")]
+pub struct PyStructuredChatModel {
+    inner: Arc<StructuredChatModel>,
+}
+
+#[pymethods]
+impl PyStructuredChatModel {
+    /// Returns the parsed JSON dict directly. Errors when the LLM returns
+    /// malformed JSON; the error message includes the schema name + raw
+    /// response for debugging.
+    #[pyo3(signature = (messages, temperature=None, max_tokens=None))]
+    fn invoke_structured<'py>(
+        &self,
+        py: Python<'py>,
+        messages: Bound<'py, PyList>,
+        temperature: Option<f32>,
+        max_tokens: Option<u32>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let msgs = parse_messages(&messages)?;
+        let opts = ChatOptions { temperature, max_tokens, ..Default::default() };
+        let m = self.inner.clone();
+        let v = py.allow_threads(|| {
+            block_on_compat(async move { m.invoke_structured(msgs, &opts).await })
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })?;
+        crate::graph::json_to_py(py, &v)
+    }
+
+    /// Standard `invoke()` — returns the normal ChatResponse dict. Text is
+    /// guaranteed to be valid JSON matching the schema (errors otherwise).
+    #[pyo3(signature = (messages, temperature=None, max_tokens=None))]
+    fn invoke<'py>(
+        &self,
+        py: Python<'py>,
+        messages: Bound<'py, PyList>,
+        temperature: Option<f32>,
+        max_tokens: Option<u32>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let msgs = parse_messages(&messages)?;
+        let opts = ChatOptions { temperature, max_tokens, ..Default::default() };
+        let m = self.inner.clone();
+        let resp = py.allow_threads(|| {
+            block_on_compat(async move { m.invoke(msgs, &opts).await })
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })?;
+        response_to_py_dict(py, &resp)
+    }
+
+    fn __repr__(&self) -> String {
+        format!("StructuredChatModel(model='{}')", self.inner.name())
+    }
+}
+
+impl PyStructuredChatModel {
+    pub(crate) fn chat_model(&self) -> Arc<dyn ChatModel> {
+        self.inner.clone() as Arc<dyn ChatModel>
+    }
+}
+
+/// Wrap any chat model with a JSON Schema for structured output. `schema`
+/// is a dict (raw JSON Schema) or a Pydantic model class (with
+/// `model_json_schema()`).
+///
+/// `name` defaults to "Output" if not given. `strict=True` (default) makes
+/// providers refuse non-conforming responses where supported (OpenAI gpt-4o+);
+/// pass `strict=False` for OSS / older models that don't support strict mode.
+#[pyfunction]
+#[pyo3(signature = (model, schema, name=None, strict=true))]
+fn with_structured_output<'py>(
+    py: Python<'py>,
+    model: Bound<'py, PyAny>,
+    schema: Bound<'py, PyAny>,
+    name: Option<String>,
+    strict: bool,
+) -> PyResult<PyStructuredChatModel> {
+    let inner = crate::agents::extract_chat_model(&model)?;
+    // Schema input: dict (raw schema), or class with model_json_schema (pydantic).
+    let schema_value: serde_json::Value = if let Ok(d) = schema.downcast::<PyDict>() {
+        crate::graph::py_dict_to_json(d)?
+    } else if let Ok(method) = schema.getattr("model_json_schema") {
+        // Pydantic v2: cls.model_json_schema() returns a dict.
+        let result = method.call0()?;
+        let d = result.downcast_into::<PyDict>().map_err(|_| {
+            PyValueError::new_err("schema.model_json_schema() must return a dict")
+        })?;
+        crate::graph::py_dict_to_json(&d)?
+    } else if let Ok(method) = schema.getattr("schema") {
+        // Pydantic v1 fallback: cls.schema() returns a dict.
+        let result = method.call0()?;
+        let d = result.downcast_into::<PyDict>().map_err(|_| {
+            PyValueError::new_err("schema.schema() must return a dict")
+        })?;
+        crate::graph::py_dict_to_json(&d)?
+    } else {
+        return Err(PyValueError::new_err(
+            "schema must be a dict (JSON Schema), a Pydantic model class, or have a .schema()/.model_json_schema() method",
+        ));
+    };
+    // Default schema name: pull from the schema's "title" if present, else "Output".
+    let schema_name = name
+        .or_else(|| schema_value.get("title").and_then(|v| v.as_str()).map(String::from))
+        .unwrap_or_else(|| "Output".into());
+    let _ = py;
+    let s = StructuredChatModel::new(inner, schema_value, schema_name).with_strict(strict);
+    Ok(PyStructuredChatModel { inner: Arc::new(s) })
 }

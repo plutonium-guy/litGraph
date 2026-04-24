@@ -26,6 +26,27 @@ pub mod docx;
 #[cfg(feature = "docx")]
 pub use docx::DocxLoader;
 
+pub mod notion;
+pub use notion::NotionLoader;
+
+pub mod slack;
+pub use slack::SlackLoader;
+
+pub mod confluence;
+pub use confluence::ConfluenceLoader;
+
+pub mod github;
+pub use github::GithubIssuesLoader;
+
+pub mod github_files;
+pub use github_files::GithubFilesLoader;
+
+pub mod gmail;
+pub use gmail::GmailLoader;
+
+pub mod gdrive;
+pub use gdrive::GoogleDriveLoader;
+
 #[derive(Debug, thiserror::Error)]
 pub enum LoaderError {
     #[error("io: {0}")]

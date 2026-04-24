@@ -4,15 +4,21 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use futures::StreamExt;
-use litgraph_agents::{AgentEvent, ReactAgent, ReactAgentConfig, SupervisorAgent, SupervisorConfig};
+use litgraph_agents::{
+    AgentEvent, ReactAgent, ReactAgentConfig, StoppedReason, SupervisorAgent, SupervisorConfig,
+    TextReActAgent, TextReactAgentConfig, TextReactTurn,
+};
 use litgraph_core::{ChatModel, ChatOptions, Message, Role};
 use pyo3::exceptions::{PyRuntimeError, PyStopIteration, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use tokio::sync::mpsc;
 
+use crate::graph::json_to_py;
+
 use crate::providers::{
-    PyAnthropicChat, PyBedrockChat, PyCohereChat, PyGeminiChat, PyOpenAIChat,
+    PyAnthropicChat, PyBedrockChat, PyBedrockConverseChat, PyCohereChat, PyGeminiChat,
+    PyOpenAIChat, PyOpenAIResponses, PyStructuredChatModel,
 };
 use crate::runtime::{block_on_compat, rt};
 use crate::tools::{
@@ -26,23 +32,68 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyReactAgent>()?;
     m.add_class::<PySupervisorAgent>()?;
     m.add_class::<PyAgentEventStream>()?;
+    m.add_class::<PyTextReActAgent>()?;
     Ok(())
+}
+
+fn extract_tools(tools: &Bound<'_, PyList>) -> PyResult<Vec<Arc<dyn litgraph_core::tool::Tool>>> {
+    let mut tool_vec: Vec<Arc<dyn litgraph_core::tool::Tool>> = Vec::new();
+    for item in tools.iter() {
+        if let Ok(ft) = item.extract::<PyRef<PyFunctionTool>>() {
+            tool_vec.push(ft.as_tool());
+        } else if let Ok(b) = item.extract::<PyRef<PyBraveSearchTool>>() {
+            tool_vec.push(b.as_tool());
+        } else if let Ok(t) = item.extract::<PyRef<PyTavilySearchTool>>() {
+            tool_vec.push(t.as_tool());
+        } else if let Ok(c) = item.extract::<PyRef<PyCalculatorTool>>() {
+            tool_vec.push(c.as_tool());
+        } else if let Ok(h) = item.extract::<PyRef<PyHttpRequestTool>>() {
+            tool_vec.push(h.as_tool());
+        } else if let Ok(r) = item.extract::<PyRef<PyReadFileTool>>() {
+            tool_vec.push(r.as_tool());
+        } else if let Ok(w) = item.extract::<PyRef<PyWriteFileTool>>() {
+            tool_vec.push(w.as_tool());
+        } else if let Ok(l) = item.extract::<PyRef<PyListDirectoryTool>>() {
+            tool_vec.push(l.as_tool());
+        } else if let Ok(m) = item.extract::<PyRef<PyMcpTool>>() {
+            tool_vec.push(m.as_tool());
+        } else if let Ok(s) = item.extract::<PyRef<PyShellTool>>() {
+            tool_vec.push(s.as_tool());
+        } else if let Ok(d) = item.extract::<PyRef<PyDuckDuckGoSearchTool>>() {
+            tool_vec.push(d.as_tool());
+        } else if let Ok(sq) = item.extract::<PyRef<PySqliteQueryTool>>() {
+            tool_vec.push(sq.as_tool());
+        } else {
+            return Err(PyValueError::new_err(
+                "tools must be FunctionTool, BraveSearchTool, TavilySearchTool, \
+                 DuckDuckGoSearchTool, CalculatorTool, HttpRequestTool, ReadFileTool, \
+                 WriteFileTool, ListDirectoryTool, ShellTool, SqliteQueryTool, or McpTool",
+            ));
+        }
+    }
+    Ok(tool_vec)
 }
 
 pub(crate) fn extract_chat_model(bound: &Bound<'_, PyAny>) -> PyResult<Arc<dyn ChatModel>> {
     if let Ok(o) = bound.extract::<PyRef<PyOpenAIChat>>() {
         Ok(o.chat_model())
+    } else if let Ok(r) = bound.extract::<PyRef<PyOpenAIResponses>>() {
+        Ok(r.chat_model())
     } else if let Ok(a) = bound.extract::<PyRef<PyAnthropicChat>>() {
         Ok(a.chat_model())
     } else if let Ok(g) = bound.extract::<PyRef<PyGeminiChat>>() {
         Ok(g.chat_model())
     } else if let Ok(b) = bound.extract::<PyRef<PyBedrockChat>>() {
         Ok(b.chat_model())
+    } else if let Ok(bc) = bound.extract::<PyRef<PyBedrockConverseChat>>() {
+        Ok(bc.chat_model())
     } else if let Ok(c) = bound.extract::<PyRef<PyCohereChat>>() {
         Ok(c.chat_model())
+    } else if let Ok(s) = bound.extract::<PyRef<PyStructuredChatModel>>() {
+        Ok(s.chat_model())
     } else {
         Err(PyValueError::new_err(
-            "model must be OpenAIChat, AnthropicChat, GeminiChat, BedrockChat, or CohereChat",
+            "model must be OpenAIChat, OpenAIResponses, AnthropicChat, GeminiChat, BedrockChat, CohereChat, or StructuredChatModel",
         ))
     }
 }
@@ -351,6 +402,132 @@ fn message_to_py_dict<'py>(py: Python<'py>, m: &Message) -> PyResult<Bound<'py, 
     }
     if let Some(ref id) = m.tool_call_id {
         d.set_item("tool_call_id", id)?;
+    }
+    Ok(d)
+}
+
+/// Text-mode ReAct agent for LLMs WITHOUT native tool-calling (Ollama
+/// local, base-completion checkpoints, older open-weight fine-tunes).
+/// Parses Thought/Action/Action Input/Final Answer prose each turn; feeds
+/// tool observations back as "Observation: ..." user messages.
+///
+/// **For GPT-4, Claude, Gemini, Cohere R+, Mistral Large, etc — use
+/// `ReactAgent` (native tool-calling API).** This class is for models
+/// that don't expose a tool-calling endpoint.
+///
+/// ```python
+/// from litgraph.agents import TextReActAgent
+/// from litgraph.providers import OpenAIChat  # pointed at an Ollama server
+/// agent = TextReActAgent(model, tools=[...], max_iterations=10)
+/// result = agent.invoke("what's the weather in Paris?")
+/// print(result["final_answer"])
+/// for turn in result["trace"]:
+///     print(turn)
+/// ```
+#[pyclass(name = "TextReActAgent", module = "litgraph.agents")]
+pub struct PyTextReActAgent {
+    inner: Arc<TextReActAgent>,
+}
+
+#[pymethods]
+impl PyTextReActAgent {
+    #[new]
+    #[pyo3(signature = (
+        model,
+        tools,
+        system_prompt=None,
+        max_iterations=10,
+        auto_format_instructions=true,
+    ))]
+    fn new(
+        model: Py<PyAny>,
+        tools: Bound<'_, PyList>,
+        system_prompt: Option<String>,
+        max_iterations: u32,
+        auto_format_instructions: bool,
+    ) -> PyResult<Self> {
+        let chat_model: Arc<dyn ChatModel> =
+            Python::with_gil(|py| extract_chat_model(model.bind(py)))?;
+        let tool_vec = extract_tools(&tools)?;
+        let cfg = TextReactAgentConfig {
+            max_iterations,
+            system_prompt,
+            chat_options: ChatOptions::default(),
+            auto_format_instructions,
+        };
+        let agent = TextReActAgent::new(chat_model, tool_vec, cfg);
+        Ok(Self {
+            inner: Arc::new(agent),
+        })
+    }
+
+    fn invoke<'py>(&self, py: Python<'py>, user: String) -> PyResult<Bound<'py, PyDict>> {
+        let agent = self.inner.clone();
+        let result = py.allow_threads(|| {
+            block_on_compat(async move { agent.invoke(user).await })
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })?;
+        let out = PyDict::new_bound(py);
+        out.set_item("final_answer", result.final_answer)?;
+        out.set_item("iterations", result.iterations)?;
+        out.set_item(
+            "stopped_reason",
+            match result.stopped_reason {
+                StoppedReason::FinalAnswer => "final_answer",
+                StoppedReason::MaxIterations => "max_iterations",
+                StoppedReason::ParseError => "parse_error",
+                StoppedReason::ToolNotFound => "tool_not_found",
+            },
+        )?;
+        let trace = PyList::empty_bound(py);
+        for turn in &result.trace {
+            trace.append(text_react_turn_to_py(py, turn)?)?;
+        }
+        out.set_item("trace", trace)?;
+        Ok(out)
+    }
+}
+
+fn text_react_turn_to_py<'py>(
+    py: Python<'py>,
+    turn: &TextReactTurn,
+) -> PyResult<Bound<'py, PyDict>> {
+    let d = PyDict::new_bound(py);
+    match turn {
+        TextReactTurn::Action {
+            raw_response,
+            thought,
+            tool,
+            input,
+            observation,
+            is_error,
+        } => {
+            d.set_item("kind", "action")?;
+            d.set_item("raw_response", raw_response)?;
+            d.set_item("thought", thought.clone())?;
+            d.set_item("tool", tool)?;
+            d.set_item("input", json_to_py(py, input)?)?;
+            d.set_item("observation", observation)?;
+            d.set_item("is_error", *is_error)?;
+        }
+        TextReactTurn::Final {
+            raw_response,
+            thought,
+            answer,
+        } => {
+            d.set_item("kind", "final")?;
+            d.set_item("raw_response", raw_response)?;
+            d.set_item("thought", thought.clone())?;
+            d.set_item("answer", answer)?;
+        }
+        TextReactTurn::ParseError {
+            raw_response,
+            error,
+        } => {
+            d.set_item("kind", "parse_error")?;
+            d.set_item("raw_response", raw_response)?;
+            d.set_item("error", error)?;
+        }
     }
     Ok(d)
 }

@@ -5,7 +5,10 @@ use std::sync::Arc;
 use litgraph_core::Document;
 use litgraph_retrieval::store::VectorStore;
 use litgraph_retrieval::{
-    Bm25Index, HybridRetriever, Reranker, RerankingRetriever, Retriever, VectorRetriever,
+    AttributeInfo, Bm25Index, ChildSplitter, Compressor, ContextualCompressionRetriever, DocStore,
+    EmbeddingsFilterCompressor, HybridRetriever, LlmExtractCompressor, MemoryDocStore,
+    MultiQueryRetriever, ParentDocumentRetriever, PipelineCompressor, Reranker,
+    RerankingRetriever, Retriever, SelfQueryRetriever, TimeWeightedRetriever, VectorRetriever,
 };
 use litgraph_rerankers_cohere::{CohereConfig, CohereReranker};
 use litgraph_rerankers_jina::{JinaRerankConfig, JinaReranker};
@@ -15,6 +18,7 @@ use litgraph_stores_hnsw::HnswVectorStore;
 use litgraph_stores_memory::MemoryVectorStore;
 use litgraph_stores_pgvector::PgVectorStore;
 use litgraph_stores_qdrant::{QdrantConfig, QdrantVectorStore};
+use litgraph_stores_weaviate::{WeaviateConfig, WeaviateVectorStore};
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
@@ -31,6 +35,7 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyMemoryVectorStore>()?;
     m.add_class::<PyHnswVectorStore>()?;
     m.add_class::<PyQdrantVectorStore>()?;
+    m.add_class::<PyWeaviateVectorStore>()?;
     m.add_class::<PyPgVectorStore>()?;
     m.add_class::<PyChromaVectorStore>()?;
     m.add_class::<PyVectorRetriever>()?;
@@ -39,6 +44,15 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyJinaReranker>()?;
     m.add_class::<PyRerankingRetriever>()?;
     m.add_class::<PyHybridRetriever>()?;
+    m.add_class::<PyParentDocumentRetriever>()?;
+    m.add_class::<PyMemoryDocStore>()?;
+    m.add_class::<PyMultiQueryRetriever>()?;
+    m.add_class::<PyLlmExtractCompressor>()?;
+    m.add_class::<PyEmbeddingsFilterCompressor>()?;
+    m.add_class::<PyPipelineCompressor>()?;
+    m.add_class::<PyContextualCompressionRetriever>()?;
+    m.add_class::<PySelfQueryRetriever>()?;
+    m.add_class::<PyTimeWeightedRetriever>()?;
     m.add_function(pyo3::wrap_pyfunction!(evaluate_retrieval, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(evaluate_generation, m)?)?;
     Ok(())
@@ -369,6 +383,115 @@ impl PyQdrantVectorStore {
     }
 }
 
+/// Weaviate VectorStore (REST + GraphQL v1 API). Class auto-creation via
+/// `ensure_class()`. Caller-supplied document ids are mapped to deterministic
+/// UUIDv5 (namespaced per class) so repeat upserts overwrite same object.
+///
+/// ```python
+/// from litgraph.retrieval import WeaviateVectorStore
+/// store = WeaviateVectorStore("http://localhost:8080", "Article",
+///                              api_key="<wcs-key>")  # api_key optional
+/// store.ensure_class()
+/// store.add(docs, embeddings)
+/// hits = store.similarity_search(query_emb, k=4, filter={"topic": "rust"})
+/// ```
+#[pyclass(name = "WeaviateVectorStore", module = "litgraph.retrieval")]
+#[derive(Clone)]
+pub struct PyWeaviateVectorStore {
+    pub(crate) inner: Arc<WeaviateVectorStore>,
+}
+
+#[pymethods]
+impl PyWeaviateVectorStore {
+    #[new]
+    #[pyo3(signature = (url, class, api_key=None, timeout_s=30))]
+    fn new(url: String, class: String, api_key: Option<String>, timeout_s: u64) -> PyResult<Self> {
+        let mut cfg = WeaviateConfig::new(url, class);
+        cfg.timeout = std::time::Duration::from_secs(timeout_s);
+        if let Some(k) = api_key { cfg = cfg.with_api_key(k); }
+        let store = WeaviateVectorStore::new(cfg)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        Ok(Self { inner: Arc::new(store) })
+    }
+
+    /// Idempotently create the class with `vectorizer: none` (we always
+    /// supply embeddings client-side).
+    fn ensure_class<'py>(&self, py: Python<'py>) -> PyResult<()> {
+        let store = self.inner.clone();
+        py.allow_threads(|| {
+            block_on_compat(async move { store.ensure_class().await })
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })
+    }
+
+    fn add<'py>(
+        &self,
+        py: Python<'py>,
+        docs: Bound<'py, PyList>,
+        embeddings: Bound<'py, PyList>,
+    ) -> PyResult<Vec<String>> {
+        let parsed = parse_docs(&docs)?;
+        let mut embs: Vec<Vec<f32>> = Vec::with_capacity(embeddings.len());
+        for item in embeddings.iter() { embs.push(item.extract::<Vec<f32>>()?); }
+        let store = self.inner.clone();
+        py.allow_threads(|| {
+            block_on_compat(async move { store.add(parsed, embs).await })
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })
+    }
+
+    #[pyo3(signature = (query_embedding, k=4, filter=None))]
+    fn similarity_search<'py>(
+        &self,
+        py: Python<'py>,
+        query_embedding: Vec<f32>,
+        k: usize,
+        filter: Option<Bound<'py, PyDict>>,
+    ) -> PyResult<Bound<'py, PyList>> {
+        let filter_map = match filter {
+            Some(d) => {
+                let mut m = std::collections::HashMap::new();
+                for (k, v) in d.iter() {
+                    let key: String = k.extract()?;
+                    // Preserve type info: bool/int → typed; everything else → string.
+                    let val = if let Ok(b) = v.extract::<bool>() {
+                        serde_json::Value::Bool(b)
+                    } else if let Ok(i) = v.extract::<i64>() {
+                        serde_json::Value::Number(i.into())
+                    } else {
+                        serde_json::Value::String(v.str()?.extract::<String>()?)
+                    };
+                    m.insert(key, val);
+                }
+                Some(m)
+            }
+            None => None,
+        };
+        let store = self.inner.clone();
+        let results = py.allow_threads(move || {
+            block_on_compat(async move {
+                store.similarity_search(&query_embedding, k, filter_map.as_ref()).await
+            })
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })?;
+        docs_to_pylist(py, results)
+    }
+
+    fn delete<'py>(&self, py: Python<'py>, ids: Vec<String>) -> PyResult<()> {
+        let store = self.inner.clone();
+        py.allow_threads(|| {
+            block_on_compat(async move { store.delete(&ids).await })
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })
+    }
+}
+
+impl PyWeaviateVectorStore {
+    pub(crate) fn as_store(&self) -> Arc<dyn VectorStore> {
+        self.inner.clone() as Arc<dyn VectorStore>
+    }
+}
+
 /// ChromaDB remote VectorStore (HTTP v1 API). Lazy collection creation on
 /// first add/search/delete. Tenant + database default to chroma's startup
 /// defaults; override for multi-tenant isolation.
@@ -585,9 +708,11 @@ impl PyVectorRetriever {
             pg.as_store()
         } else if let Ok(ch) = store.extract::<PyRef<PyChromaVectorStore>>() {
             ch.as_store()
+        } else if let Ok(wv) = store.extract::<PyRef<PyWeaviateVectorStore>>() {
+            wv.as_store()
         } else {
             return Err(pyo3::exceptions::PyTypeError::new_err(
-                "store must be MemoryVectorStore, HnswVectorStore, QdrantVectorStore, PgVectorStore, or ChromaVectorStore",
+                "store must be MemoryVectorStore, HnswVectorStore, QdrantVectorStore, PgVectorStore, ChromaVectorStore, or WeaviateVectorStore",
             ));
         };
         let inner = VectorRetriever::new(e, s);
@@ -914,7 +1039,13 @@ fn evaluate_retrieval<'py>(
 /// VectorRetriever / RerankingRetriever / Bm25Index.
 #[pyclass(name = "HybridRetriever", module = "litgraph.retrieval")]
 pub struct PyHybridRetriever {
-    inner: Arc<HybridRetriever>,
+    pub(crate) inner: Arc<HybridRetriever>,
+}
+
+impl PyHybridRetriever {
+    pub(crate) fn as_retriever(&self) -> Arc<dyn Retriever> {
+        self.inner.clone() as Arc<dyn Retriever>
+    }
 }
 
 #[pymethods]
@@ -1031,4 +1162,731 @@ fn evaluate_generation<'py>(
     }
     out.set_item("per_case", per_case)?;
     Ok(out)
+}
+
+// ---------- ParentDocumentRetriever (iter 85) ----------
+
+/// In-process HashMap-backed parent doc store. Drops with the process; for
+/// durability across runs, use SqliteDocStore (TODO future iter).
+#[pyclass(name = "MemoryDocStore", module = "litgraph.retrieval")]
+#[derive(Clone)]
+pub struct PyMemoryDocStore {
+    pub(crate) inner: Arc<MemoryDocStore>,
+}
+
+#[pymethods]
+impl PyMemoryDocStore {
+    #[new]
+    fn new() -> Self { Self { inner: Arc::new(MemoryDocStore::new()) } }
+
+    fn __len__(&self) -> usize { self.inner.len() }
+
+    fn __repr__(&self) -> String {
+        format!("MemoryDocStore(len={})", self.inner.len())
+    }
+}
+
+/// Adapter: any litgraph-splitters `Splitter` implementor → `ChildSplitter`
+/// for ParentDocumentRetriever. Holds the splitter behind an Arc and
+/// delegates `split()` to `Splitter::split_document()`.
+struct SplitterAdapter<S: litgraph_splitters::Splitter + ?Sized> {
+    inner: Arc<S>,
+}
+
+impl<S: litgraph_splitters::Splitter + ?Sized + 'static> ChildSplitter for SplitterAdapter<S> {
+    fn split(&self, doc: &Document) -> Vec<Document> {
+        self.inner.split_document(doc)
+    }
+}
+
+/// ParentDocumentRetriever — embed small chunks for precision, return
+/// large parents for context. Direct LangChain parity.
+///
+/// ```python
+/// from litgraph.splitters import RecursiveCharacterSplitter
+/// from litgraph.retrieval import (
+///     ParentDocumentRetriever, MemoryDocStore, MemoryVectorStore,
+///     VectorRetriever,
+/// )
+/// store = MemoryVectorStore(dim=1536)
+/// docs_kv = MemoryDocStore()
+/// pdr = ParentDocumentRetriever(
+///     child_splitter=RecursiveCharacterSplitter(chunk_size=200),
+///     vector_store=store,
+///     embeddings=openai_embeddings,
+///     parent_store=docs_kv,
+/// )
+/// pdr.index_documents(docs)
+/// hits = pdr.retrieve("what's a vector?", k=2)   # returns full parent docs
+/// ```
+#[pyclass(name = "ParentDocumentRetriever", module = "litgraph.retrieval")]
+#[derive(Clone)]
+pub struct PyParentDocumentRetriever {
+    pub(crate) inner: Arc<ParentDocumentRetriever>,
+}
+
+#[pymethods]
+impl PyParentDocumentRetriever {
+    /// `child_splitter` — accepts any litGraph splitter (`RecursiveCharacterSplitter`,
+    /// `MarkdownHeaderSplitter`, `HtmlHeaderSplitter`, `JsonSplitter`).
+    /// `vector_store` — accepts the same union as `VectorRetriever` (Memory / HNSW /
+    /// Qdrant / Pgvector / Chroma / Weaviate).
+    /// `embeddings` — same union as `VectorRetriever`.
+    /// `parent_store` — `MemoryDocStore` (only impl in v1).
+    #[new]
+    #[pyo3(signature = (child_splitter, vector_store, embeddings, parent_store, child_k_factor=4))]
+    fn new(
+        child_splitter: Bound<'_, PyAny>,
+        vector_store: Bound<'_, PyAny>,
+        embeddings: Bound<'_, PyAny>,
+        parent_store: PyRef<'_, PyMemoryDocStore>,
+        child_k_factor: usize,
+    ) -> PyResult<Self> {
+        // Splitter adapter: extract the inner Rust splitter and wrap.
+        let cs: Arc<dyn ChildSplitter> = if let Ok(s) = child_splitter.extract::<PyRef<crate::splitters::PyRecursiveSplitter>>() {
+            Arc::new(SplitterAdapter { inner: Arc::new(s.inner.clone()) })
+        } else if let Ok(s) = child_splitter.extract::<PyRef<crate::splitters::PyMarkdownSplitter>>() {
+            Arc::new(SplitterAdapter { inner: Arc::new(s.inner.clone()) })
+        } else if let Ok(s) = child_splitter.extract::<PyRef<crate::splitters::PyHtmlHeaderSplitter>>() {
+            Arc::new(SplitterAdapter { inner: Arc::new(s.inner.clone()) })
+        } else {
+            // JsonSplitter intentionally omitted: it walks JSON structure and
+            // doesn't implement the linear `Splitter` trait. Parent-document
+            // pattern doesn't make sense for JSON anyway (no "parent doc" concept
+            // for tree-shaped data).
+            return Err(pyo3::exceptions::PyTypeError::new_err(
+                "child_splitter must be one of RecursiveCharacterSplitter, MarkdownHeaderSplitter, HtmlHeaderSplitter",
+            ));
+        };
+
+        // Vector store: same polymorphism as PyVectorRetriever.
+        let vs: Arc<dyn VectorStore> = if let Ok(mem) = vector_store.extract::<PyRef<PyMemoryVectorStore>>() {
+            mem.as_store()
+        } else if let Ok(hn) = vector_store.extract::<PyRef<PyHnswVectorStore>>() {
+            hn.as_store()
+        } else if let Ok(qd) = vector_store.extract::<PyRef<PyQdrantVectorStore>>() {
+            qd.as_store()
+        } else if let Ok(pg) = vector_store.extract::<PyRef<PyPgVectorStore>>() {
+            pg.as_store()
+        } else if let Ok(ch) = vector_store.extract::<PyRef<PyChromaVectorStore>>() {
+            ch.as_store()
+        } else if let Ok(wv) = vector_store.extract::<PyRef<PyWeaviateVectorStore>>() {
+            wv.as_store()
+        } else {
+            return Err(pyo3::exceptions::PyTypeError::new_err(
+                "vector_store must be MemoryVectorStore / HnswVectorStore / QdrantVectorStore / PgVectorStore / ChromaVectorStore / WeaviateVectorStore",
+            ));
+        };
+
+        // Embeddings: same polymorphism as PyVectorRetriever.
+        let e: Arc<dyn litgraph_core::Embeddings> = if let Ok(fe) = embeddings.extract::<PyRef<PyFunctionEmbeddings>>() {
+            fe.as_embeddings()
+        } else if let Ok(oe) = embeddings.extract::<PyRef<PyOpenAIEmbeddings>>() {
+            oe.as_embeddings()
+        } else if let Ok(ce) = embeddings.extract::<PyRef<PyCohereEmbeddings>>() {
+            ce.as_embeddings()
+        } else if let Ok(ve) = embeddings.extract::<PyRef<PyVoyageEmbeddings>>() {
+            ve.as_embeddings()
+        } else if let Ok(ge) = embeddings.extract::<PyRef<PyGeminiEmbeddings>>() {
+            ge.as_embeddings()
+        } else if let Ok(be) = embeddings.extract::<PyRef<PyBedrockEmbeddings>>() {
+            be.as_embeddings()
+        } else if let Ok(je) = embeddings.extract::<PyRef<PyJinaEmbeddings>>() {
+            je.as_embeddings()
+        } else if let Ok(ce) = embeddings.extract::<PyRef<PyCachedEmbeddings>>() {
+            ce.as_embeddings()
+        } else {
+            return Err(pyo3::exceptions::PyTypeError::new_err(
+                "embeddings must be a litgraph Embeddings type",
+            ));
+        };
+
+        let ps: Arc<dyn DocStore> = parent_store.inner.clone() as Arc<dyn DocStore>;
+        let pdr = ParentDocumentRetriever::new(cs, vs, e, ps)
+            .with_child_k_factor(child_k_factor);
+        Ok(Self { inner: Arc::new(pdr) })
+    }
+
+    /// Index parent documents — splits each into children, embeds them in
+    /// one batch, upserts to vector store, and stores the parents.
+    fn index_documents<'py>(
+        &self,
+        py: Python<'py>,
+        docs: Bound<'py, PyList>,
+    ) -> PyResult<Vec<String>> {
+        let parsed = parse_docs(&docs)?;
+        let r = self.inner.clone();
+        py.allow_threads(|| {
+            block_on_compat(async move { r.index_documents(parsed).await })
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })
+    }
+
+    /// Retrieve — returns full parent documents (NOT child chunks).
+    #[pyo3(signature = (query, k=4))]
+    fn retrieve<'py>(
+        &self,
+        py: Python<'py>,
+        query: String,
+        k: usize,
+    ) -> PyResult<Bound<'py, PyList>> {
+        let r = self.inner.clone();
+        let docs = py.allow_threads(move || {
+            block_on_compat(async move { r.retrieve(&query, k).await })
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })?;
+        docs_to_pylist(py, docs)
+    }
+}
+
+impl PyParentDocumentRetriever {
+    pub(crate) fn as_retriever(&self) -> Arc<dyn Retriever> {
+        self.inner.clone() as Arc<dyn Retriever>
+    }
+}
+
+// ---------- MultiQueryRetriever (iter 86) ----------
+
+/// MultiQueryRetriever — LLM paraphrases the query into N variations, runs
+/// the base retriever for each in parallel, deduplicates the union, returns
+/// top-k. Improves recall on queries that use different vocabulary than the
+/// indexed documents.
+///
+/// Cost: 1 LLM call per `retrieve()` (cheap on flash/mini models) + N×base
+/// retrieval calls in parallel.
+///
+/// ```python
+/// from litgraph.providers import OpenAIChat
+/// from litgraph.retrieval import MultiQueryRetriever
+/// llm = OpenAIChat(model="gpt-4o-mini", api_key=...)
+/// mqr = MultiQueryRetriever(base=vector_retriever, llm=llm, num_variations=4)
+/// hits = mqr.retrieve("how does borrow checking work", k=5)
+/// ```
+#[pyclass(name = "MultiQueryRetriever", module = "litgraph.retrieval")]
+#[derive(Clone)]
+pub struct PyMultiQueryRetriever {
+    pub(crate) inner: Arc<MultiQueryRetriever>,
+}
+
+#[pymethods]
+impl PyMultiQueryRetriever {
+    /// `base` — any litGraph Retriever (`VectorRetriever`, `Bm25Index`,
+    /// `RerankingRetriever`, `HybridRetriever`, `ParentDocumentRetriever`,
+    /// `MultiQueryRetriever`).
+    /// `llm` — any litGraph chat model (same union as `ReactAgent.model`).
+    /// `num_variations` — paraphrase count (default 4). The original query
+    /// is also included unless `include_original=False`.
+    #[new]
+    #[pyo3(signature = (base, llm, num_variations=4, include_original=true, system_prompt=None))]
+    fn new(
+        base: Bound<'_, PyAny>,
+        llm: Bound<'_, PyAny>,
+        num_variations: usize,
+        include_original: bool,
+        system_prompt: Option<String>,
+    ) -> PyResult<Self> {
+        let base_arc: Arc<dyn Retriever> = if let Ok(v) = base.extract::<PyRef<PyVectorRetriever>>() {
+            v.as_retriever()
+        } else if let Ok(b) = base.extract::<PyRef<PyBm25Index>>() {
+            b.as_retriever()
+        } else if let Ok(r) = base.extract::<PyRef<PyRerankingRetriever>>() {
+            r.as_retriever()
+        } else if let Ok(h) = base.extract::<PyRef<PyHybridRetriever>>() {
+            h.as_retriever()
+        } else if let Ok(p) = base.extract::<PyRef<PyParentDocumentRetriever>>() {
+            p.as_retriever()
+        } else if let Ok(m) = base.extract::<PyRef<PyMultiQueryRetriever>>() {
+            m.inner.clone() as Arc<dyn Retriever>
+        } else {
+            return Err(pyo3::exceptions::PyTypeError::new_err(
+                "base must be a litGraph Retriever (VectorRetriever / Bm25Index / RerankingRetriever / HybridRetriever / ParentDocumentRetriever / MultiQueryRetriever)",
+            ));
+        };
+
+        let llm_arc = crate::agents::extract_chat_model(&llm)?;
+        let mut mqr = MultiQueryRetriever::new(base_arc, llm_arc)
+            .with_num_variations(num_variations)
+            .with_include_original(include_original);
+        if let Some(p) = system_prompt {
+            mqr = mqr.with_system_prompt(p);
+        }
+        Ok(Self { inner: Arc::new(mqr) })
+    }
+
+    /// Generate paraphrases without retrieving — useful for previewing /
+    /// caching the LLM output outside the retrieval path.
+    fn generate_queries<'py>(&self, py: Python<'py>, query: String) -> PyResult<Vec<String>> {
+        let r = self.inner.clone();
+        py.allow_threads(|| {
+            block_on_compat(async move { r.generate_queries(&query).await })
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })
+    }
+
+    #[pyo3(signature = (query, k=4))]
+    fn retrieve<'py>(
+        &self,
+        py: Python<'py>,
+        query: String,
+        k: usize,
+    ) -> PyResult<Bound<'py, PyList>> {
+        let r = self.inner.clone();
+        let docs = py.allow_threads(move || {
+            block_on_compat(async move { r.retrieve(&query, k).await })
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })?;
+        docs_to_pylist(py, docs)
+    }
+}
+
+// ---------- ContextualCompressionRetriever (iter 87) ----------
+
+/// LLM-driven extractive compressor — for each retrieved doc, the LLM
+/// rewrites the content to keep ONLY sentences relevant to the query.
+/// Docs the LLM marks as `NO_OUTPUT` are dropped. One LLM call per doc,
+/// fanned out in parallel.
+#[pyclass(name = "LlmExtractCompressor", module = "litgraph.retrieval")]
+#[derive(Clone)]
+pub struct PyLlmExtractCompressor {
+    pub(crate) inner: Arc<LlmExtractCompressor>,
+}
+
+#[pymethods]
+impl PyLlmExtractCompressor {
+    #[new]
+    #[pyo3(signature = (llm, prompt=None, max_concurrency=8))]
+    fn new(
+        llm: Bound<'_, PyAny>,
+        prompt: Option<String>,
+        max_concurrency: usize,
+    ) -> PyResult<Self> {
+        let llm_arc = crate::agents::extract_chat_model(&llm)?;
+        let mut c = LlmExtractCompressor::new(llm_arc).with_max_concurrency(max_concurrency);
+        if let Some(p) = prompt { c = c.with_prompt(p); }
+        Ok(Self { inner: Arc::new(c) })
+    }
+}
+
+/// Cosine-similarity filter compressor — drops docs below the threshold.
+/// Cheap pre-filter; combine with `LlmExtractCompressor` via `PipelineCompressor`.
+#[pyclass(name = "EmbeddingsFilterCompressor", module = "litgraph.retrieval")]
+#[derive(Clone)]
+pub struct PyEmbeddingsFilterCompressor {
+    pub(crate) inner: Arc<EmbeddingsFilterCompressor>,
+}
+
+#[pymethods]
+impl PyEmbeddingsFilterCompressor {
+    #[new]
+    fn new(embeddings: Bound<'_, PyAny>, similarity_threshold: f32) -> PyResult<Self> {
+        let e: Arc<dyn litgraph_core::Embeddings> = if let Ok(fe) = embeddings.extract::<PyRef<PyFunctionEmbeddings>>() {
+            fe.as_embeddings()
+        } else if let Ok(oe) = embeddings.extract::<PyRef<PyOpenAIEmbeddings>>() {
+            oe.as_embeddings()
+        } else if let Ok(ce) = embeddings.extract::<PyRef<PyCohereEmbeddings>>() {
+            ce.as_embeddings()
+        } else if let Ok(ve) = embeddings.extract::<PyRef<PyVoyageEmbeddings>>() {
+            ve.as_embeddings()
+        } else if let Ok(ge) = embeddings.extract::<PyRef<PyGeminiEmbeddings>>() {
+            ge.as_embeddings()
+        } else if let Ok(be) = embeddings.extract::<PyRef<PyBedrockEmbeddings>>() {
+            be.as_embeddings()
+        } else if let Ok(je) = embeddings.extract::<PyRef<PyJinaEmbeddings>>() {
+            je.as_embeddings()
+        } else if let Ok(ce) = embeddings.extract::<PyRef<PyCachedEmbeddings>>() {
+            ce.as_embeddings()
+        } else {
+            return Err(pyo3::exceptions::PyTypeError::new_err(
+                "embeddings must be a litGraph Embeddings type",
+            ));
+        };
+        Ok(Self { inner: Arc::new(EmbeddingsFilterCompressor::new(e, similarity_threshold)) })
+    }
+}
+
+/// Pipeline of compressors run in order. Empty result short-circuits
+/// the rest of the pipeline (no point running an LLM on 0 docs).
+#[pyclass(name = "PipelineCompressor", module = "litgraph.retrieval")]
+#[derive(Clone)]
+pub struct PyPipelineCompressor {
+    pub(crate) inner: Arc<PipelineCompressor>,
+}
+
+fn extract_compressor(any: &Bound<'_, PyAny>) -> PyResult<Arc<dyn Compressor>> {
+    if let Ok(c) = any.extract::<PyRef<PyLlmExtractCompressor>>() {
+        Ok(c.inner.clone() as Arc<dyn Compressor>)
+    } else if let Ok(c) = any.extract::<PyRef<PyEmbeddingsFilterCompressor>>() {
+        Ok(c.inner.clone() as Arc<dyn Compressor>)
+    } else if let Ok(c) = any.extract::<PyRef<PyPipelineCompressor>>() {
+        Ok(c.inner.clone() as Arc<dyn Compressor>)
+    } else {
+        Err(pyo3::exceptions::PyTypeError::new_err(
+            "compressor must be LlmExtractCompressor, EmbeddingsFilterCompressor, or PipelineCompressor",
+        ))
+    }
+}
+
+#[pymethods]
+impl PyPipelineCompressor {
+    #[new]
+    fn new(steps: Bound<'_, PyList>) -> PyResult<Self> {
+        let mut s: Vec<Arc<dyn Compressor>> = Vec::with_capacity(steps.len());
+        for item in steps.iter() {
+            s.push(extract_compressor(&item)?);
+        }
+        Ok(Self { inner: Arc::new(PipelineCompressor::new(s)) })
+    }
+}
+
+/// Wraps a base Retriever with a Compressor — base over-fetches, compressor
+/// filters / extracts. Direct LangChain `ContextualCompressionRetriever`
+/// parity.
+///
+/// ```python
+/// from litgraph.providers import OpenAIChat
+/// from litgraph.retrieval import (
+///     LlmExtractCompressor, ContextualCompressionRetriever,
+/// )
+/// llm = OpenAIChat(model="gpt-4o-mini", api_key=...)
+/// ccr = ContextualCompressionRetriever(
+///     base=vector_retriever,
+///     compressor=LlmExtractCompressor(llm=llm),
+/// )
+/// hits = ccr.retrieve("how does X work?", k=4)  # → token-trimmed docs
+/// ```
+#[pyclass(name = "ContextualCompressionRetriever", module = "litgraph.retrieval")]
+#[derive(Clone)]
+pub struct PyContextualCompressionRetriever {
+    pub(crate) inner: Arc<ContextualCompressionRetriever>,
+}
+
+#[pymethods]
+impl PyContextualCompressionRetriever {
+    /// `base` — same retriever polymorphism as other compositional retrievers.
+    /// `compressor` — `LlmExtractCompressor` / `EmbeddingsFilterCompressor` /
+    /// `PipelineCompressor`.
+    /// `over_fetch_factor` — base.retrieve called with `k * factor`.
+    #[new]
+    #[pyo3(signature = (base, compressor, over_fetch_factor=2))]
+    fn new(
+        base: Bound<'_, PyAny>,
+        compressor: Bound<'_, PyAny>,
+        over_fetch_factor: usize,
+    ) -> PyResult<Self> {
+        let base_arc: Arc<dyn Retriever> = if let Ok(v) = base.extract::<PyRef<PyVectorRetriever>>() {
+            v.as_retriever()
+        } else if let Ok(b) = base.extract::<PyRef<PyBm25Index>>() {
+            b.as_retriever()
+        } else if let Ok(r) = base.extract::<PyRef<PyRerankingRetriever>>() {
+            r.as_retriever()
+        } else if let Ok(h) = base.extract::<PyRef<PyHybridRetriever>>() {
+            h.as_retriever()
+        } else if let Ok(p) = base.extract::<PyRef<PyParentDocumentRetriever>>() {
+            p.as_retriever()
+        } else if let Ok(m) = base.extract::<PyRef<PyMultiQueryRetriever>>() {
+            m.inner.clone() as Arc<dyn Retriever>
+        } else {
+            return Err(pyo3::exceptions::PyTypeError::new_err(
+                "base must be a litGraph Retriever",
+            ));
+        };
+        let comp = extract_compressor(&compressor)?;
+        let r = ContextualCompressionRetriever::new(base_arc, comp)
+            .with_over_fetch_factor(over_fetch_factor);
+        Ok(Self { inner: Arc::new(r) })
+    }
+
+    #[pyo3(signature = (query, k=4))]
+    fn retrieve<'py>(
+        &self,
+        py: Python<'py>,
+        query: String,
+        k: usize,
+    ) -> PyResult<Bound<'py, PyList>> {
+        let r = self.inner.clone();
+        let docs = py.allow_threads(move || {
+            block_on_compat(async move { r.retrieve(&query, k).await })
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })?;
+        docs_to_pylist(py, docs)
+    }
+}
+
+// ---------- SelfQueryRetriever (iter 90) ----------
+
+/// SelfQueryRetriever — LLM extracts a metadata filter from the user's
+/// natural-language query before vector search. Direct LangChain parity.
+///
+/// ```python
+/// from litgraph.providers import OpenAIChat
+/// from litgraph.retrieval import SelfQueryRetriever, MemoryVectorStore
+/// chat = OpenAIChat(model="gpt-4o-mini", api_key=...)
+/// store = MemoryVectorStore()
+/// store.add(docs, embeddings)  # docs carry `language`, `year` metadata
+/// sqr = SelfQueryRetriever(
+///     embeddings=openai_embed,
+///     store=store,
+///     llm=chat,
+///     document_contents="rust crate descriptions",
+///     attributes=[
+///         {"name": "language", "description": "Programming language", "type": "string"},
+///         {"name": "year", "description": "Publication year", "type": "integer"},
+///     ],
+/// )
+/// hits = sqr.retrieve("rust crates from 2024", k=5)
+/// # LLM extracts {query:"crates", filter:{language:"rust", year:2024}}
+/// # Then vector search runs ONLY over docs matching the filter.
+/// ```
+#[pyclass(name = "SelfQueryRetriever", module = "litgraph.retrieval")]
+#[derive(Clone)]
+pub struct PySelfQueryRetriever {
+    pub(crate) inner: Arc<SelfQueryRetriever>,
+}
+
+#[pymethods]
+impl PySelfQueryRetriever {
+    /// `attributes` — list of dicts: `{"name", "description", "type"}` where
+    /// type is one of `"string"` / `"integer"` / `"number"` / `"boolean"`.
+    #[new]
+    #[pyo3(signature = (embeddings, store, llm, document_contents, attributes, system_prompt=None))]
+    fn new(
+        embeddings: Bound<'_, PyAny>,
+        store: Bound<'_, PyAny>,
+        llm: Bound<'_, PyAny>,
+        document_contents: String,
+        attributes: Bound<'_, PyList>,
+        system_prompt: Option<String>,
+    ) -> PyResult<Self> {
+        let e: Arc<dyn litgraph_core::Embeddings> = if let Ok(fe) = embeddings.extract::<PyRef<PyFunctionEmbeddings>>() {
+            fe.as_embeddings()
+        } else if let Ok(oe) = embeddings.extract::<PyRef<PyOpenAIEmbeddings>>() {
+            oe.as_embeddings()
+        } else if let Ok(ce) = embeddings.extract::<PyRef<PyCohereEmbeddings>>() {
+            ce.as_embeddings()
+        } else if let Ok(ve) = embeddings.extract::<PyRef<PyVoyageEmbeddings>>() {
+            ve.as_embeddings()
+        } else if let Ok(ge) = embeddings.extract::<PyRef<PyGeminiEmbeddings>>() {
+            ge.as_embeddings()
+        } else if let Ok(be) = embeddings.extract::<PyRef<PyBedrockEmbeddings>>() {
+            be.as_embeddings()
+        } else if let Ok(je) = embeddings.extract::<PyRef<PyJinaEmbeddings>>() {
+            je.as_embeddings()
+        } else if let Ok(ce) = embeddings.extract::<PyRef<PyCachedEmbeddings>>() {
+            ce.as_embeddings()
+        } else {
+            return Err(pyo3::exceptions::PyTypeError::new_err(
+                "embeddings must be a litGraph Embeddings type",
+            ));
+        };
+
+        let s: Arc<dyn litgraph_retrieval::VectorStore> = if let Ok(mem) = store.extract::<PyRef<PyMemoryVectorStore>>() {
+            mem.as_store()
+        } else if let Ok(hn) = store.extract::<PyRef<PyHnswVectorStore>>() {
+            hn.as_store()
+        } else if let Ok(qd) = store.extract::<PyRef<PyQdrantVectorStore>>() {
+            qd.as_store()
+        } else if let Ok(pg) = store.extract::<PyRef<PyPgVectorStore>>() {
+            pg.as_store()
+        } else if let Ok(ch) = store.extract::<PyRef<PyChromaVectorStore>>() {
+            ch.as_store()
+        } else if let Ok(wv) = store.extract::<PyRef<PyWeaviateVectorStore>>() {
+            wv.as_store()
+        } else {
+            return Err(pyo3::exceptions::PyTypeError::new_err(
+                "store must be a litGraph VectorStore type",
+            ));
+        };
+
+        let llm_arc = crate::agents::extract_chat_model(&llm)?;
+
+        let mut attrs: Vec<AttributeInfo> = Vec::with_capacity(attributes.len());
+        for item in attributes.iter() {
+            let d = item.downcast::<PyDict>().map_err(|_| {
+                pyo3::exceptions::PyTypeError::new_err("each attribute must be a dict")
+            })?;
+            let name: String = d
+                .get_item("name")?
+                .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("attribute missing 'name'"))?
+                .extract()?;
+            let description: String = d
+                .get_item("description")?
+                .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("attribute missing 'description'"))?
+                .extract()?;
+            let field_type: String = d
+                .get_item("type")?
+                .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("attribute missing 'type'"))?
+                .extract()?;
+            attrs.push(AttributeInfo::new(name, description, field_type));
+        }
+
+        let mut sqr = SelfQueryRetriever::new(e, s, llm_arc, document_contents, attrs);
+        if let Some(p) = system_prompt {
+            sqr = sqr.with_system_prompt(p);
+        }
+        Ok(Self { inner: Arc::new(sqr) })
+    }
+
+    /// Run JUST the LLM extraction step — preview what the retriever would
+    /// search for. Returns `{"query": str, "filter": dict}`.
+    fn extract_query_and_filter<'py>(
+        &self,
+        py: Python<'py>,
+        query: String,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let r = self.inner.clone();
+        let (q, f) = py.allow_threads(|| {
+            block_on_compat(async move { r.extract_query_and_filter(&query).await })
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })?;
+        let out = PyDict::new_bound(py);
+        out.set_item("query", q)?;
+        let f_py = PyDict::new_bound(py);
+        for (k, v) in f {
+            f_py.set_item(k, crate::graph::json_to_py(py, &v)?)?;
+        }
+        out.set_item("filter", f_py)?;
+        Ok(out)
+    }
+
+    #[pyo3(signature = (query, k=4))]
+    fn retrieve<'py>(
+        &self,
+        py: Python<'py>,
+        query: String,
+        k: usize,
+    ) -> PyResult<Bound<'py, PyList>> {
+        let r = self.inner.clone();
+        let docs = py.allow_threads(move || {
+            block_on_compat(async move { r.retrieve(&query, k).await })
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })?;
+        docs_to_pylist(py, docs)
+    }
+}
+
+// ---------- TimeWeightedRetriever (iter 93) ----------
+
+/// TimeWeightedVectorStoreRetriever — boost recently-accessed docs via
+/// exponential decay. Direct LangChain parity. Use case: agent memory /
+/// chat-history retrieval where recent turns matter more than older ones
+/// even at lower cosine similarity.
+///
+/// `combined_score = similarity_score + (1 - decay_rate)^hours_since_access`
+///
+/// Side effect: every retrieved doc has its `last_accessed` bumped to now,
+/// so frequently-used docs stay surfaced even as time passes.
+///
+/// ```python
+/// from litgraph.retrieval import TimeWeightedRetriever, MemoryVectorStore
+/// store = MemoryVectorStore()
+/// twr = TimeWeightedRetriever(embeddings=embed, store=store, decay_rate=0.01)
+/// twr.add_documents(docs, embeddings)
+/// hits = twr.retrieve("query", k=5)  # → fresh + relevant docs ranked first
+/// ```
+#[pyclass(name = "TimeWeightedRetriever", module = "litgraph.retrieval")]
+#[derive(Clone)]
+pub struct PyTimeWeightedRetriever {
+    pub(crate) inner: Arc<TimeWeightedRetriever>,
+}
+
+#[pymethods]
+impl PyTimeWeightedRetriever {
+    #[new]
+    #[pyo3(signature = (embeddings, store, decay_rate=0.01, over_fetch_factor=4))]
+    fn new(
+        embeddings: Bound<'_, PyAny>,
+        store: Bound<'_, PyAny>,
+        decay_rate: f32,
+        over_fetch_factor: usize,
+    ) -> PyResult<Self> {
+        let e: Arc<dyn litgraph_core::Embeddings> = if let Ok(fe) = embeddings.extract::<PyRef<PyFunctionEmbeddings>>() {
+            fe.as_embeddings()
+        } else if let Ok(oe) = embeddings.extract::<PyRef<PyOpenAIEmbeddings>>() {
+            oe.as_embeddings()
+        } else if let Ok(ce) = embeddings.extract::<PyRef<PyCohereEmbeddings>>() {
+            ce.as_embeddings()
+        } else if let Ok(ve) = embeddings.extract::<PyRef<PyVoyageEmbeddings>>() {
+            ve.as_embeddings()
+        } else if let Ok(ge) = embeddings.extract::<PyRef<PyGeminiEmbeddings>>() {
+            ge.as_embeddings()
+        } else if let Ok(be) = embeddings.extract::<PyRef<PyBedrockEmbeddings>>() {
+            be.as_embeddings()
+        } else if let Ok(je) = embeddings.extract::<PyRef<PyJinaEmbeddings>>() {
+            je.as_embeddings()
+        } else if let Ok(ce) = embeddings.extract::<PyRef<PyCachedEmbeddings>>() {
+            ce.as_embeddings()
+        } else {
+            return Err(pyo3::exceptions::PyTypeError::new_err(
+                "embeddings must be a litGraph Embeddings type",
+            ));
+        };
+        let s: Arc<dyn litgraph_retrieval::VectorStore> = if let Ok(mem) = store.extract::<PyRef<PyMemoryVectorStore>>() {
+            mem.as_store()
+        } else if let Ok(hn) = store.extract::<PyRef<PyHnswVectorStore>>() {
+            hn.as_store()
+        } else if let Ok(qd) = store.extract::<PyRef<PyQdrantVectorStore>>() {
+            qd.as_store()
+        } else if let Ok(pg) = store.extract::<PyRef<PyPgVectorStore>>() {
+            pg.as_store()
+        } else if let Ok(ch) = store.extract::<PyRef<PyChromaVectorStore>>() {
+            ch.as_store()
+        } else if let Ok(wv) = store.extract::<PyRef<PyWeaviateVectorStore>>() {
+            wv.as_store()
+        } else {
+            return Err(pyo3::exceptions::PyTypeError::new_err(
+                "store must be a litGraph VectorStore type",
+            ));
+        };
+        let twr = TimeWeightedRetriever::new(e, s)
+            .with_decay_rate(decay_rate)
+            .with_over_fetch_factor(over_fetch_factor);
+        Ok(Self { inner: Arc::new(twr) })
+    }
+
+    /// Add docs + initialize their last_accessed timestamps to "now".
+    /// Returns the assigned ids.
+    fn add_documents<'py>(
+        &self,
+        py: Python<'py>,
+        docs: Bound<'py, PyList>,
+        embeddings: Bound<'py, PyList>,
+    ) -> PyResult<Vec<String>> {
+        let parsed = parse_docs(&docs)?;
+        let mut embs: Vec<Vec<f32>> = Vec::with_capacity(embeddings.len());
+        for item in embeddings.iter() { embs.push(item.extract::<Vec<f32>>()?); }
+        let r = self.inner.clone();
+        py.allow_threads(|| {
+            block_on_compat(async move { r.add_documents(parsed, embs).await })
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })
+    }
+
+    /// Snapshot of (id, last_accessed_ms) — useful for observability
+    /// dashboards showing which docs the system is actually using.
+    fn access_log<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        let log = self.inner.access_log();
+        let out = PyList::empty_bound(py);
+        for (id, ts) in log {
+            let d = PyDict::new_bound(py);
+            d.set_item("id", id)?;
+            d.set_item("last_accessed_ms", ts)?;
+            out.append(d)?;
+        }
+        Ok(out)
+    }
+
+    #[pyo3(signature = (query, k=4))]
+    fn retrieve<'py>(
+        &self,
+        py: Python<'py>,
+        query: String,
+        k: usize,
+    ) -> PyResult<Bound<'py, PyList>> {
+        let r = self.inner.clone();
+        let docs = py.allow_threads(move || {
+            block_on_compat(async move { r.retrieve(&query, k).await })
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })?;
+        docs_to_pylist(py, docs)
+    }
 }

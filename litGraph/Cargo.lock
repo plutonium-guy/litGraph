@@ -1664,6 +1664,7 @@ dependencies = [
 name = "litgraph-loaders"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "csv",
  "glob",
  "litgraph-core",
@@ -1705,6 +1706,21 @@ dependencies = [
  "litgraph-core",
  "parking_lot",
  "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "litgraph-memory-sqlite"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "litgraph-core",
+ "rusqlite",
  "serde",
  "serde_json",
  "tempfile",
@@ -1760,6 +1776,7 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "chrono",
+ "crc32fast",
  "futures",
  "futures-util",
  "hex",
@@ -1874,6 +1891,7 @@ dependencies = [
  "litgraph-graph",
  "litgraph-loaders",
  "litgraph-mcp",
+ "litgraph-memory-sqlite",
  "litgraph-observability",
  "litgraph-providers-anthropic",
  "litgraph-providers-bedrock",
@@ -1893,6 +1911,7 @@ dependencies = [
  "litgraph-stores-memory",
  "litgraph-stores-pgvector",
  "litgraph-stores-qdrant",
+ "litgraph-stores-weaviate",
  "litgraph-tokenizers",
  "litgraph-tools-search",
  "litgraph-tools-utils",
@@ -1967,6 +1986,7 @@ name = "litgraph-retrieval"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "blake3",
  "futures",
  "litgraph-core",
  "parking_lot",
@@ -1976,6 +1996,7 @@ dependencies = [
  "tokio",
  "tracing",
  "unicode-segmentation",
+ "uuid",
 ]
 
 [[package]]
@@ -2059,6 +2080,22 @@ dependencies = [
 
 [[package]]
 name = "litgraph-stores-qdrant"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "litgraph-core",
+ "litgraph-retrieval",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "litgraph-stores-weaviate"
 version = "0.1.0"
 dependencies = [
  "async-trait",
@@ -3840,6 +3877,7 @@ dependencies = [
  "getrandom 0.4.2",
  "js-sys",
  "serde_core",
+ "sha1_smol",
  "wasm-bindgen",
 ]
 

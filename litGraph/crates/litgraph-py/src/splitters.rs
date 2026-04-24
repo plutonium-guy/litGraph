@@ -32,7 +32,7 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
 /// breadcrumb in metadata (`h1`, `h2`, …). Mirrors `MarkdownHeaderSplitter`.
 #[pyclass(name = "HtmlHeaderSplitter", module = "litgraph.splitters")]
 pub struct PyHtmlHeaderSplitter {
-    inner: HtmlHeaderSplitter,
+    pub(crate) inner: HtmlHeaderSplitter,
 }
 
 #[pymethods]
@@ -72,7 +72,7 @@ impl PyHtmlHeaderSplitter {
 /// originating subtree). Mirrors LangChain's `RecursiveJsonSplitter`.
 #[pyclass(name = "JsonSplitter", module = "litgraph.splitters")]
 pub struct PyJsonSplitter {
-    inner: JsonSplitter,
+    pub(crate) inner: JsonSplitter,
 }
 
 #[pymethods]
@@ -96,7 +96,7 @@ impl PyJsonSplitter {
 
 #[pyclass(name = "RecursiveCharacterSplitter", module = "litgraph.splitters")]
 pub struct PyRecursiveSplitter {
-    inner: RecursiveCharacterSplitter,
+    pub(crate) inner: RecursiveCharacterSplitter,
 }
 
 #[pymethods]
@@ -160,7 +160,7 @@ impl PyRecursiveSplitter {
 
 #[pyclass(name = "MarkdownHeaderSplitter", module = "litgraph.splitters")]
 pub struct PyMarkdownSplitter {
-    inner: MarkdownHeaderSplitter,
+    pub(crate) inner: MarkdownHeaderSplitter,
 }
 
 #[pymethods]

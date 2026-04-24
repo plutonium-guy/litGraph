@@ -17,8 +17,10 @@ serde_json.workspace = true
 rayon.workspace = true
 tracing.workspace = true
 unicode-segmentation.workspace = true
+parking_lot.workspace = true
+uuid = { version = "1", features = ["v4", "serde"] }
+blake3.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }
 async-trait.workspace = true
-parking_lot.workspace = true

@@ -8,6 +8,7 @@ use litgraph_core::{
     BufferMemory, ConversationMemory, Message, TokenBufferMemory, TokenCounter,
     summarize_conversation as core_summarize_conversation,
 };
+use litgraph_memory_sqlite::SqliteChatHistory;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::PyList;
@@ -20,6 +21,7 @@ use crate::runtime::block_on_compat;
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyBufferMemory>()?;
     m.add_class::<PyTokenBufferMemory>()?;
+    m.add_class::<PySqliteChatHistory>()?;
     m.add_function(wrap_pyfunction!(summarize_conversation, m)?)?;
     Ok(())
 }
@@ -277,4 +279,134 @@ fn parse_one_message(message: Bound<'_, PyAny>) -> PyResult<Message> {
     let list = PyList::new_bound(py, &[message]);
     let mut parsed = parse_messages_from_pylist(&list)?;
     parsed.pop().ok_or_else(|| pyo3::exceptions::PyValueError::new_err("empty message"))
+}
+
+// ---------- SqliteChatHistory (iter 91) ----------
+
+/// Durable conversation history backed by SQLite. Survives process restarts;
+/// per-message storage; multi-session isolation by `session_id` key.
+///
+/// ```python
+/// from litgraph.memory import SqliteChatHistory
+/// h = SqliteChatHistory.open("/var/lib/myapp/chats.db", session_id="user-42")
+/// h.set_system({"role": "system", "content": "You are helpful."})
+/// h.append({"role": "user", "content": "hi"})
+/// h.append({"role": "assistant", "content": "hello"})
+/// # Process restart...
+/// h2 = SqliteChatHistory.open("/var/lib/myapp/chats.db", session_id="user-42")
+/// msgs = h2.messages()  # → [system, user, assistant]
+/// ```
+#[pyclass(name = "SqliteChatHistory", module = "litgraph.memory")]
+#[derive(Clone)]
+pub struct PySqliteChatHistory {
+    inner: SqliteChatHistory,
+}
+
+#[pymethods]
+impl PySqliteChatHistory {
+    /// Open a sqlite file at `path` for the given `session_id`. Creates the
+    /// schema idempotently. Multiple opens against the same file are safe
+    /// (sqlite WAL mode + per-handle Mutex).
+    #[staticmethod]
+    fn open(path: String, session_id: String) -> PyResult<Self> {
+        let inner = SqliteChatHistory::open(&path, session_id)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        Ok(Self { inner })
+    }
+
+    /// In-memory variant — no file. For tests or ephemeral sessions.
+    #[staticmethod]
+    fn in_memory(session_id: String) -> PyResult<Self> {
+        let inner = SqliteChatHistory::in_memory(session_id)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        Ok(Self { inner })
+    }
+
+    /// Same backing store, addressed at a different session id. Cheap —
+    /// no new sqlite connection.
+    fn session(&self, session_id: String) -> Self {
+        Self { inner: self.inner.session(session_id) }
+    }
+
+    #[getter]
+    fn session_id(&self) -> String { self.inner.session_id().into() }
+
+    fn append<'py>(&self, py: Python<'py>, message: Bound<'py, PyAny>) -> PyResult<()> {
+        let msg = parse_one_message(message)?;
+        let inner = self.inner.clone();
+        py.allow_threads(|| {
+            block_on_compat(async move { inner.append(msg).await })
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })
+    }
+
+    fn append_all<'py>(&self, py: Python<'py>, messages: Bound<'py, PyList>) -> PyResult<()> {
+        let msgs = parse_messages_from_pylist(&messages)?;
+        let inner = self.inner.clone();
+        py.allow_threads(|| {
+            block_on_compat(async move { inner.append_all(msgs).await })
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })
+    }
+
+    fn messages<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        let inner = self.inner.clone();
+        let msgs = py.allow_threads(|| {
+            block_on_compat(async move { inner.messages().await })
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })?;
+        messages_to_py_list(py, &msgs)
+    }
+
+    /// Drops all conversation messages for this session. The system pin
+    /// is preserved (use `delete_session()` to wipe everything).
+    fn clear<'py>(&self, py: Python<'py>) -> PyResult<()> {
+        let inner = self.inner.clone();
+        py.allow_threads(|| {
+            block_on_compat(async move { inner.clear().await })
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })
+    }
+
+    fn delete_session<'py>(&self, py: Python<'py>) -> PyResult<()> {
+        let inner = self.inner.clone();
+        py.allow_threads(|| {
+            block_on_compat(async move { inner.delete_session().await })
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })
+    }
+
+    /// Set or clear the system pin. Pass `None` to remove.
+    #[pyo3(signature = (message=None))]
+    fn set_system<'py>(&self, py: Python<'py>, message: Option<Bound<'py, PyAny>>) -> PyResult<()> {
+        let msg = match message {
+            Some(m) => Some(parse_one_message(m)?),
+            None => None,
+        };
+        let inner = self.inner.clone();
+        py.allow_threads(|| {
+            block_on_compat(async move { inner.set_system(msg).await })
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })
+    }
+
+    fn message_count<'py>(&self, py: Python<'py>) -> PyResult<usize> {
+        let inner = self.inner.clone();
+        py.allow_threads(|| {
+            block_on_compat(async move { inner.message_count().await })
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })
+    }
+
+    fn list_sessions<'py>(&self, py: Python<'py>) -> PyResult<Vec<String>> {
+        let inner = self.inner.clone();
+        py.allow_threads(|| {
+            block_on_compat(async move { inner.list_sessions().await })
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })
+    }
+
+    fn __repr__(&self) -> String {
+        format!("SqliteChatHistory(session='{}')", self.inner.session_id())
+    }
 }
