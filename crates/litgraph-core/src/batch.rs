@@ -438,6 +438,96 @@ pub async fn batch_concurrent_with_shutdown(
         .collect()
 }
 
+/// Streaming variant of [`batch_concurrent_with_shutdown`]. Yields
+/// `(idx, Result<ChatResponse>)` items in completion order until
+/// either the batch finishes or `shutdown` fires — whichever comes
+/// first. On shutdown the producer aborts every in-flight task and
+/// closes the channel, so the consumer's stream ends cleanly.
+///
+/// Distinct from [`batch_concurrent_stream`]'s abort-on-drop:
+///
+/// - **Drop**: consumer-side end-of-interest. Receiver is dropped,
+///   producer notices and aborts. Useful when one consumer decides
+///   to stop on its own.
+/// - **Shutdown**: producer-side / orchestrator end-of-interest.
+///   A central signal source can stop *many* streams at once
+///   without each consumer needing to drop its receiver. Real prod
+///   use: a Plan-and-Execute orchestrator running 5 parallel
+///   batch streams in different sub-tasks — one Ctrl+C fires the
+///   shared `ShutdownSignal` and every stream ends gracefully.
+///
+/// The number of items the consumer observes equals the number of
+/// tasks that completed before the signal — partial progress is
+/// preserved as a prefix of the stream rather than as `Err`-filled
+/// slots in a Vec. Consumers that need an "expected total" compare
+/// the count they received against `inputs.len()` themselves.
+///
+/// Pre-fired signal returns an empty stream (no work spawned).
+/// `max_concurrency = 0` is normalised to 1 (sequential).
+///
+/// Composition: combines iter 210 (`batch_concurrent_stream`) +
+/// iter 225 (`ShutdownSignal`). Opens the second bridge family —
+/// streaming + coordination — opposite to the iter 227-232
+/// Vec + coordination family.
+pub fn batch_concurrent_stream_with_shutdown(
+    model: Arc<dyn ChatModel>,
+    inputs: Vec<Vec<Message>>,
+    opts: ChatOptions,
+    max_concurrency: usize,
+    shutdown: ShutdownSignal,
+) -> Pin<Box<dyn Stream<Item = BatchStreamItem> + Send>> {
+    if inputs.is_empty() || shutdown.is_signaled() {
+        return Box::pin(futures::stream::empty());
+    }
+    let cap = max_concurrency.max(1);
+    let n = inputs.len();
+    let buf = n.min(cap.max(8));
+    let (tx, rx) = mpsc::channel::<BatchStreamItem>(buf);
+
+    tokio::spawn(async move {
+        let sem = Arc::new(Semaphore::new(cap));
+        let mut set: JoinSet<BatchStreamItem> = JoinSet::new();
+        for (idx, msgs) in inputs.into_iter().enumerate() {
+            let sem = sem.clone();
+            let model = model.clone();
+            let opts = opts.clone();
+            set.spawn(async move {
+                let _permit = match sem.acquire_owned().await {
+                    Ok(p) => p,
+                    Err(_) => return (idx, Err(Error::other("batch semaphore closed"))),
+                };
+                let r = model.invoke(msgs, &opts).await;
+                (idx, r)
+            });
+        }
+        loop {
+            tokio::select! {
+                joined = set.join_next() => {
+                    let item = match joined {
+                        Some(Ok(it)) => it,
+                        Some(Err(e)) => (
+                            usize::MAX,
+                            Err(Error::other(format!("batch task join: {e}"))),
+                        ),
+                        None => break,
+                    };
+                    if tx.send(item).await.is_err() {
+                        set.abort_all();
+                        break;
+                    }
+                }
+                _ = shutdown.wait() => {
+                    set.abort_all();
+                    break;
+                }
+            }
+        }
+        // tx drops here — consumer's stream ends.
+    });
+
+    Box::pin(ReceiverStream::new(rx))
+}
+
 /// Like `batch_concurrent` but fail-fast: returns `Err` on the first
 /// failed invocation and cancels the rest. Useful when partial results
 /// aren't useful (e.g. all-or-nothing parallel rendering pipeline).
@@ -1173,5 +1263,109 @@ mod tests {
         // Empty input → no progress mutations either.
         let snap = obs.snapshot();
         assert_eq!(snap, BatchProgress::default());
+    }
+
+    // ---- batch_concurrent_stream_with_shutdown tests --------------------
+
+    #[tokio::test]
+    async fn stream_shutdown_no_signal_emits_full_set() {
+        let model: Arc<dyn ChatModel> = Arc::new(ConcurrencyProbe {
+            in_flight: Arc::new(AtomicUsize::new(0)),
+            peak: Arc::new(AtomicUsize::new(0)),
+            delay_ms: 0,
+        });
+        let inputs: Vec<Vec<Message>> = (0..6).map(|i| input(&format!("q{i}"))).collect();
+        let shutdown = ShutdownSignal::new();
+        let mut s = batch_concurrent_stream_with_shutdown(
+            model,
+            inputs,
+            ChatOptions::default(),
+            3,
+            shutdown,
+        );
+        let mut count = 0;
+        while let Some((_idx, r)) = s.next().await {
+            assert!(r.is_ok());
+            count += 1;
+        }
+        assert_eq!(count, 6);
+    }
+
+    #[tokio::test]
+    async fn stream_shutdown_pre_fired_yields_empty_stream() {
+        let model: Arc<dyn ChatModel> = Arc::new(ConcurrencyProbe {
+            in_flight: Arc::new(AtomicUsize::new(0)),
+            peak: Arc::new(AtomicUsize::new(0)),
+            delay_ms: 0,
+        });
+        let inputs: Vec<Vec<Message>> = (0..4).map(|i| input(&format!("q{i}"))).collect();
+        let shutdown = ShutdownSignal::new();
+        shutdown.signal();
+        let mut s = batch_concurrent_stream_with_shutdown(
+            model,
+            inputs,
+            ChatOptions::default(),
+            4,
+            shutdown,
+        );
+        assert!(s.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn stream_shutdown_mid_run_emits_prefix_then_ends() {
+        // 20 inputs × 50ms × cap=2 → sequential ~500ms. Fire shutdown
+        // at 80ms; consumer should see only what completed before
+        // the abort, then the stream ends fast.
+        let model: Arc<dyn ChatModel> = Arc::new(ConcurrencyProbe {
+            in_flight: Arc::new(AtomicUsize::new(0)),
+            peak: Arc::new(AtomicUsize::new(0)),
+            delay_ms: 50,
+        });
+        let inputs: Vec<Vec<Message>> = (0..20).map(|i| input(&format!("q{i}"))).collect();
+        let shutdown = ShutdownSignal::new();
+        let s2 = shutdown.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            s2.signal();
+        });
+        let started = std::time::Instant::now();
+        let mut s = batch_concurrent_stream_with_shutdown(
+            model,
+            inputs,
+            ChatOptions::default(),
+            2,
+            shutdown,
+        );
+        let mut count = 0;
+        while let Some((_idx, r)) = s.next().await {
+            assert!(r.is_ok());
+            count += 1;
+        }
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(400),
+            "elapsed {elapsed:?} — shutdown didn't terminate stream early",
+        );
+        // Some items emitted before shutdown, fewer than the full 20.
+        assert!(count >= 1, "no items reached the consumer before shutdown");
+        assert!(count < 20, "stream emitted full set despite shutdown");
+    }
+
+    #[tokio::test]
+    async fn stream_shutdown_empty_inputs_yields_empty() {
+        let model: Arc<dyn ChatModel> = Arc::new(ConcurrencyProbe {
+            in_flight: Arc::new(AtomicUsize::new(0)),
+            peak: Arc::new(AtomicUsize::new(0)),
+            delay_ms: 0,
+        });
+        let shutdown = ShutdownSignal::new();
+        let mut s = batch_concurrent_stream_with_shutdown(
+            model,
+            vec![],
+            ChatOptions::default(),
+            4,
+            shutdown,
+        );
+        assert!(s.next().await.is_none());
     }
 }
