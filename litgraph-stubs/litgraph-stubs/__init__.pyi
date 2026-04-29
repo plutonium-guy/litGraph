@@ -1,6 +1,7 @@
 from . import (
     agents as agents,
     cache as cache,
+    deep_agent as deep_agent,
     embeddings as embeddings,
     graph as graph,
     loaders as loaders,

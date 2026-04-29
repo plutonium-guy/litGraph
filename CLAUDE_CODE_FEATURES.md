@@ -126,6 +126,7 @@ long-term Store. Older (v0.3) features rolled in from prior audit.
 | Recursion / max-step guard | Avoid infinite loops | ✅ |
 | Agent event stream | UI progress | ✅ `AgentEventStream` |
 | Pre-built `create_react_agent` factory | One-liner agents | ✅ `ReactAgent.new()` |
+| `create_deep_agent` one-call factory | Loads AGENTS.md+skills, injects PlanningTool+VFS | ✅ `litgraph.deep_agent.create_deep_agent(model, tools=…, agents_md_path=…, skills_dir=…)` |
 
 ## 7. StateGraph — LangGraph headline
 
@@ -444,7 +445,7 @@ Top gaps to close, ranked by user-impact for a no-code-glue path:
 
 1. 🟡 **Long-term memory `Store`** — core trait + `InMemoryStore` shipped (`litgraph.store`, 17 Py tests). Postgres backend + vector-indexed semantic search on Store still pending.
 2. 🟡 **Middleware chain primitive** — `before/after_model` chain shipped (`litgraph.middleware`, 7 Py + 6 Rust tests). Built-ins: Logging, MessageWindow, SystemPrompt. `before/after_tool` hooks + tool-result offload still pending.
-3. ✅ **Deep Agents harness** — `PlanningTool` + `VirtualFilesystemTool` + `load_agents_md` + `load_skills_dir` + `SystemPromptBuilder` + `SubagentTool` all shipped (43 Rust + 29 Py tests across the six). Harness-level package (one-call `create_deep_agent`) still pending but all primitives are in place.
+3. ✅ **Deep Agents harness** — `PlanningTool` + `VirtualFilesystemTool` + `load_agents_md` + `load_skills_dir` + `SystemPromptBuilder` + `SubagentTool` + one-call `litgraph.deep_agent.create_deep_agent(...)` factory all shipped (43 Rust + 41 Py tests across the seven).
 4. ❌ **Functional API** (`@entrypoint` + `@task`) — Python decorator alternative to graph DSL. Trims LOC for simple workflows.
 5. ❌ **Pydantic-coerced state in Python** — type-safe stream chunks, IDE-narrow types. (Rust side already typed.)
 6. ❌ **`pyo3-stub-gen` auto-stubs** — manual stubs go stale. Pyright import warnings hurt agent-authored code.
