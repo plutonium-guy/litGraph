@@ -35,7 +35,8 @@
 
 use std::sync::Arc;
 
-use litgraph_core::{Document, Error, Result};
+use litgraph_core::{Document, Error, Progress, Result};
+use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
@@ -80,6 +81,111 @@ pub async fn rerank_concurrent(
                 if let Some(slot) = results.iter_mut().find(|s| s.is_none()) {
                     *slot = Some(Err(Error::other(format!("rerank task join: {e}"))));
                 }
+            }
+        }
+    }
+
+    results
+        .into_iter()
+        .map(|s| s.unwrap_or_else(|| Err(Error::other("rerank slot lost"))))
+        .collect()
+}
+
+/// Counters maintained by [`rerank_concurrent_with_progress`].
+/// Snapshot from any `Progress<RerankProgress>` observer to drive a
+/// progress bar over a multi-pair eval run.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RerankProgress {
+    /// Total `(query, candidates)` pairs submitted (set on entry).
+    pub total: u64,
+    /// Pairs whose `rerank` has finished, success or failure.
+    pub completed: u64,
+    /// Total candidates submitted across all pairs (set on entry).
+    /// Useful for eval reports that compute "X% of all candidates
+    /// reranked" rather than "X% of pairs finished".
+    pub total_candidates: u64,
+    /// Total docs returned across all successful pairs.
+    pub docs_returned: u64,
+    /// Subset of `completed` that returned `Err`.
+    pub errors: u64,
+}
+
+/// Same as [`rerank_concurrent`] but updates `progress` as each pair
+/// completes. Sixth (and final) progress-aware sibling, completing
+/// the family across all parallel-batch axes:
+///
+///   200  ingest_to_stream_with_progress             pipeline
+///   205  batch_concurrent_with_progress             ChatModel
+///   206  embed_documents_concurrent_with_progress   Embeddings
+///   207  retrieve_concurrent_with_progress          Retriever
+///   208  tool_dispatch_concurrent_with_progress     Tool
+///   209  rerank_concurrent_with_progress (this)     Reranker
+///
+/// Real prod use: an eval harness scoring a reranker over hundreds
+/// of `(query, gold-set)` pairs with a live counter. `total` and
+/// `total_candidates` set up front so observers see run shape
+/// before the first completion arrives.
+pub async fn rerank_concurrent_with_progress(
+    reranker: Arc<dyn Reranker>,
+    pairs: Vec<(String, Vec<Document>)>,
+    top_k: usize,
+    max_concurrency: usize,
+    progress: Progress<RerankProgress>,
+) -> Vec<Result<Vec<Document>>> {
+    if pairs.is_empty() {
+        return Vec::new();
+    }
+    let total = pairs.len() as u64;
+    let total_candidates: u64 = pairs.iter().map(|(_, c)| c.len() as u64).sum();
+    let _ = progress.update(|p| RerankProgress {
+        total,
+        total_candidates,
+        ..p.clone()
+    });
+
+    let cap = max_concurrency.max(1);
+    let sem = Arc::new(Semaphore::new(cap));
+    let mut set: JoinSet<(usize, Result<Vec<Document>>)> = JoinSet::new();
+
+    for (idx, (query, candidates)) in pairs.into_iter().enumerate() {
+        let sem = sem.clone();
+        let reranker = reranker.clone();
+        set.spawn(async move {
+            let _permit = match sem.acquire_owned().await {
+                Ok(p) => p,
+                Err(_) => return (idx, Err(Error::other("rerank semaphore closed"))),
+            };
+            let r = reranker.rerank(&query, candidates, top_k).await;
+            (idx, r)
+        });
+    }
+
+    let n = set.len();
+    let mut results: Vec<Option<Result<Vec<Document>>>> = (0..n).map(|_| None).collect();
+    while let Some(joined) = set.join_next().await {
+        match joined {
+            Ok((idx, r)) => {
+                let (n_docs, is_err) = match &r {
+                    Ok(docs) => (docs.len() as u64, false),
+                    Err(_) => (0, true),
+                };
+                results[idx] = Some(r);
+                let _ = progress.update(|p| RerankProgress {
+                    completed: p.completed + 1,
+                    docs_returned: p.docs_returned + n_docs,
+                    errors: p.errors + if is_err { 1 } else { 0 },
+                    ..p.clone()
+                });
+            }
+            Err(e) => {
+                if let Some(slot) = results.iter_mut().find(|s| s.is_none()) {
+                    *slot = Some(Err(Error::other(format!("rerank task join: {e}"))));
+                }
+                let _ = progress.update(|p| RerankProgress {
+                    completed: p.completed + 1,
+                    errors: p.errors + 1,
+                    ..p.clone()
+                });
             }
         }
     }
@@ -297,5 +403,96 @@ mod tests {
         for r in &out {
             assert_eq!(r.as_ref().unwrap().len(), 2);
         }
+    }
+
+    // ---- rerank_concurrent_with_progress tests ------------------------
+
+    #[tokio::test]
+    async fn progress_total_and_candidates_set_at_start() {
+        let (r, _peak) = probe(0);
+        let pairs: Vec<_> = vec![
+            ("q1".into(), vec![doc("a"), doc("b")]),
+            ("q2".into(), vec![doc("c"), doc("d"), doc("e")]),
+            ("q3".into(), vec![doc("f")]),
+        ];
+        let progress = Progress::new(RerankProgress::default());
+        let obs = progress.observer();
+        let _ = rerank_concurrent_with_progress(r, pairs, 5, 4, progress).await;
+        let snap = obs.snapshot();
+        assert_eq!(snap.total, 3);
+        assert_eq!(snap.total_candidates, 6); // 2 + 3 + 1
+        assert_eq!(snap.completed, 3);
+        assert_eq!(snap.errors, 0);
+        // Reverser returns up to top_k from each set: min(top_k, candidates_in_pair).
+        assert_eq!(snap.docs_returned, 6);
+    }
+
+    #[tokio::test]
+    async fn progress_records_per_pair_errors() {
+        struct FailOnQ {
+            bad: String,
+        }
+        #[async_trait]
+        impl Reranker for FailOnQ {
+            async fn rerank(
+                &self,
+                query: &str,
+                docs: Vec<Document>,
+                top_k: usize,
+            ) -> Result<Vec<Document>> {
+                if query == self.bad {
+                    Err(Error::other("synthetic"))
+                } else {
+                    Ok(docs.into_iter().take(top_k).collect())
+                }
+            }
+        }
+        let r: Arc<dyn Reranker> = Arc::new(FailOnQ {
+            bad: "q2".into(),
+        });
+        let pairs: Vec<_> = (0..5)
+            .map(|i| (format!("q{i}"), vec![doc("x"), doc("y")]))
+            .collect();
+        let progress = Progress::new(RerankProgress::default());
+        let obs = progress.observer();
+        let _ = rerank_concurrent_with_progress(r, pairs, 2, 4, progress).await;
+        let snap = obs.snapshot();
+        assert_eq!(snap.total, 5);
+        assert_eq!(snap.total_candidates, 10);
+        assert_eq!(snap.completed, 5);
+        assert_eq!(snap.errors, 1);
+        // 4 successful pairs × 2 docs = 8 returned.
+        assert_eq!(snap.docs_returned, 8);
+    }
+
+    #[tokio::test]
+    async fn progress_observer_polls_mid_run() {
+        let (r, _peak) = probe(15);
+        let pairs: Vec<_> = (0..6)
+            .map(|i| (format!("q{i}"), vec![doc("a"), doc("b")]))
+            .collect();
+        let progress = Progress::new(RerankProgress::default());
+        let mut obs = progress.observer();
+        let progress_clone = progress.clone();
+        let h = tokio::spawn(async move {
+            rerank_concurrent_with_progress(r, pairs, 1, 2, progress_clone).await
+        });
+        let _ = obs.changed().await;
+        let mid = obs.snapshot();
+        assert_eq!(mid.total, 6);
+        assert_eq!(mid.total_candidates, 12);
+        let _ = h.await.unwrap();
+        let snap = obs.snapshot();
+        assert_eq!(snap.completed, 6);
+    }
+
+    #[tokio::test]
+    async fn progress_empty_pairs_no_updates() {
+        let (r, _peak) = probe(0);
+        let progress = Progress::new(RerankProgress::default());
+        let obs = progress.observer();
+        let out = rerank_concurrent_with_progress(r, vec![], 5, 4, progress).await;
+        assert!(out.is_empty());
+        assert_eq!(obs.snapshot(), RerankProgress::default());
     }
 }

@@ -35,7 +35,10 @@ pub use concurrent::{
     RetrieveProgress,
 };
 pub use race::RaceRetriever;
-pub use rerank_concurrent::{rerank_concurrent, rerank_concurrent_fail_fast};
+pub use rerank_concurrent::{
+    rerank_concurrent, rerank_concurrent_fail_fast, rerank_concurrent_with_progress,
+    RerankProgress,
+};
 pub use rerank::{Reranker, RerankingRetriever};
 pub use parent::{
     ChildSplitter, DocStore, MemoryDocStore, ParentDocumentRetriever, PARENT_ID_META_KEY,

@@ -224,6 +224,7 @@ patterns").
 | `embed_documents_concurrent_with_progress` (iter 206) | Composes iter 183 + iter 199 | Third progress-aware composition. `EmbedProgress { total_texts, total_chunks, completed_chunks, completed_texts, errors }` watcher updated as each chunk's embed call returns — drop-in replacement for bulk-indexing flows that want a tqdm-style counter / ETA |
 | `retrieve_concurrent_with_progress` (iter 207) | Composes iter 190 + iter 199 | Fourth progress-aware composition. `RetrieveProgress { total, completed, docs_returned, errors }` watcher updated as each query completes — eval-harness pattern with a live counter |
 | `tool_dispatch_concurrent_with_progress` (iter 208) | Composes iter 191 + iter 199 | Fifth progress-aware composition. `ToolDispatchProgress { total, completed, errors, unknown_tool_errors }` — unknown-tool errors bucketed separately so dashboards distinguish a routing-bug regression (LLM emitted a name your registry doesn't know) from a runtime tool failure |
+| `rerank_concurrent_with_progress` (iter 209) | Composes iter 197 + iter 199 | Closes the progress-aware family across all 6 parallel-batch axes (ingest, chat batch, embed batch, retriever, tool, rerank). `RerankProgress { total, total_candidates, completed, docs_returned, errors }` — `total_candidates` exposed separately so eval reports can compute "X% of candidates reranked" rather than just "X% of pairs" |
 
 ---
 
