@@ -241,6 +241,7 @@ patterns").
 | `SemanticStore::bulk_delete` (iter 223) | Pair to bulk_put | Aligned `Vec<Result<bool>>` over `Store::delete`. Per-tenant namespace cleanup, retention sweeps, TTL boundary drops. Closes LangGraph's `BaseStore::mdelete` parity gap |
 | `SemanticStore::bulk_get` (iter 224) | Third of the bulk trio | Aligned `Vec<Result<Option<(text, value)>>>` for known-key fetches. Distinct from `semantic_search` (which ranks by meaning). Surfaces corrupt-shape errors per key without tanking the whole batch. Closes the full `BaseStore::{mset, mdelete, mget}` parity |
 | `ShutdownSignal` (iter 225) | `tokio::sync::Notify` + AtomicBool fired flag | Fifth distinct channel shape: N-waiter EDGE signal. Single `signal()` wakes every current and future waiter (idempotent); late `wait()` resolves instantly via the flag fast-path so no Notify-replay quirk. Channel-shape table now: mpsc / broadcast / watch / oneshot / Notify-edge |
+| `until_shutdown` (iter 226) | `tokio::select!` over fut + ShutdownSignal::wait | Composable future combinator: `until_shutdown(model.invoke(...), &shutdown).await` returns `Some(T)` if the future completed, `None` if shutdown won. Inner future is dropped on shutdown so HTTP / DB / sleep resources are released promptly — no orphan in-flight work. Fast-path `is_signaled()` check skips polling the inner entirely if signal already fired |
 
 ---
 

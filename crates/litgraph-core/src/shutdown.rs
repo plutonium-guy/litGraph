@@ -36,6 +36,7 @@
 //! - **Single-edge "go" signal**: warm up workers, then signal
 //!   all-at-once to start coordinated work.
 
+use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -97,6 +98,42 @@ impl ShutdownSignal {
     /// Non-blocking check. `true` once `signal()` has been called.
     pub fn is_signaled(&self) -> bool {
         self.fired.load(Ordering::SeqCst)
+    }
+}
+
+/// Race any future against a [`ShutdownSignal`]. Returns
+/// `Some(T)` if the future completed first, `None` if shutdown
+/// won. Drops the inner future on shutdown so any HTTP / DB /
+/// `tokio::time::sleep` resources held inside get released
+/// promptly — no orphaned in-flight work.
+///
+/// Ergonomic graceful-cancel for any await call:
+///
+/// ```ignore
+/// let resp = until_shutdown(model.invoke(msgs, &opts), &shutdown).await;
+/// match resp {
+///     Some(Ok(r)) => { /* normal */ }
+///     Some(Err(e)) => { /* model failure */ }
+///     None => { /* user hit Ctrl+C */ }
+/// }
+/// ```
+///
+/// If the signal already fired before this call, returns `None`
+/// instantly without polling `fut` at all.
+pub async fn until_shutdown<F, T>(
+    fut: F,
+    shutdown: &ShutdownSignal,
+) -> Option<T>
+where
+    F: Future<Output = T>,
+{
+    // Fast-path: signal already fired — drop fut without polling.
+    if shutdown.is_signaled() {
+        return None;
+    }
+    tokio::select! {
+        v = fut => Some(v),
+        _ = shutdown.wait() => None,
     }
 }
 
@@ -205,6 +242,80 @@ mod tests {
     async fn default_constructs_unsignaled() {
         let s = ShutdownSignal::default();
         assert!(!s.is_signaled());
+    }
+
+    // ---- until_shutdown tests -----------------------------------------
+
+    #[tokio::test]
+    async fn until_shutdown_returns_some_when_future_wins() {
+        let s = ShutdownSignal::new();
+        let r = until_shutdown(async { 42_u32 }, &s).await;
+        assert_eq!(r, Some(42));
+    }
+
+    #[tokio::test]
+    async fn until_shutdown_returns_none_on_pre_fired_signal() {
+        let s = ShutdownSignal::new();
+        s.signal();
+        // The inner future would never resolve, but fast-path
+        // returns None without polling it.
+        let never = std::future::pending::<u32>();
+        let r = until_shutdown(never, &s).await;
+        assert_eq!(r, None);
+    }
+
+    #[tokio::test]
+    async fn until_shutdown_returns_none_when_signal_wins() {
+        let s = ShutdownSignal::new();
+        let s2 = s.clone();
+        let h = tokio::spawn(async move {
+            until_shutdown(
+                tokio::time::sleep(Duration::from_secs(60)),
+                &s2,
+            )
+            .await
+        });
+        // Yield once so the spawned task parks on the select.
+        tokio::task::yield_now().await;
+        s.signal();
+        let r = tokio::time::timeout(Duration::from_millis(100), h)
+            .await
+            .expect("until_shutdown didn't return after signal")
+            .unwrap();
+        assert!(r.is_none());
+    }
+
+    #[tokio::test]
+    async fn until_shutdown_drops_inner_future_on_signal() {
+        // The inner future holds a sleep; on signal, the sleep
+        // should be dropped and not actually run for 60s. We
+        // measure wall-clock to confirm.
+        let s = ShutdownSignal::new();
+        let s2 = s.clone();
+        let started = std::time::Instant::now();
+        let h = tokio::spawn(async move {
+            until_shutdown(
+                tokio::time::sleep(Duration::from_secs(60)),
+                &s2,
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        s.signal();
+        let _ = h.await.unwrap();
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "wall-clock {elapsed:?} — inner future wasn't dropped",
+        );
+    }
+
+    #[tokio::test]
+    async fn until_shutdown_passes_through_future_value() {
+        let s = ShutdownSignal::new();
+        let r: Option<Result<&str, &str>> =
+            until_shutdown(async { Ok::<&str, &str>("done") }, &s).await;
+        assert_eq!(r, Some(Ok("done")));
     }
 
     #[tokio::test]

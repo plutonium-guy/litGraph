@@ -108,7 +108,7 @@ pub use stream_broadcast::{
 };
 pub use progress::{Progress, ProgressObserver};
 pub use resume_registry::{ResumeFuture, ResumeRegistry};
-pub use shutdown::ShutdownSignal;
+pub use shutdown::{until_shutdown, ShutdownSignal};
 pub use tool_dispatch::{
     tool_dispatch_concurrent, tool_dispatch_concurrent_fail_fast,
     tool_dispatch_concurrent_stream, tool_dispatch_concurrent_stream_with_progress,
