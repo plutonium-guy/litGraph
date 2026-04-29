@@ -35,7 +35,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use futures::Stream;
-use litgraph_core::Document;
+use litgraph_core::{Document, Progress};
+use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, Semaphore};
 use tokio::task::JoinSet;
 use tokio_stream::wrappers::ReceiverStream;
@@ -129,6 +130,183 @@ pub async fn load_concurrent(
 /// One item from [`load_concurrent_stream`] — the input loader
 /// index plus that loader's outcome, emitted in completion order.
 pub type LoadStreamItem = (usize, LoaderResult<Vec<Document>>);
+
+/// Counters maintained by [`load_concurrent_with_progress`] and
+/// [`load_concurrent_stream_with_progress`]. Snapshot from any
+/// `Progress<LoadProgress>` observer to drive an ingest dashboard.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LoadProgress {
+    /// Total loaders submitted (set on entry).
+    pub total: u64,
+    /// Loaders whose `load()` has finished, success or failure.
+    pub completed: u64,
+    /// Total documents returned across all successful loaders.
+    pub docs_loaded: u64,
+    /// Subset of `completed` that returned `Err`.
+    pub errors: u64,
+}
+
+/// Same as [`load_concurrent`] but updates `progress` as each
+/// loader completes. Sixth and final progress-aware sibling
+/// across the parallel-batch family (the loader axis was missing
+/// it; this iter closes the gap retroactively).
+///
+/// Real prod use: an ingestion dashboard rendering "8 / 50
+/// loaders done, 1.2k docs loaded, 0 errors" while a long-running
+/// fan-out is in flight.
+pub async fn load_concurrent_with_progress(
+    loaders: Vec<Arc<dyn Loader>>,
+    max_concurrency: usize,
+    progress: Progress<LoadProgress>,
+) -> Vec<LoaderResult<Vec<Document>>> {
+    if loaders.is_empty() {
+        return Vec::new();
+    }
+    let total = loaders.len() as u64;
+    let _ = progress.update(|p| LoadProgress {
+        total,
+        ..p.clone()
+    });
+
+    let cap = max_concurrency.max(1);
+    let sem = Arc::new(Semaphore::new(cap));
+    let mut set: JoinSet<(usize, LoaderResult<Vec<Document>>)> = JoinSet::new();
+
+    for (idx, loader) in loaders.into_iter().enumerate() {
+        let sem = sem.clone();
+        set.spawn(async move {
+            let _permit = match sem.acquire_owned().await {
+                Ok(p) => p,
+                Err(_) => {
+                    return (
+                        idx,
+                        Err(LoaderError::Other("loader semaphore closed".into())),
+                    )
+                }
+            };
+            let join = tokio::task::spawn_blocking(move || loader.load()).await;
+            let r = match join {
+                Ok(r) => r,
+                Err(e) => Err(LoaderError::Other(format!(
+                    "loader task panicked: {e}",
+                ))),
+            };
+            (idx, r)
+        });
+    }
+
+    let n = set.len();
+    let mut out: Vec<Option<LoaderResult<Vec<Document>>>> = (0..n).map(|_| None).collect();
+    while let Some(joined) = set.join_next().await {
+        match joined {
+            Ok((idx, r)) => {
+                let (n_docs, is_err) = match &r {
+                    Ok(docs) => (docs.len() as u64, false),
+                    Err(_) => (0, true),
+                };
+                out[idx] = Some(r);
+                let _ = progress.update(|p| LoadProgress {
+                    completed: p.completed + 1,
+                    docs_loaded: p.docs_loaded + n_docs,
+                    errors: p.errors + if is_err { 1 } else { 0 },
+                    ..p.clone()
+                });
+            }
+            Err(e) => {
+                if let Some(slot) = out.iter_mut().find(|s| s.is_none()) {
+                    *slot = Some(Err(LoaderError::Other(format!("loader join: {e}"))));
+                }
+                let _ = progress.update(|p| LoadProgress {
+                    completed: p.completed + 1,
+                    errors: p.errors + 1,
+                    ..p.clone()
+                });
+            }
+        }
+    }
+
+    out.into_iter()
+        .map(|s| s.unwrap_or_else(|| Err(LoaderError::Other("loader slot lost".into()))))
+        .collect()
+}
+
+/// Combined streaming + progress-watcher variant. Yields the same
+/// `(loader_idx, LoaderResult)` items as
+/// [`load_concurrent_stream`] AND updates the supplied
+/// `Progress<LoadProgress>` watcher per-loader. Closes the
+/// four-quadrant consumer matrix for the loader axis — the last of
+/// the six parallel-batch axes to ship the full set.
+pub fn load_concurrent_stream_with_progress(
+    loaders: Vec<Arc<dyn Loader>>,
+    max_concurrency: usize,
+    progress: Progress<LoadProgress>,
+) -> Pin<Box<dyn Stream<Item = LoadStreamItem> + Send>> {
+    if loaders.is_empty() {
+        return Box::pin(futures::stream::empty());
+    }
+    let total = loaders.len() as u64;
+    let _ = progress.update(|p| LoadProgress {
+        total,
+        ..p.clone()
+    });
+
+    let cap = max_concurrency.max(1);
+    let n = loaders.len();
+    let buf = n.min(cap.max(8));
+    let (tx, rx) = mpsc::channel::<LoadStreamItem>(buf);
+
+    tokio::spawn(async move {
+        let sem = Arc::new(Semaphore::new(cap));
+        let mut set: JoinSet<LoadStreamItem> = JoinSet::new();
+        for (idx, loader) in loaders.into_iter().enumerate() {
+            let sem = sem.clone();
+            set.spawn(async move {
+                let _permit = match sem.acquire_owned().await {
+                    Ok(p) => p,
+                    Err(_) => {
+                        return (
+                            idx,
+                            Err(LoaderError::Other("loader semaphore closed".into())),
+                        )
+                    }
+                };
+                let join = tokio::task::spawn_blocking(move || loader.load()).await;
+                let r = match join {
+                    Ok(r) => r,
+                    Err(e) => Err(LoaderError::Other(format!(
+                        "loader task panicked: {e}",
+                    ))),
+                };
+                (idx, r)
+            });
+        }
+        while let Some(joined) = set.join_next().await {
+            let item = match joined {
+                Ok(it) => it,
+                Err(e) => (
+                    usize::MAX,
+                    Err(LoaderError::Other(format!("loader join: {e}"))),
+                ),
+            };
+            let (n_docs, is_err) = match &item.1 {
+                Ok(docs) => (docs.len() as u64, false),
+                Err(_) => (0, true),
+            };
+            let _ = progress.update(|p| LoadProgress {
+                completed: p.completed + 1,
+                docs_loaded: p.docs_loaded + n_docs,
+                errors: p.errors + if is_err { 1 } else { 0 },
+                ..p.clone()
+            });
+            if tx.send(item).await.is_err() {
+                set.abort_all();
+                break;
+            }
+        }
+    });
+
+    Box::pin(ReceiverStream::new(rx))
+}
 
 /// Streaming variant of [`load_concurrent`]. Yields
 /// `(loader_idx, LoaderResult<Vec<Document>>)` pairs as each
@@ -360,6 +538,103 @@ mod tests {
         let bad: Arc<dyn Loader> = Arc::new(AlwaysFail);
         let r = load_concurrent_flat(vec![good, bad], 4).await;
         assert!(r.is_err());
+    }
+
+    // ---- load_concurrent_with_progress tests --------------------------
+
+    #[tokio::test]
+    async fn progress_total_set_and_completed_counts_advance() {
+        let (_tmp, paths) = write_files("p_advance", 4);
+        let loaders: Vec<Arc<dyn Loader>> = paths
+            .iter()
+            .map(|p| Arc::new(TextLoader::new(p)) as Arc<dyn Loader>)
+            .collect();
+        let progress = Progress::new(LoadProgress::default());
+        let obs = progress.observer();
+        let _ = load_concurrent_with_progress(loaders, 4, progress).await;
+        let snap = obs.snapshot();
+        assert_eq!(snap.total, 4);
+        assert_eq!(snap.completed, 4);
+        assert_eq!(snap.docs_loaded, 4); // TextLoader → 1 doc per file
+        assert_eq!(snap.errors, 0);
+    }
+
+    #[tokio::test]
+    async fn progress_records_loader_failures() {
+        let (_tmp, paths) = write_files("p_err", 1);
+        let good: Arc<dyn Loader> = Arc::new(TextLoader::new(&paths[0]));
+        let bad: Arc<dyn Loader> = Arc::new(AlwaysFail);
+        let progress = Progress::new(LoadProgress::default());
+        let obs = progress.observer();
+        let _ = load_concurrent_with_progress(vec![good, bad], 4, progress).await;
+        let snap = obs.snapshot();
+        assert_eq!(snap.total, 2);
+        assert_eq!(snap.completed, 2);
+        assert_eq!(snap.errors, 1);
+        assert_eq!(snap.docs_loaded, 1);
+    }
+
+    #[tokio::test]
+    async fn progress_empty_loaders_no_updates() {
+        let progress = Progress::new(LoadProgress::default());
+        let obs = progress.observer();
+        let out = load_concurrent_with_progress(vec![], 4, progress).await;
+        assert!(out.is_empty());
+        assert_eq!(obs.snapshot(), LoadProgress::default());
+    }
+
+    // ---- load_concurrent_stream_with_progress tests -------------------
+
+    #[tokio::test]
+    async fn stream_with_progress_yields_items_and_advances_counters() {
+        let (_tmp, paths) = write_files("sp_one", 5);
+        let loaders: Vec<Arc<dyn Loader>> = paths
+            .iter()
+            .map(|p| Arc::new(TextLoader::new(p)) as Arc<dyn Loader>)
+            .collect();
+        let progress = Progress::new(LoadProgress::default());
+        let obs = progress.observer();
+        let mut s = load_concurrent_stream_with_progress(loaders, 3, progress);
+        let mut count = 0;
+        while let Some((_idx, r)) = s.next().await {
+            assert!(r.is_ok());
+            count += 1;
+        }
+        assert_eq!(count, 5);
+        let snap = obs.snapshot();
+        assert_eq!(snap.total, 5);
+        assert_eq!(snap.completed, 5);
+        assert_eq!(snap.docs_loaded, 5);
+        assert_eq!(snap.errors, 0);
+    }
+
+    #[tokio::test]
+    async fn stream_with_progress_records_loader_failures() {
+        let (_tmp, paths) = write_files("sp_err", 1);
+        let good: Arc<dyn Loader> = Arc::new(TextLoader::new(&paths[0]));
+        let bad: Arc<dyn Loader> = Arc::new(AlwaysFail);
+        let progress = Progress::new(LoadProgress::default());
+        let obs = progress.observer();
+        let mut s = load_concurrent_stream_with_progress(vec![good, bad], 4, progress);
+        let mut errors_in_stream = 0;
+        while let Some((_idx, r)) = s.next().await {
+            if r.is_err() {
+                errors_in_stream += 1;
+            }
+        }
+        let snap = obs.snapshot();
+        assert_eq!(snap.completed, 2);
+        assert_eq!(snap.errors, 1);
+        assert_eq!(errors_in_stream, snap.errors as usize);
+    }
+
+    #[tokio::test]
+    async fn stream_with_progress_empty_loaders_no_updates() {
+        let progress = Progress::new(LoadProgress::default());
+        let obs = progress.observer();
+        let mut s = load_concurrent_stream_with_progress(vec![], 4, progress);
+        assert!(s.next().await.is_none());
+        assert_eq!(obs.snapshot(), LoadProgress::default());
     }
 
     // ---- load_concurrent_stream tests ---------------------------------

@@ -236,6 +236,7 @@ patterns").
 | `retrieve_concurrent_stream_with_progress` (iter 218) | Composes iter 207 + iter 212 | Combined consumer shape extended to the retriever axis. Three of six axes now ship the full four-quadrant matrix |
 | `tool_dispatch_concurrent_stream_with_progress` (iter 219) | Composes iter 208 + iter 213 | Combined consumer shape extended to the tool axis. Four of six axes now ship the full four-quadrant matrix. `unknown_tool_errors` bucketing carries over so observers see routing-vs-runtime breakdown live |
 | `rerank_concurrent_stream_with_progress` (iter 220) | Composes iter 209 + iter 214 | Combined consumer shape extended to the rerank axis. Five of six axes now ship the full four-quadrant matrix |
+| `load_concurrent_with_progress` + `load_concurrent_stream_with_progress` (iter 221) | Closes the loader axis | Two functions in one iter — the loader axis was missing the progress-aware variant since iter 187, so this iter retroactively ships it AND the combined stream-with-progress sibling. The four-quadrant consumer matrix now closes across all six parallel-batch axes |
 
 ---
 
