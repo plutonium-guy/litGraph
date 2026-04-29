@@ -21,6 +21,7 @@ rusqlite.workspace = true
 bincode.workspace = true
 parking_lot.workspace = true
 rayon.workspace = true
+redis.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }

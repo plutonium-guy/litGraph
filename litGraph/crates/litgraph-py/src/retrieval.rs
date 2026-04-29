@@ -8,7 +8,8 @@ use litgraph_retrieval::{
     embedding_redundant_filter, long_context_reorder, mmr_select, AttributeInfo, Bm25Index,
     ChildSplitter, Compressor, ContextualCompressionRetriever, DocStore,
     EmbeddingsFilterCompressor, HybridRetriever, LlmExtractCompressor, MemoryDocStore,
-    HydeRetriever, MultiQueryRetriever, ParentDocumentRetriever, PipelineCompressor, Reranker,
+    HydeRetriever, MaxMarginalRelevanceRetriever, MultiQueryRetriever, ParentDocumentRetriever,
+    PipelineCompressor, Reranker,
     RerankingRetriever, Retriever, SelfQueryRetriever, TimeWeightedRetriever, VectorRetriever,
 };
 use litgraph_rerankers_cohere::{CohereConfig, CohereReranker};
@@ -49,6 +50,7 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyMemoryDocStore>()?;
     m.add_class::<PyMultiQueryRetriever>()?;
     m.add_class::<PyHydeRetriever>()?;
+    m.add_class::<PyMaxMarginalRelevanceRetriever>()?;
     m.add_class::<PyLlmExtractCompressor>()?;
     m.add_class::<PyEmbeddingsFilterCompressor>()?;
     m.add_class::<PyPipelineCompressor>()?;
@@ -2057,5 +2059,86 @@ impl PyHydeRetriever {
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))
         })?;
         docs_to_pylist(py, docs)
+    }
+}
+
+/// Max-Marginal-Relevance retriever — over-fetches K from base, then
+/// MMR-selects final K balancing relevance vs novelty. Reduces near-
+/// duplicate results in RAG. LangChain `MaxMarginalRelevanceRetriever`.
+///
+/// `lambda_mult ∈ [0,1]`: 1.0 = pure relevance (top-K), 0.5 = balanced
+/// (LangChain default), 0.0 = pure diversity. `fetch_k` controls how many
+/// candidates the base retriever surfaces before MMR; default 20.
+///
+/// ```python
+/// from litgraph.retrieval import MaxMarginalRelevanceRetriever
+/// mmr = MaxMarginalRelevanceRetriever(
+///     base=vector_retriever, embeddings=embedder,
+///     fetch_k=20, lambda_mult=0.5,
+/// )
+/// docs = mmr.retrieve("multi-aspect question", k=5)
+/// ```
+#[pyclass(name = "MaxMarginalRelevanceRetriever", module = "litgraph.retrieval")]
+#[derive(Clone)]
+pub struct PyMaxMarginalRelevanceRetriever {
+    pub(crate) inner: Arc<MaxMarginalRelevanceRetriever>,
+}
+
+#[pymethods]
+impl PyMaxMarginalRelevanceRetriever {
+    #[new]
+    #[pyo3(signature = (base, embeddings, fetch_k=20, lambda_mult=0.5))]
+    fn new(
+        base: Bound<'_, PyAny>,
+        embeddings: Bound<'_, PyAny>,
+        fetch_k: usize,
+        lambda_mult: f32,
+    ) -> PyResult<Self> {
+        let base_arc: Arc<dyn Retriever> = if let Ok(v) = base.extract::<PyRef<PyVectorRetriever>>() {
+            v.as_retriever()
+        } else if let Ok(b) = base.extract::<PyRef<PyBm25Index>>() {
+            b.as_retriever()
+        } else if let Ok(r) = base.extract::<PyRef<PyRerankingRetriever>>() {
+            r.as_retriever()
+        } else if let Ok(h) = base.extract::<PyRef<PyHybridRetriever>>() {
+            h.as_retriever()
+        } else if let Ok(p) = base.extract::<PyRef<PyParentDocumentRetriever>>() {
+            p.as_retriever()
+        } else if let Ok(m) = base.extract::<PyRef<PyMultiQueryRetriever>>() {
+            m.inner.clone() as Arc<dyn Retriever>
+        } else if let Ok(hy) = base.extract::<PyRef<PyHydeRetriever>>() {
+            hy.inner.clone() as Arc<dyn Retriever>
+        } else {
+            return Err(pyo3::exceptions::PyTypeError::new_err(
+                "base must be a litGraph Retriever",
+            ));
+        };
+        let emb_arc = crate::embeddings::extract_embeddings(&embeddings)?;
+        let mmr = MaxMarginalRelevanceRetriever::new(base_arc, emb_arc)
+            .with_fetch_k(fetch_k)
+            .with_lambda(lambda_mult);
+        Ok(Self { inner: Arc::new(mmr) })
+    }
+
+    #[pyo3(signature = (query, k=4))]
+    fn retrieve<'py>(
+        &self,
+        py: Python<'py>,
+        query: String,
+        k: usize,
+    ) -> PyResult<Bound<'py, PyList>> {
+        let r = self.inner.clone();
+        let docs = py.allow_threads(|| {
+            block_on_compat(async move { r.retrieve(&query, k).await })
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })?;
+        docs_to_pylist(py, docs)
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "MaxMarginalRelevanceRetriever(fetch_k={}, lambda_mult={})",
+            self.inner.fetch_k, self.inner.lambda_mult,
+        )
     }
 }

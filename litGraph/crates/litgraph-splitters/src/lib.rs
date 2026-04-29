@@ -8,6 +8,7 @@ pub mod semantic;
 pub mod json;
 pub mod html_header;
 pub mod code;
+pub mod token;
 
 pub use recursive::{Language, RecursiveCharacterSplitter};
 pub use markdown::MarkdownHeaderSplitter;
@@ -15,6 +16,7 @@ pub use semantic::SemanticChunker;
 pub use json::JsonSplitter;
 pub use html_header::HtmlHeaderSplitter;
 pub use code::CodeSplitter;
+pub use token::TokenTextSplitter;
 
 use litgraph_core::Document;
 use rayon::prelude::*;

@@ -16,8 +16,9 @@ use litgraph_tools_search::{
 use litgraph_tools_utils::{
     CachedTool, CalculatorTool, DalleConfig, DalleImageTool, FsRoot, GmailSendConfig, GmailSendTool,
     HttpRequestConfig, HttpRequestTool, ListDirectoryTool, PythonReplConfig, PythonReplTool,
-    ReadFileTool, ShellTool, SqliteQueryTool, TtsAudioTool, TtsConfig, WebFetchConfig, WebFetchTool,
-    WebhookConfig, WebhookTool, WhisperConfig, WhisperTranscribeTool, WriteFileTool,
+    ReadFileTool, RetryConfig as ToolRetryConfig, RetryTool, ShellTool, SqliteQueryTool,
+    TimeoutTool, TtsAudioTool, TtsConfig, WebFetchConfig, WebFetchTool, WebhookConfig, WebhookTool,
+    WhisperConfig, WhisperTranscribeTool, WriteFileTool,
 };
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
@@ -46,6 +47,8 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyWebhookTool>()?;
     m.add_class::<PyGmailSendTool>()?;
     m.add_class::<PyWebFetchTool>()?;
+    m.add_class::<PyTimeoutTool>()?;
+    m.add_class::<PyRetryTool>()?;
     m.add_function(pyo3::wrap_pyfunction!(tool, m)?)?;
     Ok(())
 }
@@ -109,6 +112,12 @@ pub(crate) fn extract_tool_arc(bound: &Bound<'_, PyAny>) -> PyResult<Arc<dyn Too
         return Ok(t.as_tool());
     }
     if let Ok(t) = bound.extract::<PyRef<PyWebFetchTool>>() {
+        return Ok(t.as_tool());
+    }
+    if let Ok(t) = bound.extract::<PyRef<PyTimeoutTool>>() {
+        return Ok(t.as_tool());
+    }
+    if let Ok(t) = bound.extract::<PyRef<PyRetryTool>>() {
         return Ok(t.as_tool());
     }
     if let Ok(t) = bound.extract::<PyRef<PyWebhookTool>>() {
@@ -1166,4 +1175,90 @@ impl PyWebFetchTool {
     pub(crate) fn as_tool(&self) -> Arc<dyn Tool> {
         self.inner.clone() as Arc<dyn Tool>
     }
+}
+
+/// Wrap any Tool with a per-call timeout. On timeout, the tool's call
+/// returns an error to the agent (treated as `isError: true`); the
+/// agent decides whether to retry, route around, or give up.
+///
+/// Pairs with `RetryTool` for "retry up to N times, each capped at T
+/// seconds": `RetryTool(TimeoutTool(inner, 30s), max_attempts=3)`.
+///
+/// ```python
+/// from litgraph.tools import TimeoutTool, HttpRequestTool
+/// http = HttpRequestTool()
+/// safe_http = TimeoutTool(http, timeout_s=10)  # 10s per call max
+/// ```
+#[pyclass(name = "TimeoutTool", module = "litgraph.tools")]
+#[derive(Clone)]
+pub struct PyTimeoutTool { pub(crate) inner: Arc<TimeoutTool> }
+
+#[pymethods]
+impl PyTimeoutTool {
+    #[new]
+    fn new(inner: Bound<'_, PyAny>, timeout_s: f64) -> PyResult<Self> {
+        let inner_arc = extract_tool_arc(&inner)?;
+        let dur = std::time::Duration::from_millis((timeout_s * 1000.0) as u64);
+        Ok(Self { inner: TimeoutTool::wrap(inner_arc, dur) })
+    }
+
+    #[getter]
+    fn name(&self) -> String { self.inner.schema().name }
+    fn __repr__(&self) -> String {
+        format!("TimeoutTool(inner={})", self.inner.schema().name)
+    }
+}
+
+impl PyTimeoutTool {
+    pub(crate) fn as_tool(&self) -> Arc<dyn Tool> { self.inner.clone() as Arc<dyn Tool> }
+}
+
+/// Wrap any Tool with exponential-backoff retry on transient errors.
+/// Retries `Timeout`, `RateLimited`, and `Provider` errors. Terminal
+/// errors (bad input, parse failure) bubble immediately — retrying them
+/// just wastes time.
+///
+/// ```python
+/// from litgraph.tools import RetryTool, HttpRequestTool
+/// http = HttpRequestTool()
+/// resilient = RetryTool(http, max_attempts=3, initial_delay_s=0.5)
+/// ```
+///
+/// Recommended composition: `RetryTool(TimeoutTool(inner, ...), ...)`
+/// → each attempt is bounded by the timeout; total cost = N × timeout.
+#[pyclass(name = "RetryTool", module = "litgraph.tools")]
+#[derive(Clone)]
+pub struct PyRetryTool { pub(crate) inner: Arc<RetryTool> }
+
+#[pymethods]
+impl PyRetryTool {
+    #[new]
+    #[pyo3(signature = (
+        inner, max_attempts=3, initial_delay_s=0.1, max_delay_s=5.0, multiplier=2.0,
+    ))]
+    fn new(
+        inner: Bound<'_, PyAny>,
+        max_attempts: u32,
+        initial_delay_s: f64,
+        max_delay_s: f64,
+        multiplier: f64,
+    ) -> PyResult<Self> {
+        let inner_arc = extract_tool_arc(&inner)?;
+        let cfg = ToolRetryConfig::new()
+            .with_max_attempts(max_attempts)
+            .with_initial_delay(std::time::Duration::from_millis((initial_delay_s * 1000.0) as u64))
+            .with_max_delay(std::time::Duration::from_millis((max_delay_s * 1000.0) as u64))
+            .with_multiplier(multiplier);
+        Ok(Self { inner: RetryTool::wrap(inner_arc, cfg) })
+    }
+
+    #[getter]
+    fn name(&self) -> String { self.inner.schema().name }
+    fn __repr__(&self) -> String {
+        format!("RetryTool(inner={})", self.inner.schema().name)
+    }
+}
+
+impl PyRetryTool {
+    pub(crate) fn as_tool(&self) -> Arc<dyn Tool> { self.inner.clone() as Arc<dyn Tool> }
 }

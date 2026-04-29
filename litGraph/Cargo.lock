@@ -1859,6 +1859,7 @@ dependencies = [
  "moka",
  "parking_lot",
  "rayon",
+ "redis",
  "rusqlite",
  "serde",
  "serde_json",
@@ -2005,6 +2006,21 @@ dependencies = [
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "litgraph-memory-postgres"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "deadpool-postgres",
+ "litgraph-core",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-postgres",
  "tracing",
 ]
 
@@ -2185,6 +2201,7 @@ dependencies = [
  "litgraph-graph",
  "litgraph-loaders",
  "litgraph-mcp",
+ "litgraph-memory-postgres",
  "litgraph-memory-sqlite",
  "litgraph-observability",
  "litgraph-providers-anthropic",
@@ -2307,6 +2324,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "litgraph-core",
+ "litgraph-tokenizers",
  "once_cell",
  "rayon",
  "regex",

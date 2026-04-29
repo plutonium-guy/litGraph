@@ -5,8 +5,7 @@ use std::sync::Arc;
 use litgraph_core::{Document, Embeddings};
 use litgraph_splitters::{
     CodeSplitter, HtmlHeaderSplitter, JsonSplitter, Language, MarkdownHeaderSplitter,
-    RecursiveCharacterSplitter,
-    SemanticChunker, Splitter,
+    RecursiveCharacterSplitter, SemanticChunker, Splitter, TokenTextSplitter,
 };
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
@@ -26,6 +25,7 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyJsonSplitter>()?;
     m.add_class::<PyHtmlHeaderSplitter>()?;
     m.add_class::<PyCodeSplitter>()?;
+    m.add_class::<PyTokenTextSplitter>()?;
     Ok(())
 }
 
@@ -346,3 +346,50 @@ impl PyCodeSplitter {
     }
 }
 
+
+/// Token-aware text splitter — counts tokens via `litgraph-tokenizers`
+/// (tiktoken for OpenAI; HF tokenizers for others). `chunk_size=1000`
+/// means EXACTLY 1000 tokens, not chars. Use after structural splits
+/// (markdown/html headers) to enforce a hard token budget per chunk.
+///
+/// `model` is the tokenizer key — `"gpt-4o"` / `"claude-opus-4-7"` /
+/// `"text-embedding-3-small"` / etc.
+///
+/// ```python
+/// from litgraph.splitters import TokenTextSplitter
+/// s = TokenTextSplitter(chunk_size=512, chunk_overlap=50, model="gpt-4o")
+/// chunks = s.split_text(open("doc.md").read())
+/// # Each chunk: ≤ 512 GPT-4o tokens.
+/// ```
+#[pyclass(name = "TokenTextSplitter", module = "litgraph.splitters")]
+pub struct PyTokenTextSplitter { pub(crate) inner: TokenTextSplitter }
+
+#[pymethods]
+impl PyTokenTextSplitter {
+    #[new]
+    #[pyo3(signature = (chunk_size=512, chunk_overlap=50, model="gpt-4o"))]
+    fn new(chunk_size: usize, chunk_overlap: usize, model: &str) -> Self {
+        Self { inner: TokenTextSplitter::new(chunk_size, chunk_overlap, model) }
+    }
+
+    fn split_text(&self, py: Python<'_>, text: String) -> Vec<String> {
+        py.allow_threads(|| self.inner.split_text(&text))
+    }
+
+    fn split_documents<'py>(
+        &self,
+        py: Python<'py>,
+        docs: Bound<'py, PyList>,
+    ) -> PyResult<Bound<'py, PyList>> {
+        let parsed: Vec<Document> = parse_docs(&docs)?;
+        let chunks = py.allow_threads(|| self.inner.split_documents(&parsed));
+        docs_to_pylist(py, chunks)
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "TokenTextSplitter(chunk_size={}, chunk_overlap={}, model={:?})",
+            self.inner.chunk_size, self.inner.chunk_overlap, self.inner.model
+        )
+    }
+}

@@ -6,8 +6,9 @@ use std::sync::{Arc, Mutex};
 
 use litgraph_core::{
     BufferMemory, ConversationMemory, Message, SummaryBufferMemory, TokenBufferMemory, TokenCounter,
-    summarize_conversation as core_summarize_conversation,
+    VectorStoreMemory, summarize_conversation as core_summarize_conversation,
 };
+use litgraph_memory_postgres::PostgresChatHistory;
 use litgraph_memory_sqlite::SqliteChatHistory;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
@@ -22,7 +23,9 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyBufferMemory>()?;
     m.add_class::<PyTokenBufferMemory>()?;
     m.add_class::<PySummaryBufferMemory>()?;
+    m.add_class::<PyVectorStoreMemory>()?;
     m.add_class::<PySqliteChatHistory>()?;
+    m.add_class::<PyPostgresChatHistory>()?;
     m.add_function(wrap_pyfunction!(summarize_conversation, m)?)?;
     Ok(())
 }
@@ -586,5 +589,262 @@ impl PySqliteChatHistory {
 
     fn __repr__(&self) -> String {
         format!("SqliteChatHistory(session='{}')", self.inner.session_id())
+    }
+}
+
+/// Vector-store memory — embeddings of each turn, retrieve top-K most-
+/// relevant past messages by cosine. Long-running agents need topic-
+/// relevance memory, not just recency. LangChain `VectorStoreRetrieverMemory`.
+///
+/// `append()` is sync and queues the message; `flush()` (or auto-flush
+/// on `retrieve_for`) embeds pending messages in a single batch call.
+///
+/// ```python
+/// from litgraph.memory import VectorStoreMemory
+/// from litgraph.embeddings import OpenAIEmbeddings
+///
+/// emb = OpenAIEmbeddings(api_key=..., model="text-embedding-3-small")
+/// mem = VectorStoreMemory(embeddings=emb, default_top_k=4)
+/// mem.append({"role": "user", "content": "rust borrow checker fix"})
+/// mem.append({"role": "assistant", "content": "use clone or rework lifetimes"})
+/// # Later turn:
+/// retrieved = mem.retrieve_for("rust borrow", k=2)
+/// for r in retrieved:
+///     print(r["score"], r["message"])
+/// # Or build the next-turn context in one call:
+/// ctx = mem.build_context("rust borrow", k=2,
+///                          current={"role": "user", "content": "another fix?"})
+/// ```
+#[pyclass(name = "VectorStoreMemory", module = "litgraph.memory")]
+pub struct PyVectorStoreMemory {
+    inner: Arc<VectorStoreMemory>,
+}
+
+#[pymethods]
+impl PyVectorStoreMemory {
+    #[new]
+    #[pyo3(signature = (embeddings, default_top_k=4))]
+    fn new(embeddings: Bound<'_, PyAny>, default_top_k: usize) -> PyResult<Self> {
+        let emb = crate::embeddings::extract_embeddings(&embeddings)?;
+        Ok(Self {
+            inner: Arc::new(VectorStoreMemory::new(emb, default_top_k)),
+        })
+    }
+
+    fn append<'py>(&self, py: Python<'py>, message: Bound<'py, PyAny>) -> PyResult<()> {
+        let m = parse_one_message(message)?;
+        py.allow_threads(|| {
+            self.inner.append(m);
+            Ok(())
+        })
+    }
+
+    #[pyo3(signature = (message=None))]
+    fn set_system<'py>(&self, message: Option<Bound<'py, PyAny>>) -> PyResult<()> {
+        let m = message.map(parse_one_message).transpose()?;
+        self.inner.set_system(m);
+        Ok(())
+    }
+
+    fn embedded_len(&self) -> usize { self.inner.embedded_len() }
+    fn pending_len(&self) -> usize { self.inner.pending_len() }
+
+    fn clear(&self) {
+        self.inner.clear();
+    }
+
+    /// Embed any pending messages now (in one batch). Returns the new
+    /// total number of embedded messages.
+    fn flush<'py>(&self, py: Python<'py>) -> PyResult<usize> {
+        let inner = self.inner.clone();
+        py.allow_threads(|| {
+            block_on_compat(async move { inner.flush().await })
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })
+    }
+
+    /// Top-K most-relevant past messages. `k=0` uses `default_top_k`.
+    /// Returns list of dicts: `[{"message": {...}, "score": float}, ...]`.
+    #[pyo3(signature = (query, k=0))]
+    fn retrieve_for<'py>(
+        &self,
+        py: Python<'py>,
+        query: &str,
+        k: usize,
+    ) -> PyResult<Bound<'py, PyList>> {
+        let inner = self.inner.clone();
+        let q = query.to_string();
+        let retrieved = py.allow_threads(|| {
+            block_on_compat(async move { inner.retrieve_for(&q, k).await })
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })?;
+        let out = PyList::empty_bound(py);
+        for r in retrieved {
+            let d = pyo3::types::PyDict::new_bound(py);
+            // messages_to_py_list emits a list — pull the single dict back out.
+            let msg_pylist = messages_to_py_list(py, &[r.message])?;
+            let msg_dict = msg_pylist.get_item(0)?;
+            d.set_item("message", msg_dict)?;
+            d.set_item("score", r.score as f64)?;
+            out.append(d)?;
+        }
+        Ok(out)
+    }
+
+    /// Build the next-turn message list: `[system?, ...top_k, current]`.
+    #[pyo3(signature = (query, current, k=0))]
+    fn build_context<'py>(
+        &self,
+        py: Python<'py>,
+        query: &str,
+        current: Bound<'py, PyAny>,
+        k: usize,
+    ) -> PyResult<Bound<'py, PyList>> {
+        let cur = parse_one_message(current)?;
+        let inner = self.inner.clone();
+        let q = query.to_string();
+        let msgs = py.allow_threads(|| {
+            block_on_compat(async move { inner.build_context(&q, k, cur).await })
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })?;
+        messages_to_py_list(py, &msgs)
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "VectorStoreMemory(embedded={}, pending={})",
+            self.inner.embedded_len(),
+            self.inner.pending_len(),
+        )
+    }
+}
+
+/// Postgres-backed durable conversation history. Distributed counterpart
+/// to `SqliteChatHistory` — for cloud / multi-instance deployments where
+/// chat sessions need to be readable + writable from multiple workers.
+///
+/// Uses `deadpool-postgres` for connection pooling. `connect(dsn, session_id)`
+/// is the entry point; DSN accepts the standard libpq format
+/// `postgres://user:pass@host:5432/db`.
+///
+/// ```python
+/// from litgraph.memory import PostgresChatHistory
+/// h = PostgresChatHistory.connect(
+///     "postgres://user:pass@localhost:5432/myapp",
+///     session_id="user-42",
+/// )
+/// h.set_system({"role": "system", "content": "You are helpful."})
+/// h.append({"role": "user", "content": "hi"})
+/// h.append({"role": "assistant", "content": "hello"})
+/// # Across worker processes / restarts:
+/// h2 = PostgresChatHistory.connect(dsn, session_id="user-42")
+/// msgs = h2.messages()  # → [system, user, assistant]
+/// ```
+#[pyclass(name = "PostgresChatHistory", module = "litgraph.memory")]
+#[derive(Clone)]
+pub struct PyPostgresChatHistory {
+    inner: PostgresChatHistory,
+}
+
+#[pymethods]
+impl PyPostgresChatHistory {
+    /// Connect via libpq DSN. Schema is created idempotently on first
+    /// connect.
+    #[staticmethod]
+    fn connect(py: Python<'_>, dsn: String, session_id: String) -> PyResult<Self> {
+        let inner = py.allow_threads(|| {
+            block_on_compat(async move {
+                PostgresChatHistory::connect(&dsn, session_id).await
+            })
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })?;
+        Ok(Self { inner })
+    }
+
+    /// Same backing pool, addressed at a different session id. Cheap.
+    fn session(&self, session_id: String) -> Self {
+        Self { inner: self.inner.session(session_id) }
+    }
+
+    #[getter]
+    fn session_id(&self) -> String { self.inner.session_id().into() }
+
+    fn append<'py>(&self, py: Python<'py>, message: Bound<'py, PyAny>) -> PyResult<()> {
+        let msg = parse_one_message(message)?;
+        let inner = self.inner.clone();
+        py.allow_threads(|| {
+            block_on_compat(async move { inner.append(msg).await })
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })
+    }
+
+    fn append_all<'py>(&self, py: Python<'py>, messages: Bound<'py, PyList>) -> PyResult<()> {
+        let msgs = parse_messages_from_pylist(&messages)?;
+        let inner = self.inner.clone();
+        py.allow_threads(|| {
+            block_on_compat(async move { inner.append_all(msgs).await })
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })
+    }
+
+    fn messages<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        let inner = self.inner.clone();
+        let msgs = py.allow_threads(|| {
+            block_on_compat(async move { inner.messages().await })
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })?;
+        messages_to_py_list(py, &msgs)
+    }
+
+    /// Drop all conversation messages for this session. The system pin
+    /// is preserved — use `delete_session()` to wipe everything.
+    fn clear<'py>(&self, py: Python<'py>) -> PyResult<()> {
+        let inner = self.inner.clone();
+        py.allow_threads(|| {
+            block_on_compat(async move { inner.clear().await })
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })
+    }
+
+    fn delete_session<'py>(&self, py: Python<'py>) -> PyResult<()> {
+        let inner = self.inner.clone();
+        py.allow_threads(|| {
+            block_on_compat(async move { inner.delete_session().await })
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })
+    }
+
+    /// Set or clear the system pin. Pass `None` to remove.
+    #[pyo3(signature = (message=None))]
+    fn set_system<'py>(&self, py: Python<'py>, message: Option<Bound<'py, PyAny>>) -> PyResult<()> {
+        let msg = match message {
+            Some(m) => Some(parse_one_message(m)?),
+            None => None,
+        };
+        let inner = self.inner.clone();
+        py.allow_threads(|| {
+            block_on_compat(async move { inner.set_system(msg).await })
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })
+    }
+
+    fn message_count<'py>(&self, py: Python<'py>) -> PyResult<usize> {
+        let inner = self.inner.clone();
+        py.allow_threads(|| {
+            block_on_compat(async move { inner.message_count().await })
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })
+    }
+
+    fn list_sessions<'py>(&self, py: Python<'py>) -> PyResult<Vec<String>> {
+        let inner = self.inner.clone();
+        py.allow_threads(|| {
+            block_on_compat(async move { inner.list_sessions().await })
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })
+    }
+
+    fn __repr__(&self) -> String {
+        format!("PostgresChatHistory(session='{}')", self.inner.session_id())
     }
 }

@@ -16,6 +16,9 @@ use serde_json::Value;
 pub mod html;
 pub use html::HtmlLoader;
 
+pub mod html_to_markdown;
+pub use html_to_markdown::{html_to_markdown, HtmlToMarkdownTransformer};
+
 #[cfg(feature = "pdf")]
 pub mod pdf;
 #[cfg(feature = "pdf")]
@@ -60,6 +63,8 @@ pub mod gitlab;
 pub use gitlab::GitLabIssuesLoader;
 pub mod gitlab_files;
 pub use gitlab_files::GitLabFilesLoader;
+pub mod sitemap;
+pub use sitemap::SitemapLoader;
 pub use s3::S3Loader;
 
 #[derive(Debug, thiserror::Error)]

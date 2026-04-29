@@ -9,10 +9,14 @@
 pub mod react;
 pub mod supervisor;
 pub mod text_react;
+pub mod plan_execute;
 
 pub use react::{AgentEvent, AgentEventStream, AgentState, ReactAgent, ReactAgentConfig};
 pub use supervisor::{SupervisorAgent, SupervisorConfig};
 pub use text_react::{
     StoppedReason, TextReActAgent, TextReactAgentConfig, TextReactEvent, TextReactEventStream,
     TextReactResult, TextReactTurn,
+};
+pub use plan_execute::{
+    PlanAndExecuteAgent, PlanAndExecuteConfig, PlanAndExecuteResult, StepOutcome,
 };

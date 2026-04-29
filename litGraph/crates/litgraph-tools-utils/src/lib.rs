@@ -19,6 +19,7 @@ mod python_repl;
 mod webhook;
 mod gmail_send;
 mod web_fetch;
+mod tool_resilience;
 
 pub use calculator::CalculatorTool;
 pub use http_request::{HttpRequestTool, HttpRequestConfig};
@@ -33,3 +34,4 @@ pub use python_repl::{PythonReplConfig, PythonReplTool};
 pub use webhook::{WebhookConfig, WebhookPreset, WebhookTool};
 pub use gmail_send::{GmailSendConfig, GmailSendTool};
 pub use web_fetch::{WebFetchConfig, WebFetchTool};
+pub use tool_resilience::{RetryConfig, RetryTool, TimeoutTool};

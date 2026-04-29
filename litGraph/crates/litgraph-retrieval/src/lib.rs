@@ -15,6 +15,7 @@ pub mod compression;
 pub mod self_query;
 pub mod time_weighted;
 pub mod transformers;
+pub mod mmr_retriever;
 
 pub use store::{VectorStore, Filter};
 pub use retriever::{Retriever, VectorRetriever};
@@ -32,6 +33,7 @@ pub use compression::{
 };
 pub use self_query::{AttributeInfo, SelfQueryRetriever};
 pub use time_weighted::TimeWeightedRetriever;
+pub use mmr_retriever::MaxMarginalRelevanceRetriever;
 pub use eval::{
     evaluate_retrieval, mrr_at_k, ndcg_at_k, recall_at_k, EvalCase, EvalConfig, EvalReport,
     PerQueryMetrics,

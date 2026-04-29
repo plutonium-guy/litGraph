@@ -2,18 +2,18 @@
 //! rayon-parallel directory traversal on Rust threads.
 
 use litgraph_loaders::{
-    ConfluenceLoader, CsvLoader, DirectoryLoader, DocxLoader, GitLabIssuesLoader,
-    GithubFilesLoader, GithubIssuesLoader, GmailLoader, GoogleDriveLoader, HtmlLoader,
-    JiraIssuesLoader, JsonLinesLoader, JsonLoader, JupyterNotebookLoader, LinearIssuesLoader,
-    Loader, MarkdownLoader, NotionLoader, PdfLoader, S3Loader, SlackLoader, TextLoader, WebLoader,
-    default_dispatcher,
+    html_to_markdown, ConfluenceLoader, CsvLoader, DirectoryLoader, DocxLoader, GitLabFilesLoader,
+    GitLabIssuesLoader, GithubFilesLoader, GithubIssuesLoader, GmailLoader, GoogleDriveLoader,
+    HtmlLoader, HtmlToMarkdownTransformer, JiraIssuesLoader, JsonLinesLoader, JsonLoader,
+    JupyterNotebookLoader, LinearIssuesLoader, Loader, MarkdownLoader, NotionLoader, PdfLoader,
+    S3Loader, SitemapLoader, SlackLoader, TextLoader, WebLoader, default_dispatcher,
 };
 use litgraph_providers_bedrock::AwsCredentials;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::PyList;
 
-use crate::retrieval::docs_to_pylist;
+use crate::retrieval::{docs_to_pylist, parse_docs};
 
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyTextLoader>()?;
@@ -38,7 +38,77 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyS3Loader>()?;
     m.add_class::<PyJupyterNotebookLoader>()?;
     m.add_class::<PyGitLabIssuesLoader>()?;
+    m.add_class::<PyGitLabFilesLoader>()?;
+    m.add_class::<PySitemapLoader>()?;
+    m.add_class::<PyHtmlToMarkdownTransformer>()?;
+    m.add_function(pyo3::wrap_pyfunction!(py_html_to_markdown, m)?)?;
     Ok(())
+}
+
+/// Convert an HTML string to clean Markdown. Pure-function counterpart to
+/// `HtmlToMarkdownTransformer` for one-shot use.
+///
+/// ```python
+/// from litgraph.loaders import html_to_markdown
+/// md = html_to_markdown("<h1>Title</h1><p>body</p>")
+/// # => "# Title\n\nbody"
+/// ```
+#[pyfunction(name = "html_to_markdown")]
+#[pyo3(signature = (html, strip_boilerplate=true))]
+fn py_html_to_markdown(html: &str, strip_boilerplate: bool) -> String {
+    html_to_markdown(html, strip_boilerplate)
+}
+
+/// Document transformer: HTML content → Markdown content. Pair after
+/// `WebLoader` / `SitemapLoader` so downstream splitters/embedders see
+/// clean markdown instead of raw HTML. Markdown is more token-efficient
+/// and preserves structural signal (headings, lists, links, code) that
+/// matters for RAG quality.
+///
+/// ```python
+/// from litgraph.loaders import (
+///     SitemapLoader, HtmlToMarkdownTransformer,
+/// )
+/// raw = SitemapLoader("https://docs.example.com/sitemap.xml").load()
+/// docs = HtmlToMarkdownTransformer().transform(raw)
+/// # docs[i].content is now markdown; docs[i].metadata is preserved.
+/// ```
+#[pyclass(name = "HtmlToMarkdownTransformer", module = "litgraph.loaders")]
+pub struct PyHtmlToMarkdownTransformer {
+    inner: HtmlToMarkdownTransformer,
+}
+
+#[pymethods]
+impl PyHtmlToMarkdownTransformer {
+    #[new]
+    #[pyo3(signature = (strip_boilerplate=true, keep_metadata=true))]
+    fn new(strip_boilerplate: bool, keep_metadata: bool) -> Self {
+        let mut inner = HtmlToMarkdownTransformer::new();
+        if !strip_boilerplate {
+            inner = inner.keep_boilerplate();
+        }
+        if !keep_metadata {
+            inner = inner.drop_metadata();
+        }
+        Self { inner }
+    }
+
+    fn transform<'py>(
+        &self,
+        py: Python<'py>,
+        docs: Bound<'py, PyList>,
+    ) -> PyResult<Bound<'py, PyList>> {
+        let parsed = parse_docs(&docs)?;
+        let out = py.allow_threads(|| self.inner.transform(parsed));
+        docs_to_pylist(py, out)
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "HtmlToMarkdownTransformer(strip_boilerplate={}, keep_metadata={})",
+            self.inner.strip_boilerplate, self.inner.keep_metadata
+        )
+    }
 }
 
 /// PDF text loader — pure-Rust via lopdf. `per_page=True` (default) yields
@@ -968,6 +1038,138 @@ impl PyGitLabIssuesLoader {
             inner = inner.with_labels(l);
         }
         Self { inner }
+    }
+
+    fn load<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        let docs = py.allow_threads(|| self.inner.load()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string())))?;
+        docs_to_pylist(py, docs)
+    }
+}
+
+/// GitLab files loader. Parallel to GithubFilesLoader for code-RAG over
+/// self-hosted GitLab repos. Walks the repo tree, fetches each blob,
+/// returns one Document per file.
+///
+/// Auth: PRIVATE-TOKEN by default (PAT); pass `oauth=True` for Bearer.
+/// Path filtering: `extensions=[".rs", ".py"]` allowlist;
+/// `exclude_paths=[...]` substring blocklist (defaults skip
+/// node_modules/, vendor/, target/, lockfiles, minified files).
+///
+/// ```python
+/// from litgraph.loaders import GitLabFilesLoader
+/// loader = GitLabFilesLoader(
+///     token="glpat-xxx", project="12345", git_ref="main",
+///     extensions=[".rs", ".md"],
+///     max_files=100,
+/// )
+/// docs = loader.load()
+/// ```
+#[pyclass(name = "GitLabFilesLoader", module = "litgraph.loaders")]
+pub struct PyGitLabFilesLoader { inner: GitLabFilesLoader }
+
+#[pymethods]
+impl PyGitLabFilesLoader {
+    #[new]
+    #[pyo3(signature = (
+        token, project, base_url=None, git_ref="main",
+        extensions=None, exclude_paths=None,
+        max_files=Some(500), max_file_size_bytes=1024*1024, oauth=false,
+    ))]
+    fn new(
+        token: String,
+        project: String,
+        base_url: Option<String>,
+        git_ref: &str,
+        extensions: Option<Vec<String>>,
+        exclude_paths: Option<Vec<String>>,
+        max_files: Option<usize>,
+        max_file_size_bytes: u64,
+        oauth: bool,
+    ) -> Self {
+        let mut inner = GitLabFilesLoader::from_project(token, project)
+            .with_ref(git_ref)
+            .with_max_files(max_files)
+            .with_max_file_size_bytes(max_file_size_bytes)
+            .with_oauth(oauth);
+        if let Some(url) = base_url {
+            inner = inner.with_base_url(url);
+        }
+        if let Some(exts) = extensions {
+            inner = inner.with_extensions(exts);
+        }
+        if let Some(paths) = exclude_paths {
+            inner = inner.with_exclude_paths(paths);
+        }
+        Self { inner }
+    }
+
+    fn load<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        let docs = py.allow_threads(|| self.inner.load()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string())))?;
+        docs_to_pylist(py, docs)
+    }
+}
+
+/// Sitemap loader. Fetches `sitemap.xml`, extracts `<loc>` URLs, then
+/// pulls each via WebLoader. Crawls docs sites (Read the Docs, Hugo,
+/// Jekyll, Sphinx) without manually enumerating pages.
+///
+/// Supports both `urlset` (terminal) and `sitemapindex` (one level of
+/// nested sitemaps; deeper nesting bails). `include_pattern` /
+/// `exclude_pattern` filter URLs via regex (include applied first).
+/// `max_urls` caps total fetched (default 200) — protects against
+/// accidentally crawling 50K-page corp docs.
+///
+/// ```python
+/// from litgraph.loaders import SitemapLoader
+/// loader = SitemapLoader(
+///     "https://docs.example.com/sitemap.xml",
+///     include_pattern=r"/api/",
+///     exclude_pattern=r"deprecated",
+///     max_urls=100,
+/// )
+/// docs = loader.load()
+/// # docs[i].metadata["sitemap_source"] == sitemap URL
+/// # docs[i].metadata["source"] == individual page URL
+/// ```
+#[pyclass(name = "SitemapLoader", module = "litgraph.loaders")]
+pub struct PySitemapLoader { inner: SitemapLoader }
+
+#[pymethods]
+impl PySitemapLoader {
+    #[new]
+    #[pyo3(signature = (
+        sitemap_url,
+        timeout_s=30,
+        user_agent=None,
+        include_pattern=None,
+        exclude_pattern=None,
+        max_urls=200,
+    ))]
+    fn new(
+        sitemap_url: String,
+        timeout_s: u64,
+        user_agent: Option<String>,
+        include_pattern: Option<String>,
+        exclude_pattern: Option<String>,
+        max_urls: usize,
+    ) -> PyResult<Self> {
+        let mut inner = SitemapLoader::new(sitemap_url)
+            .with_timeout(std::time::Duration::from_secs(timeout_s))
+            .with_max_urls(max_urls);
+        if let Some(ua) = user_agent {
+            inner = inner.with_user_agent(ua);
+        }
+        if let Some(pat) = include_pattern {
+            inner = inner.with_include_pattern(&pat)
+                .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        }
+        if let Some(pat) = exclude_pattern {
+            inner = inner.with_exclude_pattern(&pat)
+                .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        }
+        Ok(Self { inner })
     }
 
     fn load<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {

@@ -9,6 +9,7 @@ description = "Text splitters — recursive character, token-sized, Markdown-awa
 
 [dependencies]
 litgraph-core.workspace = true
+litgraph-tokenizers.workspace = true
 rayon.workspace = true
 tracing.workspace = true
 serde_json.workspace = true

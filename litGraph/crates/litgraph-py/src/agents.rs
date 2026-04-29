@@ -5,7 +5,8 @@ use std::sync::{Arc, Mutex};
 
 use futures::StreamExt;
 use litgraph_agents::{
-    AgentEvent, ReactAgent, ReactAgentConfig, StoppedReason, SupervisorAgent, SupervisorConfig,
+    AgentEvent, PlanAndExecuteAgent, PlanAndExecuteConfig, ReactAgent, ReactAgentConfig,
+    StoppedReason, SupervisorAgent, SupervisorConfig,
     TextReActAgent, TextReactAgentConfig, TextReactEvent, TextReactTurn,
 };
 use litgraph_core::{ChatModel, ChatOptions, Message, Role};
@@ -25,14 +26,16 @@ use crate::runtime::{block_on_compat, rt};
 use crate::tools::{
     PyBraveSearchTool, PyCachedTool, PyCalculatorTool, PyDalleImageTool, PyDuckDuckGoSearchTool,
     PyFunctionTool, PyHttpRequestTool, PyListDirectoryTool, PyPythonReplTool, PyReadFileTool,
-    PyGmailSendTool, PyShellTool, PySqliteQueryTool, PyTavilyExtractTool, PyTavilySearchTool,
-    PyTtsAudioTool, PyWebFetchTool, PyWebhookTool, PyWhisperTranscribeTool, PyWriteFileTool,
+    PyGmailSendTool, PyRetryTool, PyShellTool, PySqliteQueryTool, PyTavilyExtractTool,
+    PyTavilySearchTool, PyTimeoutTool, PyTtsAudioTool, PyWebFetchTool, PyWebhookTool,
+    PyWhisperTranscribeTool, PyWriteFileTool,
 };
 use crate::mcp::PyMcpTool;
 
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyReactAgent>()?;
     m.add_class::<PySupervisorAgent>()?;
+    m.add_class::<PyPlanAndExecuteAgent>()?;
     m.add_class::<PyAgentEventStream>()?;
     m.add_class::<PyTextReActAgent>()?;
     m.add_class::<PyTextReactEventStream>()?;
@@ -84,6 +87,10 @@ fn extract_tools(tools: &Bound<'_, PyList>) -> PyResult<Vec<Arc<dyn litgraph_cor
             tool_vec.push(gs.as_tool());
         } else if let Ok(wf) = item.extract::<PyRef<PyWebFetchTool>>() {
             tool_vec.push(wf.as_tool());
+        } else if let Ok(tt) = item.extract::<PyRef<PyTimeoutTool>>() {
+            tool_vec.push(tt.as_tool());
+        } else if let Ok(rt) = item.extract::<PyRef<PyRetryTool>>() {
+            tool_vec.push(rt.as_tool());
         } else {
             return Err(PyValueError::new_err(
                 "tools must be FunctionTool, BraveSearchTool, TavilySearchTool, \
@@ -197,6 +204,10 @@ impl PyReactAgent {
                 tool_vec.push(gs.as_tool());
             } else if let Ok(wf) = item.extract::<PyRef<PyWebFetchTool>>() {
                 tool_vec.push(wf.as_tool());
+            } else if let Ok(tt) = item.extract::<PyRef<PyTimeoutTool>>() {
+                tool_vec.push(tt.as_tool());
+            } else if let Ok(rt) = item.extract::<PyRef<PyRetryTool>>() {
+                tool_vec.push(rt.as_tool());
             } else {
                 return Err(PyValueError::new_err(
                     "tools must be FunctionTool, BraveSearchTool, TavilySearchTool, \
@@ -753,4 +764,110 @@ fn text_react_turn_to_py<'py>(
         }
     }
     Ok(d)
+}
+
+/// Plan-and-Execute agent. Two-phase: planner LLM emits a numbered list
+/// of steps; per-step ReactAgent worker executes each in sequence.
+/// Different model for planner vs executor allows cheap-planner /
+/// capable-executor cost optimization.
+///
+/// ```python
+/// from litgraph.agents import PlanAndExecuteAgent
+/// from litgraph.providers import OpenAIChat
+///
+/// planner  = OpenAIChat(api_key=..., model="gpt-4o-mini")  # cheap
+/// executor = OpenAIChat(api_key=..., model="gpt-4o")       # capable
+/// agent = PlanAndExecuteAgent(
+///     planner=planner, executor=executor, tools=[],
+///     max_steps=5, max_iterations_per_step=4,
+/// )
+/// result = agent.invoke("Research X then write a brief.")
+/// print(result["plan"])          # ["step1", "step2", ...]
+/// print(result["steps"])         # [{"step": ..., "output": ...}, ...]
+/// print(result["final_answer"])  # last step's output
+/// ```
+#[pyclass(name = "PlanAndExecuteAgent", module = "litgraph.agents")]
+pub struct PyPlanAndExecuteAgent {
+    inner: PlanAndExecuteAgent,
+}
+
+#[pymethods]
+impl PyPlanAndExecuteAgent {
+    #[new]
+    #[pyo3(signature = (
+        planner,
+        executor=None,
+        tools=None,
+        planner_system=None,
+        executor_system=None,
+        max_steps=7,
+        max_iterations_per_step=5,
+    ))]
+    fn new(
+        planner: Bound<'_, PyAny>,
+        executor: Option<Bound<'_, PyAny>>,
+        tools: Option<Bound<'_, pyo3::types::PyList>>,
+        planner_system: Option<String>,
+        executor_system: Option<String>,
+        max_steps: usize,
+        max_iterations_per_step: u32,
+    ) -> PyResult<Self> {
+        let planner_arc = extract_chat_model(&planner)?;
+        let executor_arc = match executor {
+            Some(e) => extract_chat_model(&e)?,
+            None => planner_arc.clone(),
+        };
+        let mut tool_vec: Vec<Arc<dyn litgraph_core::tool::Tool>> = Vec::new();
+        if let Some(tlist) = tools {
+            for item in tlist.iter() {
+                if let Ok(t) = item.extract::<PyRef<crate::tools::PyFunctionTool>>() {
+                    tool_vec.push(t.as_tool());
+                } else {
+                    let arc = crate::tools::extract_tool_arc(&item)?;
+                    tool_vec.push(arc);
+                }
+            }
+        }
+        let mut cfg = PlanAndExecuteConfig::default();
+        if let Some(s) = planner_system {
+            cfg.planner_system = s;
+        }
+        cfg.executor_system = executor_system;
+        cfg.max_steps = max_steps;
+        cfg.max_iterations_per_step = max_iterations_per_step;
+        Ok(Self {
+            inner: PlanAndExecuteAgent::new(planner_arc, executor_arc, tool_vec, cfg),
+        })
+    }
+
+    fn invoke<'py>(
+        &self,
+        py: Python<'py>,
+        task: String,
+    ) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
+        let result = py.allow_threads(|| {
+            crate::runtime::block_on_compat(async { self.inner.invoke(task).await })
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })?;
+        let d = pyo3::types::PyDict::new_bound(py);
+        let plan_list = pyo3::types::PyList::empty_bound(py);
+        for s in &result.plan {
+            plan_list.append(s)?;
+        }
+        d.set_item("plan", plan_list)?;
+        let steps_list = pyo3::types::PyList::empty_bound(py);
+        for s in &result.steps {
+            let sd = pyo3::types::PyDict::new_bound(py);
+            sd.set_item("step", &s.step)?;
+            sd.set_item("output", &s.output)?;
+            steps_list.append(sd)?;
+        }
+        d.set_item("steps", steps_list)?;
+        d.set_item("final_answer", &result.final_answer)?;
+        Ok(d)
+    }
+
+    fn __repr__(&self) -> String {
+        "PlanAndExecuteAgent()".into()
+    }
 }
