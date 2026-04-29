@@ -33,7 +33,7 @@ pub use multi_vector::{MultiVectorItem, MultiVectorRetriever};
 pub use concurrent::{
     retrieve_concurrent, retrieve_concurrent_fail_fast, retrieve_concurrent_stream,
     retrieve_concurrent_stream_with_progress, retrieve_concurrent_with_progress,
-    RetrieveProgress, RetrieveStreamItem,
+    retrieve_concurrent_with_shutdown, RetrieveProgress, RetrieveStreamItem,
 };
 pub use race::RaceRetriever;
 pub use rerank_concurrent::{
