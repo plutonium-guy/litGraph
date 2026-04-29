@@ -34,6 +34,7 @@ pub mod dataset_version;
 pub mod prompt_hub;
 pub mod langmem;
 pub mod assistants;
+pub mod table_parser;
 
 pub use error::{Error, Result};
 pub use structured::StructuredChatModel;
@@ -79,6 +80,10 @@ pub use dataset_version::{
 pub use prompt_hub::{CachingPromptHub, FilesystemPromptHub, PromptHub, PromptRef};
 pub use langmem::{EpisodicMemory, Memory, MemoryExtractor, DEFAULT_EXTRACTION_SYSTEM_PROMPT};
 pub use assistants::{Assistant, AssistantManager, AssistantPatch};
+pub use table_parser::{
+    format_instructions as table_format_instructions, parse_table_csv, parse_table_json,
+    parse_table_value, Table, TableQuery,
+};
 pub use eval_harness::{
     run_eval, AggregateScores, ContainsAllScorer, EvalCase, EvalCaseResult, EvalDataset,
     EvalReport, ExactMatchScorer, JaccardScorer, LevenshteinScorer, LlmJudgeScorer, RegexScorer,

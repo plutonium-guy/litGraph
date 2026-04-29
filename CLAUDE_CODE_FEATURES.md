@@ -87,7 +87,7 @@ long-term Store. Older (v0.3) features rolled in from prior audit.
 | `format_instructions` helpers | Auto-tell LLM the format | ✅ |
 | OutputFixingParser (retry-on-parse-fail) | Self-heal | ✅ |
 | Streaming partial JSON | Live structured UIs | ✅ `parse_partial_json` |
-| Pandas DataFrame parser | Data agents | ❌ |
+| Pandas DataFrame parser | Data agents | ✅ `litgraph_core::{Table, TableQuery, parse_table_json, parse_table_csv, table_format_instructions}` — three ingest formats (`{columns,rows}` / records / CSV with quote+CRLF handling), query lang `column:`/`row:`/`<col>:<row>`/`mean:`/`sum:`/`min:`/`max:`/`count:`/`unique:`, type-checked numeric ops, null-skipping count |
 
 ## 5. Tools — let agent do things
 
