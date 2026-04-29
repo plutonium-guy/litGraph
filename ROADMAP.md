@@ -137,11 +137,12 @@ Total = sum. Anything ≥18 is fair game for the next ten iters.
 - **Effort:** 3–4 iters. Heavy because of model loading + KV-cache
   + tokenization edge cases.
 
-### 9. Webhook-resume bridge for interrupts
-- **Status:** 🟡. Today: user wires their own. Add a thin
-  `litgraph-serve --features webhooks` route that accepts
-  `POST /threads/:id/resume` with a JSON `Command` body.
-- **Effort:** 1 iter (small, mostly axum routing).
+### 9. Webhook-resume bridge for interrupts ✅ shipped iter 201 + 202
+- **Status:** ✅. `litgraph_core::ResumeRegistry` (201) ships the
+  oneshot-backed coordination primitive; `litgraph_serve::resume::
+  resume_router` (202) wraps it in axum endpoints — `POST
+  /threads/:id/resume`, `DELETE /threads/:id/resume`,
+  `GET /resumes/pending`. Mounts alongside the chat / studio routers.
 
 ### 10. Pregel-style super-step parallel execution audit
 - **Status:** ✅ scheduler exists, but worth a perf pass — currently
@@ -216,6 +217,7 @@ patterns").
 | `Progress<T>` (iter 199) | `tokio::sync::watch` latest-value broadcast | Completes the channel-shape trio: mpsc fan-in (189), broadcast fan-out (195), watch latest-value (199). Multiple observers, intermediate values collapse — observers see only the latest snapshot, perfect for progress UIs |
 | `ingest_to_stream_with_progress` (iter 200) | Composition of iter 196 + iter 199 | First **composition** of two prior parallelism primitives: the multi-stage ingest pipeline (196) updates an `IngestProgress` watcher (199) at each stage boundary. Demonstrates the compositional payoff of building primitives that snap together |
 | `ResumeRegistry` (iter 201) | `tokio::sync::oneshot` per thread id | Fourth channel shape in the lineage: oneshot signal (single-fire, single consumer). Foundation for the LangGraph interrupt-resume pattern — agent parks on `await_resume()`, an HTTP handler / Slack callback fires `resume(thread_id, value)` from anywhere |
+| `resume_router` (iter 202) | axum router over `ResumeRegistry` | Wire-protocol completion of iter 201: `POST /threads/:id/resume {value}` delivers, `DELETE /threads/:id/resume` cancels, `GET /resumes/pending` lists. Composes a coordination primitive into a real prod-ready HTTP feature in <100 LOC of glue |
 
 ---
 

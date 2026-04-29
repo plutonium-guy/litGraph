@@ -64,6 +64,8 @@ use tracing::{debug, error};
 #[cfg(feature = "studio")]
 pub mod studio;
 
+pub mod resume;
+
 /// Wraps the model + any per-instance config the handlers need. Cheap
 /// to clone (Arc inside).
 #[derive(Clone)]
