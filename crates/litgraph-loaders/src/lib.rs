@@ -78,6 +78,8 @@ pub mod youtube;
 pub use youtube::YouTubeTranscriptLoader;
 pub mod discord;
 pub use discord::DiscordChannelLoader;
+pub mod outlook;
+pub use outlook::OutlookMessagesLoader;
 
 #[derive(Debug, thiserror::Error)]
 pub enum LoaderError {
