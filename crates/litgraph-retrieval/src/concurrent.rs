@@ -253,6 +253,89 @@ pub fn retrieve_concurrent_stream(
     Box::pin(ReceiverStream::new(rx))
 }
 
+/// Streaming variant of [`retrieve_concurrent_with_shutdown`].
+/// Yields `(query_idx, Result)` items in completion order until
+/// either every query finishes or `shutdown` fires. On shutdown
+/// the producer aborts in-flight queries and drops the channel —
+/// the consumer's stream ends cleanly with `None`.
+///
+/// Same producer-side / consumer-side distinction as iter 233:
+///
+/// - **Drop**: consumer-side end-of-interest (existing behavior of
+///   [`retrieve_concurrent_stream`]).
+/// - **Shutdown**: producer-side / orchestrator end-of-interest.
+///   One signal stops every parallel retriever stream a multi-query
+///   eval driver owns without it tracking each receiver.
+///
+/// Real prod use: a long eval-harness run streaming retrievals
+/// over thousands of queries — Ctrl+C fires the shared
+/// `ShutdownSignal`, every parallel retrieval stream terminates
+/// cleanly, and the partial results already drained into the
+/// scorer stay valid for a partial eval report.
+///
+/// Pre-fired signal returns an empty stream (no work spawned).
+/// `max_concurrency = 0` normalised to 1 (sequential).
+///
+/// Composition: combines iter 212 (`retrieve_concurrent_stream`)
+/// + iter 225 (`ShutdownSignal`). Mirror of iters 233 / 234 on
+/// the retriever axis — third of six stream axes bridged.
+pub fn retrieve_concurrent_stream_with_shutdown(
+    retriever: Arc<dyn Retriever>,
+    queries: Vec<String>,
+    k: usize,
+    max_concurrency: usize,
+    shutdown: ShutdownSignal,
+) -> Pin<Box<dyn Stream<Item = RetrieveStreamItem> + Send>> {
+    if queries.is_empty() || shutdown.is_signaled() {
+        return Box::pin(futures::stream::empty());
+    }
+    let cap = max_concurrency.max(1);
+    let n = queries.len();
+    let buf = n.min(cap.max(8));
+    let (tx, rx) = mpsc::channel::<RetrieveStreamItem>(buf);
+
+    tokio::spawn(async move {
+        let sem = Arc::new(Semaphore::new(cap));
+        let mut set: JoinSet<RetrieveStreamItem> = JoinSet::new();
+        for (idx, q) in queries.into_iter().enumerate() {
+            let sem = sem.clone();
+            let retriever = retriever.clone();
+            set.spawn(async move {
+                let _permit = match sem.acquire_owned().await {
+                    Ok(p) => p,
+                    Err(_) => return (idx, Err(Error::other("retrieve semaphore closed"))),
+                };
+                let r = retriever.retrieve(&q, k).await;
+                (idx, r)
+            });
+        }
+        loop {
+            tokio::select! {
+                joined = set.join_next() => {
+                    let item = match joined {
+                        Some(Ok(it)) => it,
+                        Some(Err(e)) => (
+                            usize::MAX,
+                            Err(Error::other(format!("retrieve task join: {e}"))),
+                        ),
+                        None => break,
+                    };
+                    if tx.send(item).await.is_err() {
+                        set.abort_all();
+                        break;
+                    }
+                }
+                _ = shutdown.wait() => {
+                    set.abort_all();
+                    break;
+                }
+            }
+        }
+    });
+
+    Box::pin(ReceiverStream::new(rx))
+}
+
 /// Combined streaming + progress-watcher variant. Yields the same
 /// `(query_idx, Result)` items as [`retrieve_concurrent_stream`]
 /// AND updates the supplied [`Progress<RetrieveProgress>`] watcher
@@ -887,5 +970,65 @@ mod tests {
         .await;
         assert!(out.is_empty());
         assert_eq!(obs.snapshot(), RetrieveProgress::default());
+    }
+
+    // ---- retrieve_concurrent_stream_with_shutdown tests ---------------
+
+    #[tokio::test]
+    async fn stream_shutdown_no_signal_emits_full_set() {
+        let (r, _peak) = probe(0);
+        let shutdown = ShutdownSignal::new();
+        let mut s = retrieve_concurrent_stream_with_shutdown(r, qs(6), 1, 4, shutdown);
+        let mut count = 0;
+        while let Some((_idx, res)) = s.next().await {
+            assert!(res.is_ok());
+            count += 1;
+        }
+        assert_eq!(count, 6);
+    }
+
+    #[tokio::test]
+    async fn stream_shutdown_pre_fired_yields_empty_stream() {
+        let (r, _peak) = probe(0);
+        let shutdown = ShutdownSignal::new();
+        shutdown.signal();
+        let mut s = retrieve_concurrent_stream_with_shutdown(r, qs(4), 1, 4, shutdown);
+        assert!(s.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn stream_shutdown_mid_run_emits_prefix_then_ends() {
+        // 30 queries × 50ms × cap=2 ≈ 750ms sequential. Fire signal
+        // at 80ms; consumer should see a prefix and the stream ends
+        // far before the natural duration.
+        let (r, _peak) = probe(50);
+        let shutdown = ShutdownSignal::new();
+        let s2 = shutdown.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+            s2.signal();
+        });
+        let started = std::time::Instant::now();
+        let mut s = retrieve_concurrent_stream_with_shutdown(r, qs(30), 1, 2, shutdown);
+        let mut count = 0;
+        while let Some((_idx, res)) = s.next().await {
+            assert!(res.is_ok());
+            count += 1;
+        }
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_millis(400),
+            "elapsed {elapsed:?} — shutdown didn't terminate stream early",
+        );
+        assert!(count >= 1, "no items reached the consumer before shutdown");
+        assert!(count < 30, "stream emitted full set despite shutdown");
+    }
+
+    #[tokio::test]
+    async fn stream_shutdown_empty_queries_yields_empty() {
+        let (r, _peak) = probe(0);
+        let shutdown = ShutdownSignal::new();
+        let mut s = retrieve_concurrent_stream_with_shutdown(r, vec![], 1, 4, shutdown);
+        assert!(s.next().await.is_none());
     }
 }
