@@ -12,9 +12,10 @@ use std::sync::Arc;
 
 use litgraph_core::{
     ChatPromptTemplate, FewShotChatPromptTemplate, LengthBasedExampleSelector, Message, Role,
-    SemanticSimilarityExampleSelector,
+    SemanticSimilarityExampleSelector, Skill, SystemPromptBuilder, load_agents_md,
+    load_skills_dir,
 };
-use pyo3::exceptions::{PyRuntimeError, PyValueError};
+use pyo3::exceptions::{PyIOError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
 
@@ -26,7 +27,143 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyFewShotChatPromptTemplate>()?;
     m.add_class::<PySemanticSimilarityExampleSelector>()?;
     m.add_class::<PyLengthBasedExampleSelector>()?;
+    m.add_class::<PySkill>()?;
+    m.add_class::<PySystemPromptBuilder>()?;
+    m.add_function(pyo3::wrap_pyfunction!(load_agents_md_py, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(load_skills_dir_py, m)?)?;
     Ok(())
+}
+
+/// Read a single AGENTS.md (or CLAUDE.md / system-prompt) file. Returns the
+/// file contents as a string, or `None` if the file does not exist.
+#[pyfunction(name = "load_agents_md")]
+#[pyo3(signature = (path))]
+fn load_agents_md_py(path: String) -> PyResult<Option<String>> {
+    load_agents_md(&path).map_err(|e| PyIOError::new_err(e.to_string()))
+}
+
+/// Read every `*.md` file in `dir` as a `Skill`. Sorted by filename. Returns
+/// an empty list if the directory does not exist.
+#[pyfunction(name = "load_skills_dir")]
+#[pyo3(signature = (dir))]
+fn load_skills_dir_py(dir: String) -> PyResult<Vec<PySkill>> {
+    let skills = load_skills_dir(&dir).map_err(|e| PyIOError::new_err(e.to_string()))?;
+    Ok(skills.into_iter().map(|s| PySkill { inner: s }).collect())
+}
+
+/// One named skill loaded from disk. Construct directly or via
+/// `litgraph.prompts.load_skills_dir(...)`.
+#[pyclass(name = "Skill", module = "litgraph.prompts")]
+#[derive(Clone)]
+pub struct PySkill {
+    pub(crate) inner: Skill,
+}
+
+#[pymethods]
+impl PySkill {
+    #[new]
+    #[pyo3(signature = (name, description, content, source=None))]
+    fn new(name: String, description: String, content: String, source: Option<String>) -> Self {
+        Self {
+            inner: Skill {
+                name,
+                description,
+                content,
+                source: source.map(std::path::PathBuf::from),
+            },
+        }
+    }
+
+    #[getter]
+    fn name(&self) -> String {
+        self.inner.name.clone()
+    }
+    #[getter]
+    fn description(&self) -> String {
+        self.inner.description.clone()
+    }
+    #[getter]
+    fn content(&self) -> String {
+        self.inner.content.clone()
+    }
+    #[getter]
+    fn source(&self) -> Option<String> {
+        self.inner
+            .source
+            .as_ref()
+            .and_then(|p| p.to_str().map(|s| s.to_string()))
+    }
+
+    fn __repr__(&self) -> String {
+        format!("Skill(name={:?}, description={:?})", self.inner.name, self.inner.description)
+    }
+}
+
+/// Assemble a structured system prompt from a base instruction, an optional
+/// AGENTS.md memory body, a list of `Skill`s, and arbitrary extra named
+/// sections. Output is plain Markdown (`## Section` headers).
+#[pyclass(name = "SystemPromptBuilder", module = "litgraph.prompts")]
+pub struct PySystemPromptBuilder {
+    inner: SystemPromptBuilder,
+}
+
+#[pymethods]
+impl PySystemPromptBuilder {
+    #[new]
+    fn new(base: String) -> Self {
+        Self {
+            inner: SystemPromptBuilder::new(base),
+        }
+    }
+
+    fn with_agents_md<'py>(mut slf: PyRefMut<'py, Self>, body: String) -> PyRefMut<'py, Self> {
+        let owned = std::mem::take(&mut slf.inner);
+        slf.inner = owned.with_agents_md(body);
+        slf
+    }
+
+    fn with_skill<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        skill: PyRef<'_, PySkill>,
+    ) -> PyRefMut<'py, Self> {
+        let owned = std::mem::take(&mut slf.inner);
+        slf.inner = owned.with_skill(skill.inner.clone());
+        slf
+    }
+
+    fn with_skills<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        skills: Bound<'_, PyList>,
+    ) -> PyResult<PyRefMut<'py, Self>> {
+        let mut collected: Vec<Skill> = Vec::with_capacity(skills.len());
+        for item in skills.iter() {
+            let s = item.extract::<PyRef<PySkill>>()?;
+            collected.push(s.inner.clone());
+        }
+        let owned = std::mem::take(&mut slf.inner);
+        slf.inner = owned.with_skills(collected);
+        Ok(slf)
+    }
+
+    fn with_section<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        heading: String,
+        body: String,
+    ) -> PyRefMut<'py, Self> {
+        let owned = std::mem::take(&mut slf.inner);
+        slf.inner = owned.with_section(heading, body);
+        slf
+    }
+
+    fn build(&self) -> String {
+        self.inner.build()
+    }
+
+    fn __repr__(&self) -> String {
+        let s = self.inner.build();
+        let preview: String = s.chars().take(60).collect();
+        format!("SystemPromptBuilder(preview={:?})", preview)
+    }
 }
 
 fn role_from_str(s: &str) -> PyResult<Role> {

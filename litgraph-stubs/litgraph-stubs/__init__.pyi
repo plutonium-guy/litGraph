@@ -6,6 +6,7 @@ from . import (
     loaders as loaders,
     middleware as middleware,
     observability as observability,
+    prompts as prompts,
     providers as providers,
     retrieval as retrieval,
     splitters as splitters,

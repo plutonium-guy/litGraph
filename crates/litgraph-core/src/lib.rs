@@ -25,6 +25,7 @@ pub mod markdown_table_parser;
 pub mod vector_store_memory;
 pub mod store;
 pub mod middleware;
+pub mod skill_loader;
 
 pub use error::{Error, Result};
 pub use structured::StructuredChatModel;
@@ -54,6 +55,7 @@ pub use middleware::{
     AgentMiddleware, LoggingMiddleware, MessageWindowMiddleware, MiddlewareChain,
     MiddlewareChatModel, SystemPromptMiddleware,
 };
+pub use skill_loader::{load_agents_md, load_skills_dir, Skill, SystemPromptBuilder};
 pub use eval_harness::{
     run_eval, AggregateScores, ContainsAllScorer, EvalCase, EvalCaseResult, EvalDataset,
     EvalReport, ExactMatchScorer, JaccardScorer, LevenshteinScorer, LlmJudgeScorer, RegexScorer,
