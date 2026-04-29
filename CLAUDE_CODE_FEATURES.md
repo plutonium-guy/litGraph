@@ -72,7 +72,7 @@ long-term Store. Older (v0.3) features rolled in from prior audit.
 | Partial application (bind vars) | Curry templates | ✅ |
 | from/to JSON · from/to dict | Save/load prompts | ✅ |
 | Composition (extend/+/concat) | Layer base+role+task | ✅ |
-| Hub pull (`langchain hub`) | Share prompts | ❌ no hub |
+| Hub pull (`langchain hub`) | Share prompts | ✅ `litgraph_core::{PromptHub, FilesystemPromptHub, CachingPromptHub}` + `litgraph_loaders::HttpPromptHub` — versioned `name@v2` refs, JSON-on-disk or HTTP fetch, bearer/header auth, traversal-hardened, list/push/pull, process-local cache wrapper |
 
 ## 4. Output Parsers — turn text into structs
 

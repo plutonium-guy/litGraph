@@ -19,12 +19,16 @@ tracing.workspace = true
 regex.workspace = true
 once_cell = "1"
 parking_lot.workspace = true
-tokio = { workspace = true, optional = true }
+# Non-optional: needed for `tokio::task::spawn_blocking` in tool_offload,
+# dataset_version, and prompt_hub. Downstream crates already pull tokio
+# unconditionally, so making it optional only saved a feature flag toggle.
+tokio = { workspace = true }
 blake3.workspace = true
 
 [features]
 default = []
-runtime = ["tokio"]
+# Retained for backwards compat — tokio is now an unconditional dep.
+runtime = []
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

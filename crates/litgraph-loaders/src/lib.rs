@@ -72,6 +72,8 @@ pub mod wikipedia;
 pub use wikipedia::WikipediaLoader;
 pub mod pubmed;
 pub use pubmed::PubMedLoader;
+pub mod http_prompt_hub;
+pub use http_prompt_hub::HttpPromptHub;
 
 #[derive(Debug, thiserror::Error)]
 pub enum LoaderError {

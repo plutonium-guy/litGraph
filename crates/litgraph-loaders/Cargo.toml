@@ -26,6 +26,8 @@ base64.workspace = true
 # tags only — no attributes on data nodes, so regex is safe here).
 litgraph-providers-bedrock.workspace = true
 chrono.workspace = true
+async-trait.workspace = true
+tokio = { workspace = true }
 # PDF text extraction is opt-in. lopdf is pure-Rust + handles font encoding so
 # we don't need cargo install poppler / wasm-bindgen / native deps.
 lopdf = { version = "0.40", optional = true }

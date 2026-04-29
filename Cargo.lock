@@ -1959,6 +1959,7 @@ dependencies = [
 name = "litgraph-loaders"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "base64 0.22.1",
  "chrono",
  "csv",
@@ -1975,6 +1976,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror 1.0.69",
+ "tokio",
  "tracing",
  "walkdir",
  "zip",
