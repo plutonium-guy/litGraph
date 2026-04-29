@@ -209,6 +209,7 @@ patterns").
 | `RaceEmbeddings` (iter 192) | Tokio `JoinSet` + `abort_all` over `Embeddings` | Embeddings analogue of iter 184 `RaceChatModel`. Hedge OpenAI / Voyage / local fastembed for tail-latency cuts on the embed-query critical path |
 | `RaceRetriever` (iter 193) | Tokio `JoinSet` + `abort_all` over `Retriever` | Completes the race trio across the read-side traits (Chat/Embeddings/Retriever). Hedge a fast cache against a slow primary for latency-min retrieval; vs `EnsembleRetriever` which fuses for quality |
 | `TimeoutChatModel` + `TimeoutEmbeddings` (iter 194) | `tokio::time::timeout` (concurrent inner-future vs deadline-timer, `select`-style) | Different shape from `JoinSet/abort_all` race patterns: the "competitor" is a deadline timer, not another provider. Drops the inner future on timeout, releasing connection / parse state |
+| `broadcast_chat_stream` (iter 195) | `tokio::sync::broadcast` (1→N fan-out) | Inverse of iter 189's `mpsc`-based fan-in. One upstream stream, N concurrent subscribers; lazy-spawn pump to avoid event loss vs late subscribers; `Lagged(n)` per subscriber on capacity overflow so a slow consumer doesn't stall fast ones |
 
 ---
 

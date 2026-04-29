@@ -26,6 +26,7 @@ tokio = { workspace = true }
 blake3.workspace = true
 rayon.workspace = true
 async-stream.workspace = true
+tokio-stream = { workspace = true, features = ["sync"] }
 
 [features]
 default = []

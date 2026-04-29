@@ -45,7 +45,197 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyMultiplexStream>()?;
     m.add_function(wrap_pyfunction!(multiplex_chat_streams, m)?)?;
     m.add_function(wrap_pyfunction!(py_tool_dispatch_concurrent, m)?)?;
+    m.add_class::<PyBroadcastHandle>()?;
+    m.add_class::<PyBroadcastSubscriber>()?;
+    m.add_function(wrap_pyfunction!(broadcast_chat_stream, m)?)?;
     Ok(())
+}
+
+/// Broadcast a single chat model's token stream to N concurrent
+/// subscribers. Inverse of `multiplex_chat_streams` (iter 189): that
+/// fans-IN N streams into one; broadcast fans-OUT one stream to N.
+///
+/// Use cases:
+/// - Live UI + audit log subscribing to the same agent stream.
+/// - Multi-pane debugger showing the same tokens to many clients.
+/// - Sidecar policy evaluator watching tokens in flight.
+///
+/// All subscribers must call `.subscribe()` BEFORE the first iteration
+/// hits the runtime — the pump is spawned on the first `subscribe()`,
+/// so additional subscribers must register before yielding control.
+///
+/// ```python
+/// from litgraph.agents import broadcast_chat_stream
+/// handle = broadcast_chat_stream(model, [{"role": "user", "content": "hi"}], capacity=64)
+/// sub_a = handle.subscribe()
+/// sub_b = handle.subscribe()
+/// # Now drain both. Each receives every event.
+/// for ev in sub_a:
+///     print("a:", ev.get("text", ""))
+/// ```
+#[pyfunction]
+#[pyo3(signature = (model, messages, capacity=64, temperature=None, max_tokens=None))]
+fn broadcast_chat_stream(
+    py: Python<'_>,
+    model: Bound<'_, PyAny>,
+    messages: Bound<'_, PyList>,
+    capacity: usize,
+    temperature: Option<f32>,
+    max_tokens: Option<u32>,
+) -> PyResult<Py<PyBroadcastHandle>> {
+    let chat = extract_chat_model(&model)?;
+    let msgs = crate::providers::parse_messages_from_pylist(&messages)?;
+    let opts = ChatOptions {
+        temperature,
+        max_tokens,
+        ..Default::default()
+    };
+
+    // Build an "upstream" by spawning model.stream() inside the
+    // broadcast pump. We need a `ChatStream` here — call
+    // `model.stream(...)` once and pass the resulting stream into
+    // `litgraph_core::broadcast_chat_stream`.
+    let upstream_future = async move { chat.stream(msgs, &opts).await };
+    // Resolve the stream synchronously on this thread so we have a
+    // concrete `ChatStream` to pass in. `model.stream` returns the
+    // stream future immediately; awaiting once gives us the actual
+    // Stream impl.
+    let upstream = py.allow_threads(|| {
+        block_on_compat(upstream_future)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    })?;
+
+    let handle = litgraph_core::broadcast_chat_stream(upstream, capacity)
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    Py::new(
+        py,
+        PyBroadcastHandle {
+            inner: Arc::new(handle),
+        },
+    )
+}
+
+/// Handle to a configured broadcast. Call `.subscribe()` to obtain
+/// a fresh subscriber iterator. First `.subscribe()` call spawns the
+/// pump.
+#[pyclass(name = "BroadcastHandle", module = "litgraph.agents")]
+pub struct PyBroadcastHandle {
+    inner: Arc<litgraph_core::BroadcastHandle>,
+}
+
+#[pymethods]
+impl PyBroadcastHandle {
+    fn subscribe<'py>(&self, py: Python<'py>) -> PyResult<Py<PyBroadcastSubscriber>> {
+        let stream = self.inner.subscribe();
+        // Bridge: drain the BroadcastSubscriberStream into an
+        // mpsc::Receiver that Python can `__next__` block on.
+        let (tx, rx) = mpsc::channel::<litgraph_core::BroadcastEvent>(64);
+        crate::runtime::rt().spawn(async move {
+            let mut s = stream;
+            while let Some(ev) = s.next().await {
+                if tx.send(ev).await.is_err() {
+                    break;
+                }
+            }
+        });
+        Py::new(
+            py,
+            PyBroadcastSubscriber {
+                rx: Arc::new(Mutex::new(Some(rx))),
+            },
+        )
+    }
+
+    fn receiver_count(&self) -> usize {
+        self.inner.receiver_count()
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "BroadcastHandle(receivers={})",
+            self.inner.receiver_count()
+        )
+    }
+}
+
+/// One Python iterator over a broadcast subscriber's events. Each
+/// `__next__` returns a dict; iteration ends with `StopIteration` when
+/// the upstream pump finishes.
+#[pyclass(name = "BroadcastSubscriber", module = "litgraph.agents")]
+pub struct PyBroadcastSubscriber {
+    rx: Arc<Mutex<Option<mpsc::Receiver<litgraph_core::BroadcastEvent>>>>,
+}
+
+#[pymethods]
+impl PyBroadcastSubscriber {
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __next__<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let slot = self.rx.clone();
+        let item = py.allow_threads(|| {
+            let mut guard = slot.lock().expect("poisoned");
+            let mut rx = match guard.take() {
+                Some(r) => r,
+                None => return None,
+            };
+            let got = block_on_compat(async { rx.recv().await });
+            *guard = Some(rx);
+            got
+        });
+        match item {
+            Some(ev) => broadcast_event_to_py(py, &ev),
+            None => {
+                *self.rx.lock().expect("poisoned") = None;
+                Err(PyStopIteration::new_err("broadcast subscriber exhausted"))
+            }
+        }
+    }
+}
+
+fn broadcast_event_to_py<'py>(
+    py: Python<'py>,
+    ev: &litgraph_core::BroadcastEvent,
+) -> PyResult<Bound<'py, PyDict>> {
+    use litgraph_core::{BroadcastEvent, ChatStreamEvent};
+    let d = PyDict::new_bound(py);
+    match ev {
+        BroadcastEvent::Lagged { skipped } => {
+            d.set_item("type", "lagged")?;
+            d.set_item("skipped", skipped)?;
+        }
+        BroadcastEvent::Event(Err(msg)) => {
+            d.set_item("type", "error")?;
+            d.set_item("error", msg)?;
+        }
+        BroadcastEvent::Event(Ok(ChatStreamEvent::Delta { text })) => {
+            d.set_item("type", "delta")?;
+            d.set_item("text", text)?;
+        }
+        BroadcastEvent::Event(Ok(ChatStreamEvent::ToolCallDelta {
+            index,
+            id,
+            name,
+            arguments_delta,
+        })) => {
+            d.set_item("type", "tool_call_delta")?;
+            d.set_item("index", index)?;
+            d.set_item("id", id.clone())?;
+            d.set_item("name", name.clone())?;
+            d.set_item("arguments_delta", arguments_delta.clone())?;
+        }
+        BroadcastEvent::Event(Ok(ChatStreamEvent::Done { response })) => {
+            d.set_item("type", "done")?;
+            d.set_item("text", response.message.text_content())?;
+            d.set_item(
+                "finish_reason",
+                format!("{:?}", response.finish_reason).to_lowercase(),
+            )?;
+            d.set_item("model", &response.model)?;
+        }
+    }
+    Ok(d)
 }
 
 /// Run N tool calls concurrently, capped at `max_concurrency` in

@@ -38,6 +38,7 @@ pub mod batch;
 pub mod embed_batch;
 pub mod semantic_store;
 pub mod stream_multiplex;
+pub mod stream_broadcast;
 pub mod tool_dispatch;
 pub mod table_parser;
 
@@ -91,6 +92,10 @@ pub use embed_batch::{
 };
 pub use semantic_store::{SemanticHit, SemanticStore};
 pub use stream_multiplex::{multiplex_chat_streams, MultiplexEvent, MultiplexStream};
+pub use stream_broadcast::{
+    broadcast_chat_stream, broadcast_chat_stream_with_main, BroadcastEvent, BroadcastHandle,
+    BroadcastSubscriberStream,
+};
 pub use tool_dispatch::{tool_dispatch_concurrent, tool_dispatch_concurrent_fail_fast};
 pub use table_parser::{
     format_instructions as table_format_instructions, parse_table_csv, parse_table_json,
