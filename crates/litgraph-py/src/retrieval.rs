@@ -7,8 +7,10 @@ use litgraph_retrieval::store::VectorStore;
 use litgraph_retrieval::{
     embedding_redundant_filter, long_context_reorder, mmr_select, AttributeInfo, Bm25Index,
     ChildSplitter, Compressor, ContextualCompressionRetriever, DocStore,
-    EmbeddingsFilterCompressor, EnsembleReranker, EnsembleRetriever, HybridRetriever, LlmExtractCompressor, MemoryDocStore,
-    HydeRetriever, MaxMarginalRelevanceRetriever, MultiQueryRetriever, MultiVectorItem, MultiVectorRetriever, ParentDocumentRetriever,
+    retrieve_concurrent, EmbeddingsFilterCompressor, EnsembleReranker, EnsembleRetriever,
+    HybridRetriever, LlmExtractCompressor, MemoryDocStore, HydeRetriever,
+    MaxMarginalRelevanceRetriever, MultiQueryRetriever, MultiVectorItem, MultiVectorRetriever,
+    ParentDocumentRetriever,
     PipelineCompressor, Reranker,
     RerankingRetriever, Retriever, SelfQueryRetriever, TimeWeightedRetriever, VectorRetriever,
 };
@@ -62,6 +64,7 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyTimeWeightedRetriever>()?;
     m.add_function(pyo3::wrap_pyfunction!(evaluate_retrieval, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(evaluate_generation, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(py_retrieve_concurrent, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(mmr_select_py, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(embedding_redundant_filter_py, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(long_context_reorder_py, m)?)?;
@@ -2495,4 +2498,95 @@ impl PyMaxMarginalRelevanceRetriever {
             self.inner.fetch_k, self.inner.lambda_mult,
         )
     }
+}
+
+// ---------- retrieve_concurrent (iter 190) ----------
+
+/// Extract an `Arc<dyn Retriever>` from any of the supported py
+/// retriever wrappers. Used by `retrieve_concurrent` and any future
+/// helpers that need polymorphic retriever input.
+fn extract_retriever_arc(item: &Bound<'_, PyAny>) -> PyResult<Arc<dyn Retriever>> {
+    if let Ok(v) = item.extract::<PyRef<PyVectorRetriever>>() {
+        return Ok(v.as_retriever());
+    }
+    if let Ok(b) = item.extract::<PyRef<PyBm25Index>>() {
+        return Ok(b.as_retriever());
+    }
+    if let Ok(rr) = item.extract::<PyRef<PyRerankingRetriever>>() {
+        return Ok(rr.as_retriever());
+    }
+    if let Ok(h) = item.extract::<PyRef<PyHybridRetriever>>() {
+        return Ok(h.as_retriever());
+    }
+    if let Ok(e) = item.extract::<PyRef<PyEnsembleRetriever>>() {
+        return Ok(e.as_retriever());
+    }
+    if let Ok(p) = item.extract::<PyRef<PyParentDocumentRetriever>>() {
+        return Ok(p.as_retriever());
+    }
+    if let Ok(m) = item.extract::<PyRef<PyMultiVectorRetriever>>() {
+        return Ok(m.as_retriever());
+    }
+    Err(pyo3::exceptions::PyTypeError::new_err(
+        "retriever must be VectorRetriever, Bm25Index, RerankingRetriever, HybridRetriever, \
+         EnsembleRetriever, ParentDocumentRetriever, or MultiVectorRetriever",
+    ))
+}
+
+/// Run a single retriever against N caller-supplied queries
+/// concurrently, capped at `max_concurrency` in flight. Output is
+/// aligned 1:1 with `queries`. Per-query failures isolate by default
+/// (slot becomes `{"error": "..."}`); pass `fail_fast=True` to raise
+/// on the first error and abort the rest.
+///
+/// Distinct from `MultiQueryRetriever` (which uses an LLM to expand
+/// ONE query into N variants) and `EnsembleRetriever` (which uses
+/// DIFFERENT retrievers on the same query). This helper is the
+/// "evaluate / batch" path: same retriever, many caller queries.
+///
+/// ```python
+/// from litgraph.retrieval import retrieve_concurrent
+/// queries = [c["query"] for c in eval_cases]
+/// results = retrieve_concurrent(retriever, queries, k=10, max_concurrency=16)
+/// for q, hits in zip(queries, results):
+///     if isinstance(hits, dict) and "error" in hits:
+///         print(f"failed: {q}: {hits['error']}")
+///     else:
+///         print(f"{q}: top-1 = {hits[0]['content']}")
+/// ```
+#[pyfunction]
+#[pyo3(name = "retrieve_concurrent", signature = (retriever, queries, k=10, max_concurrency=8, fail_fast=false))]
+fn py_retrieve_concurrent<'py>(
+    py: Python<'py>,
+    retriever: Bound<'py, PyAny>,
+    queries: Vec<String>,
+    k: usize,
+    max_concurrency: usize,
+    fail_fast: bool,
+) -> PyResult<Bound<'py, PyList>> {
+    let r_arc = extract_retriever_arc(&retriever)?;
+    let results = py.allow_threads(|| {
+        block_on_compat(async move {
+            Ok::<_, litgraph_core::Error>(
+                retrieve_concurrent(r_arc, queries, k, max_concurrency).await,
+            )
+        })
+        .map_err(|e: litgraph_core::Error| PyRuntimeError::new_err(e.to_string()))
+    })?;
+
+    let out = PyList::empty_bound(py);
+    for r in results {
+        match r {
+            Ok(docs) => out.append(docs_to_pylist(py, docs)?)?,
+            Err(e) => {
+                if fail_fast {
+                    return Err(PyRuntimeError::new_err(e.to_string()));
+                }
+                let d = PyDict::new_bound(py);
+                d.set_item("error", e.to_string())?;
+                out.append(d)?;
+            }
+        }
+    }
+    Ok(out)
 }
