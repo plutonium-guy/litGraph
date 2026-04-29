@@ -49,9 +49,10 @@ use std::sync::Arc;
 
 use futures::Stream;
 use litgraph_core::{
-    embed_documents_concurrent, Document, Embeddings, DEFAULT_EMBED_CHUNK_SIZE,
+    embed_documents_concurrent, Document, Embeddings, Progress, DEFAULT_EMBED_CHUNK_SIZE,
     DEFAULT_EMBED_CONCURRENCY,
 };
+use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -62,6 +63,34 @@ use crate::{load_concurrent, Loader, LoaderError, LoaderResult};
 pub struct IngestBatch {
     pub docs: Vec<Document>,
     pub embeddings: Vec<Vec<f32>>,
+}
+
+/// Counters maintained by [`ingest_to_stream_with_progress`]. Read on
+/// demand from any [`Progress`] observer to drive a UI bar, log
+/// throughput, or trip a circuit breaker on stuck stages.
+///
+/// All fields are monotonic (only increase). The pipeline updates
+/// each counter after the corresponding stage emits — so a snapshot
+/// where `chunks_split > chunks_embedded` means the embedder hasn't
+/// caught up yet (normal mid-flight state).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IngestProgress {
+    /// Number of loaders submitted to stage 1.
+    pub loaders_total: u64,
+    /// Number of loaders whose `load()` has finished (Ok or Err).
+    pub loaders_done: u64,
+    /// Number of `Document`s emitted by successful loaders so far.
+    pub docs_loaded: u64,
+    /// Number of chunks emitted by the splitter stage.
+    pub chunks_split: u64,
+    /// Number of chunks the embedder has produced vectors for.
+    pub chunks_embedded: u64,
+    /// Number of `IngestBatch`es emitted to the output stream.
+    pub batches_emitted: u64,
+    /// Loader-level failures observed (does not include embed errors).
+    pub loader_errors: u64,
+    /// Embed-level failures observed.
+    pub embed_errors: u64,
 }
 
 /// Pipeline tunables. All bounded values default to a "modest VM"
@@ -227,6 +256,185 @@ where
             embed_chunk_size,
             embed_concurrency,
             &batch_tx,
+        )
+        .await;
+    });
+
+    ReceiverStream::new(batch_rx)
+}
+
+/// Like [`ingest_to_stream`] but additionally updates the supplied
+/// [`Progress`] handle as each stage advances. Observers attached to
+/// the same `Progress` can read counter snapshots on demand —
+/// perfect for progress bars, dashboards, throughput logging, and
+/// stuck-stage detection.
+///
+/// All counters are monotonic. The pipeline writes each field
+/// immediately after the corresponding stage emits, so a snapshot
+/// where `chunks_split > chunks_embedded` is normal mid-flight (the
+/// embedder is catching up).
+///
+/// Composes [iter 196] (multi-stage ingestion) and [iter 199]
+/// (Progress) into a single call. Demonstrates the ergonomic value
+/// of building primitives that compose.
+pub fn ingest_to_stream_with_progress<S>(
+    loaders: Vec<Arc<dyn Loader>>,
+    splitter: S,
+    embedder: Arc<dyn Embeddings>,
+    cfg: IngestConfig,
+    progress: Progress<IngestProgress>,
+) -> impl Stream<Item = Result<IngestBatch, LoaderError>> + Send
+where
+    S: Fn(Document) -> Vec<Document> + Send + Sync + 'static,
+{
+    // Initialise loaders_total now that we know the count.
+    let total = loaders.len() as u64;
+    let _ = progress.update(|p| IngestProgress {
+        loaders_total: total,
+        ..p.clone()
+    });
+
+    let splitter = Arc::new(splitter);
+    let (load_tx, load_rx) = mpsc::channel::<LoaderResult<Vec<Document>>>(cfg.load_buffer);
+    let (split_tx, split_rx) = mpsc::channel::<LoaderResult<Document>>(cfg.split_buffer);
+    let (batch_tx, batch_rx) =
+        mpsc::channel::<Result<IngestBatch, LoaderError>>(cfg.batch_buffer);
+
+    // ---- Stage 1: loaders → load_tx (with progress) ----
+    let load_concurrency = cfg.load_concurrency;
+    let stage1_loaders = loaders;
+    let stage1_progress = progress.clone();
+    tokio::spawn(async move {
+        let results = load_concurrent(stage1_loaders, load_concurrency).await;
+        for r in results {
+            // Bump loaders_done regardless of success.
+            let _ = stage1_progress.update(|p| IngestProgress {
+                loaders_done: p.loaders_done + 1,
+                docs_loaded: p.docs_loaded
+                    + r.as_ref().map(|v| v.len() as u64).unwrap_or(0),
+                loader_errors: p.loader_errors + if r.is_err() { 1 } else { 0 },
+                ..p.clone()
+            });
+            if load_tx.send(r).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    // ---- Stage 2: load_rx → splitter → split_tx (with progress) ----
+    let splitter_arc = splitter.clone();
+    let stage2_progress = progress.clone();
+    tokio::spawn(async move {
+        let mut load_rx = load_rx;
+        while let Some(batch_result) = load_rx.recv().await {
+            match batch_result {
+                Ok(docs) => {
+                    for d in docs {
+                        let chunks = splitter_arc(d);
+                        let n = chunks.len() as u64;
+                        let _ = stage2_progress.update(|p| IngestProgress {
+                            chunks_split: p.chunks_split + n,
+                            ..p.clone()
+                        });
+                        for chunk in chunks {
+                            if split_tx.send(Ok(chunk)).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    if split_tx.send(Err(e)).await.is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+    });
+
+    // ---- Stage 3: split_rx → embedder → batch_tx (with progress) ----
+    let embed_chunk_size = cfg.embed_chunk_size;
+    let embed_concurrency = cfg.embed_concurrency;
+    let stage3_progress = progress;
+    tokio::spawn(async move {
+        let mut split_rx = split_rx;
+        let mut buf: Vec<Document> = Vec::with_capacity(embed_chunk_size);
+
+        async fn flush_buf(
+            buf: &mut Vec<Document>,
+            embedder: &Arc<dyn Embeddings>,
+            embed_chunk_size: usize,
+            embed_concurrency: usize,
+            tx: &mpsc::Sender<Result<IngestBatch, LoaderError>>,
+            progress: &Progress<IngestProgress>,
+        ) -> bool {
+            if buf.is_empty() {
+                return true;
+            }
+            let n = buf.len() as u64;
+            let texts: Vec<String> = buf.iter().map(|d| d.content.clone()).collect();
+            let res = embed_documents_concurrent(
+                embedder.clone(),
+                &texts,
+                embed_chunk_size,
+                embed_concurrency,
+            )
+            .await;
+            let payload = match res {
+                Ok(embeddings) => {
+                    let docs: Vec<Document> = std::mem::take(buf);
+                    let _ = progress.update(|p| IngestProgress {
+                        chunks_embedded: p.chunks_embedded + n,
+                        batches_emitted: p.batches_emitted + 1,
+                        ..p.clone()
+                    });
+                    Ok(IngestBatch { docs, embeddings })
+                }
+                Err(e) => {
+                    buf.clear();
+                    let _ = progress.update(|p| IngestProgress {
+                        embed_errors: p.embed_errors + 1,
+                        ..p.clone()
+                    });
+                    Err(LoaderError::Other(format!("embed: {e}")))
+                }
+            };
+            tx.send(payload).await.is_ok()
+        }
+
+        while let Some(item) = split_rx.recv().await {
+            match item {
+                Ok(doc) => {
+                    buf.push(doc);
+                    if buf.len() >= embed_chunk_size {
+                        if !flush_buf(
+                            &mut buf,
+                            &embedder,
+                            embed_chunk_size,
+                            embed_concurrency,
+                            &batch_tx,
+                            &stage3_progress,
+                        )
+                        .await
+                        {
+                            return;
+                        }
+                    }
+                }
+                Err(e) => {
+                    if batch_tx.send(Err(e)).await.is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+        let _ = flush_buf(
+            &mut buf,
+            &embedder,
+            embed_chunk_size,
+            embed_concurrency,
+            &batch_tx,
+            &stage3_progress,
         )
         .await;
     });
@@ -432,5 +640,141 @@ mod tests {
                 assert_eq!(emb[0] as usize, d.content.len());
             }
         }
+    }
+
+    // ---- Progress-aware variant tests --------------------------------
+
+    #[tokio::test]
+    async fn progress_loaders_total_set_at_start() {
+        let tmp = TempDir::new().unwrap();
+        let paths = write_files(&tmp, "p_total", 5);
+        let loaders: Vec<Arc<dyn Loader>> = paths
+            .iter()
+            .map(|p| Arc::new(crate::TextLoader::new(p)) as Arc<dyn Loader>)
+            .collect();
+        let (e, _peak) = embedder();
+        let progress = Progress::new(IngestProgress::default());
+        let obs = progress.observer();
+        let _stream = ingest_to_stream_with_progress(
+            loaders,
+            |d| vec![d],
+            e,
+            IngestConfig::default(),
+            progress,
+        );
+        // Snapshot may take a moment to update; tiny yield gives the
+        // first-stage spawn a chance to set it. Even before yielding,
+        // `loaders_total` is set synchronously in the function body.
+        assert_eq!(obs.snapshot().loaders_total, 5);
+    }
+
+    #[tokio::test]
+    async fn progress_counters_advance_through_pipeline() {
+        let tmp = TempDir::new().unwrap();
+        let paths = write_files(&tmp, "p_advance", 3);
+        let loaders: Vec<Arc<dyn Loader>> = paths
+            .iter()
+            .map(|p| Arc::new(crate::TextLoader::new(p)) as Arc<dyn Loader>)
+            .collect();
+        let (e, _peak) = embedder();
+        let progress = Progress::new(IngestProgress::default());
+        let obs = progress.observer();
+        let cfg = IngestConfig {
+            embed_chunk_size: 2,
+            ..IngestConfig::default()
+        };
+        let split = |d: Document| {
+            (0..2)
+                .map(|i| Document::new(format!("{}|c{i}", d.content)))
+                .collect()
+        };
+        let s = ingest_to_stream_with_progress(loaders, split, e, cfg, progress);
+        let collected: Vec<_> = s.collect().await;
+        assert!(collected.iter().all(|r| r.is_ok()));
+        let final_snap = obs.snapshot();
+        assert_eq!(final_snap.loaders_total, 3);
+        assert_eq!(final_snap.loaders_done, 3);
+        assert_eq!(final_snap.docs_loaded, 3);
+        // 3 docs × 2 chunks = 6 chunks total.
+        assert_eq!(final_snap.chunks_split, 6);
+        assert_eq!(final_snap.chunks_embedded, 6);
+        // 6 chunks ÷ chunk_size 2 = 3 batches.
+        assert_eq!(final_snap.batches_emitted, 3);
+        assert_eq!(final_snap.loader_errors, 0);
+        assert_eq!(final_snap.embed_errors, 0);
+    }
+
+    #[tokio::test]
+    async fn progress_records_loader_failures() {
+        let tmp = TempDir::new().unwrap();
+        let good = write_files(&tmp, "ok", 1)[0].clone();
+        let missing = tmp.path().join("missing.txt");
+        let loaders: Vec<Arc<dyn Loader>> = vec![
+            Arc::new(crate::TextLoader::new(&good)),
+            Arc::new(crate::TextLoader::new(&missing)),
+        ];
+        let (e, _peak) = embedder();
+        let progress = Progress::new(IngestProgress::default());
+        let obs = progress.observer();
+        let s = ingest_to_stream_with_progress(
+            loaders,
+            |d| vec![d],
+            e,
+            IngestConfig::default(),
+            progress,
+        );
+        let _: Vec<_> = s.collect().await;
+        let snap = obs.snapshot();
+        assert_eq!(snap.loaders_total, 2);
+        assert_eq!(snap.loaders_done, 2);
+        assert_eq!(snap.loader_errors, 1);
+        assert_eq!(snap.docs_loaded, 1);
+    }
+
+    #[tokio::test]
+    async fn progress_observer_can_be_polled_mid_run() {
+        // Slower embedder so observers see a partial snapshot before
+        // the run finishes.
+        let tmp = TempDir::new().unwrap();
+        let paths = write_files(&tmp, "p_mid", 4);
+        let loaders: Vec<Arc<dyn Loader>> = paths
+            .iter()
+            .map(|p| Arc::new(crate::TextLoader::new(p)) as Arc<dyn Loader>)
+            .collect();
+        let (e, _peak) = embedder();
+        let progress = Progress::new(IngestProgress::default());
+        let mut obs = progress.observer();
+        let s = ingest_to_stream_with_progress(
+            loaders,
+            |d| vec![d],
+            e,
+            IngestConfig::default(),
+            progress,
+        );
+        let mut s = Box::pin(s);
+        // Pull one batch.
+        let _first = s.next().await.unwrap().unwrap();
+        // After at least one batch emitted, batches_emitted >= 1.
+        let _ = obs.changed().await; // wait for any update
+        let mid = obs.snapshot();
+        assert!(mid.batches_emitted >= 1);
+        assert!(mid.chunks_embedded >= 1);
+        // Drain rest.
+        while let Some(_) = s.next().await {}
+        let final_snap = obs.snapshot();
+        assert_eq!(final_snap.loaders_done, 4);
+    }
+
+    #[tokio::test]
+    async fn progress_default_is_zero_everywhere() {
+        let p = IngestProgress::default();
+        assert_eq!(p.loaders_total, 0);
+        assert_eq!(p.loaders_done, 0);
+        assert_eq!(p.docs_loaded, 0);
+        assert_eq!(p.chunks_split, 0);
+        assert_eq!(p.chunks_embedded, 0);
+        assert_eq!(p.batches_emitted, 0);
+        assert_eq!(p.loader_errors, 0);
+        assert_eq!(p.embed_errors, 0);
     }
 }

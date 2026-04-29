@@ -214,6 +214,7 @@ patterns").
 | `rerank_concurrent` (iter 197) | Tokio `JoinSet` + `Semaphore` over `Reranker::rerank` | Adds a fifth axis to the parallel-batch family (chat/embed/retrieve/tool/rerank). One reranker, N independent `(query, candidates)` pairs — eval / batch-rerank path |
 | `Bm25Index::add` parallel build (iter 198) | Rayon `par_iter` on tokenize+count per doc | Pure CPU parallelism for index construction (vs the I/O-bound parallelism of the JoinSet/Semaphore family). Each doc tokenizes independently in a Rayon worker; DF merge happens sequentially under the write lock |
 | `Progress<T>` (iter 199) | `tokio::sync::watch` latest-value broadcast | Completes the channel-shape trio: mpsc fan-in (189), broadcast fan-out (195), watch latest-value (199). Multiple observers, intermediate values collapse — observers see only the latest snapshot, perfect for progress UIs |
+| `ingest_to_stream_with_progress` (iter 200) | Composition of iter 196 + iter 199 | First **composition** of two prior parallelism primitives: the multi-stage ingest pipeline (196) updates an `IngestProgress` watcher (199) at each stage boundary. Demonstrates the compositional payoff of building primitives that snap together |
 
 ---
 
