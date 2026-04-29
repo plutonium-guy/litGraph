@@ -434,7 +434,7 @@ Distinct from short-term checkpointer — JSON document store keyed by
 | LangServe drop-in REST | One-line serve | ✅ `litgraph-serve::serve_chat` |
 | LangGraph Server | Hosted runtime + UI | 🚫 out of scope |
 | LangGraph Studio (visual debugger) | Step-debug graph | ❌ no native UI |
-| Assistants API (LangGraph) | Per-graph config snapshots | ❌ |
+| Assistants API (LangGraph) | Per-graph config snapshots | ✅ `litgraph_core::{AssistantManager, Assistant, AssistantPatch}` — CRUD + monotonic version bumping, immutable `<id>@v<n>` archives for audit history, `get_version` lookup, scoped per `graph_id`, backed by any `Store` impl (InMemory / PostgresStore) |
 | Webhook resume after interrupt | External system → resume | 🟡 user wires via `Command` |
 
 ---
