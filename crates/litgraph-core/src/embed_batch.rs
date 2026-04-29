@@ -195,6 +195,97 @@ pub fn embed_documents_concurrent_stream(
     Box::pin(ReceiverStream::new(rx))
 }
 
+/// Combined streaming + progress-watcher variant. Yields the same
+/// `(chunk_idx, Result)` items as
+/// [`embed_documents_concurrent_stream`] AND updates the supplied
+/// [`Progress<EmbedProgress>`] watcher as each chunk completes.
+///
+/// Per-chunk accounting matches
+/// [`embed_documents_concurrent_with_progress`]; per-row stream
+/// accounting matches [`embed_documents_concurrent_stream`].
+/// Useful when callers want both a per-chunk row-view (for live
+/// vector-store upserts) AND a summary `{total_texts, total_chunks,
+/// completed_chunks, completed_texts, errors}` watcher driving a UI
+/// progress bar.
+///
+/// Composition: extends the combined consumer shape from iter 216
+/// (chat batch) to the embeddings axis.
+pub fn embed_documents_concurrent_stream_with_progress(
+    embedder: Arc<dyn Embeddings>,
+    texts: Vec<String>,
+    chunk_size: usize,
+    max_concurrency: usize,
+    progress: Progress<EmbedProgress>,
+) -> Pin<Box<dyn Stream<Item = EmbedStreamItem> + Send>> {
+    if texts.is_empty() {
+        return Box::pin(futures::stream::empty());
+    }
+    let cap = max_concurrency.max(1);
+    let chunk = if chunk_size == 0 { texts.len() } else { chunk_size };
+    let chunks: Vec<Vec<String>> = texts.chunks(chunk).map(|s| s.to_vec()).collect();
+    let n_chunks = chunks.len() as u64;
+    let total_texts = texts.len() as u64;
+    let _ = progress.update(|p| EmbedProgress {
+        total_texts,
+        total_chunks: n_chunks,
+        ..p.clone()
+    });
+
+    let buf = (chunks.len()).min(cap.max(8));
+    let (tx, rx) = mpsc::channel::<EmbedStreamItem>(buf);
+
+    tokio::spawn(async move {
+        let sem = Arc::new(Semaphore::new(cap));
+        let mut set: JoinSet<(usize, usize, Result<Vec<Vec<f32>>>)> = JoinSet::new();
+        for (idx, chunk_texts) in chunks.into_iter().enumerate() {
+            let sem = sem.clone();
+            let embedder = embedder.clone();
+            let chunk_len = chunk_texts.len();
+            set.spawn(async move {
+                let _permit = match sem.acquire_owned().await {
+                    Ok(p) => p,
+                    Err(_) => {
+                        return (
+                            idx,
+                            chunk_len,
+                            Err(Error::other("embed semaphore closed")),
+                        )
+                    }
+                };
+                let r = embedder.embed_documents(&chunk_texts).await;
+                (idx, chunk_len, r)
+            });
+        }
+        while let Some(joined) = set.join_next().await {
+            let (idx, chunk_len, item) = match joined {
+                Ok(it) => it,
+                Err(e) => (
+                    usize::MAX,
+                    0,
+                    Err(Error::other(format!("embed task join: {e}"))),
+                ),
+            };
+            // Update progress BEFORE forwarding — observers always
+            // see the counter tick before / at-the-same-time as
+            // the stream item. Same consistency contract as iter 216.
+            let is_err = item.is_err();
+            let _ = progress.update(|p| EmbedProgress {
+                completed_chunks: p.completed_chunks + 1,
+                completed_texts: p.completed_texts
+                    + if is_err { 0 } else { chunk_len as u64 },
+                errors: p.errors + if is_err { 1 } else { 0 },
+                ..p.clone()
+            });
+            if tx.send((idx, item)).await.is_err() {
+                set.abort_all();
+                break;
+            }
+        }
+    });
+
+    Box::pin(ReceiverStream::new(rx))
+}
+
 /// Counters maintained by [`embed_documents_concurrent_with_progress`].
 /// All fields monotonic. Snapshot from any
 /// [`Progress<EmbedProgress>`] observer to drive a progress bar over
@@ -585,6 +676,109 @@ mod tests {
     // ---- embed_documents_concurrent_stream tests ---------------------
 
     use futures::StreamExt;
+
+    // ---- embed_documents_concurrent_stream_with_progress tests --------
+
+    #[tokio::test]
+    async fn stream_with_progress_yields_items_and_advances_counters() {
+        let (e, _peak, _seen) = probe(5);
+        let texts = ts(11);
+        let progress = Progress::new(EmbedProgress::default());
+        let obs = progress.observer();
+        let mut s = embed_documents_concurrent_stream_with_progress(
+            e, texts, 4, 4, progress,
+        );
+        let mut count = 0;
+        let mut total_embeddings = 0;
+        while let Some((_idx, r)) = s.next().await {
+            let v = r.unwrap();
+            total_embeddings += v.len();
+            count += 1;
+        }
+        assert_eq!(count, 3); // 11 ÷ 4 → 3 chunks
+        assert_eq!(total_embeddings, 11);
+        let snap = obs.snapshot();
+        assert_eq!(snap.total_texts, 11);
+        assert_eq!(snap.total_chunks, 3);
+        assert_eq!(snap.completed_chunks, 3);
+        assert_eq!(snap.completed_texts, 11);
+    }
+
+    #[tokio::test]
+    async fn stream_with_progress_records_chunk_failure() {
+        struct FailEmbed {
+            seen: Arc<AtomicUsize>,
+            fail_on: usize,
+        }
+        #[async_trait]
+        impl Embeddings for FailEmbed {
+            fn name(&self) -> &str {
+                "fail"
+            }
+            fn dimensions(&self) -> usize {
+                1
+            }
+            async fn embed_query(&self, _t: &str) -> Result<Vec<f32>> {
+                Ok(vec![0.0])
+            }
+            async fn embed_documents(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+                let n = self.seen.fetch_add(1, Ordering::SeqCst);
+                if n == self.fail_on {
+                    return Err(Error::other("synthetic"));
+                }
+                Ok(texts.iter().map(|_| vec![0.0]).collect())
+            }
+        }
+        let e: Arc<dyn Embeddings> = Arc::new(FailEmbed {
+            seen: Arc::new(AtomicUsize::new(0)),
+            fail_on: 1,
+        });
+        let texts = ts(15);
+        let progress = Progress::new(EmbedProgress::default());
+        let obs = progress.observer();
+        let mut s = embed_documents_concurrent_stream_with_progress(
+            e, texts, 5, 1, progress,
+        );
+        let mut errors_in_stream = 0;
+        while let Some((_idx, r)) = s.next().await {
+            if r.is_err() {
+                errors_in_stream += 1;
+            }
+        }
+        let snap = obs.snapshot();
+        assert!(snap.errors >= 1);
+        assert_eq!(errors_in_stream, snap.errors as usize);
+    }
+
+    #[tokio::test]
+    async fn stream_with_progress_total_set_at_start() {
+        let (e, _peak, _seen) = probe(0);
+        let texts = ts(10);
+        let progress = Progress::new(EmbedProgress::default());
+        let obs = progress.observer();
+        let _s = embed_documents_concurrent_stream_with_progress(
+            e, texts, 4, 2, progress,
+        );
+        let snap = obs.snapshot();
+        assert_eq!(snap.total_texts, 10);
+        assert_eq!(snap.total_chunks, 3); // 4 + 4 + 2
+    }
+
+    #[tokio::test]
+    async fn stream_with_progress_empty_input_no_updates() {
+        let (e, _peak, _seen) = probe(0);
+        let progress = Progress::new(EmbedProgress::default());
+        let obs = progress.observer();
+        let mut s = embed_documents_concurrent_stream_with_progress(
+            e,
+            vec![],
+            4,
+            4,
+            progress,
+        );
+        assert!(s.next().await.is_none());
+        assert_eq!(obs.snapshot(), EmbedProgress::default());
+    }
 
     #[tokio::test]
     async fn stream_yields_one_item_per_chunk() {
