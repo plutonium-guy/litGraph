@@ -24,8 +24,8 @@ use async_trait::async_trait;
 use backon::{ExponentialBuilder, Retryable};
 use litgraph_core::model::ChatStream;
 use litgraph_core::{
-    ChatModel, ChatOptions, ChatResponse, ContentPart, Embeddings, Error, Message, PiiScrubber,
-    Result,
+    ChatModel, ChatOptions, ChatResponse, CircuitBreaker, CircuitCallError, ContentPart,
+    Embeddings, Error, Message, PiiScrubber, Result,
 };
 use tracing::{debug, warn};
 
@@ -537,6 +537,99 @@ impl ChatModel for TimeoutChatModel {
         // Per-call timeout doesn't compose cleanly with token streams;
         // pass through. See module doc.
         self.inner.stream(messages, opts).await
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CircuitBreakerChatModel — fail-fast wrapper backed by iter-243 primitive
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Wrap any [`ChatModel`] with a [`CircuitBreaker`] so persistent
+/// upstream failures stop bleeding load against a sick service.
+///
+/// Distinct from [`RetryingChatModel`]: that retries individual
+/// transient errors (right when failures are momentary). When an
+/// upstream is *down*, retrying just hammers it harder. The
+/// breaker stops calls cold for a cooldown window, gives the
+/// upstream room to heal, and emits an `Error::Provider("circuit
+/// breaker open")` from waiting callers so they can fall through
+/// (e.g. via [`FallbackChatModel`]) immediately.
+///
+/// # Composition
+///
+/// Stacks naturally with the existing wrapper toolkit. A common
+/// prod chain — outer to inner:
+///
+/// 1. `CircuitBreakerChatModel` — fail-fast on persistent outage
+/// 2. `FallbackChatModel` — switch provider on circuit-open
+/// 3. `RetryingChatModel` — retry the *primary* on transient errors
+/// 4. `RateLimitedChatModel` — local rate cap
+/// 5. real provider
+///
+/// # Streaming
+///
+/// `stream()` is wrapped at the **handshake**: if the breaker is
+/// open, returns `Error::Provider("circuit breaker open")` without
+/// invoking the inner stream. If the inner `stream()` returns Ok,
+/// the breaker records success and the caller drives the stream
+/// normally — mid-stream failures are not visible to the breaker
+/// (consumer's responsibility). This matches the breaker's
+/// admission-control semantics.
+pub struct CircuitBreakerChatModel {
+    pub inner: Arc<dyn ChatModel>,
+    pub breaker: Arc<CircuitBreaker>,
+}
+
+impl CircuitBreakerChatModel {
+    pub fn new(inner: Arc<dyn ChatModel>, breaker: Arc<CircuitBreaker>) -> Self {
+        Self { inner, breaker }
+    }
+}
+
+#[async_trait]
+impl ChatModel for CircuitBreakerChatModel {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    async fn invoke(
+        &self,
+        messages: Vec<Message>,
+        opts: &ChatOptions,
+    ) -> Result<ChatResponse> {
+        let inner = self.inner.clone();
+        let opts = opts.clone();
+        let r = self
+            .breaker
+            .call(move || async move { inner.invoke(messages, &opts).await })
+            .await;
+        match r {
+            Ok(resp) => Ok(resp),
+            Err(CircuitCallError::CircuitOpen) => {
+                Err(Error::Provider("circuit breaker open".into()))
+            }
+            Err(CircuitCallError::Inner(e)) => Err(e),
+        }
+    }
+
+    async fn stream(
+        &self,
+        messages: Vec<Message>,
+        opts: &ChatOptions,
+    ) -> Result<ChatStream> {
+        let inner = self.inner.clone();
+        let opts = opts.clone();
+        let r = self
+            .breaker
+            .call(move || async move { inner.stream(messages, &opts).await })
+            .await;
+        match r {
+            Ok(s) => Ok(s),
+            Err(CircuitCallError::CircuitOpen) => {
+                Err(Error::Provider("circuit breaker open".into()))
+            }
+            Err(CircuitCallError::Inner(e)) => Err(e),
+        }
     }
 }
 
@@ -2862,6 +2955,187 @@ mod tests {
         assert_eq!(kept.tool_call_id.as_deref(), Some("prior"));
         assert_eq!(kept.name.as_deref(), Some("asst"));
         assert!(kept.cache);
+    }
+
+    // ---- CircuitBreakerChatModel tests ----------------------------------
+
+    /// Always errs with provider("502 ...") so the breaker counts every call
+    /// as a failure. Counts invocations so we can verify the breaker
+    /// short-circuits without invoking inner.
+    struct AlwaysFailModel {
+        seen: AtomicU32,
+    }
+
+    #[async_trait]
+    impl ChatModel for AlwaysFailModel {
+        fn name(&self) -> &str {
+            "always-fail"
+        }
+        async fn invoke(
+            &self,
+            _m: Vec<Message>,
+            _o: &ChatOptions,
+        ) -> Result<ChatResponse> {
+            self.seen.fetch_add(1, Ordering::SeqCst);
+            Err(Error::provider("502 sick upstream"))
+        }
+        async fn stream(
+            &self,
+            _m: Vec<Message>,
+            _o: &ChatOptions,
+        ) -> Result<ChatStream> {
+            self.seen.fetch_add(1, Ordering::SeqCst);
+            Err(Error::provider("502 sick upstream"))
+        }
+    }
+
+    #[tokio::test]
+    async fn circuit_breaker_passes_through_inner_errors_until_threshold() {
+        let inner = Arc::new(AlwaysFailModel {
+            seen: AtomicU32::new(0),
+        });
+        let breaker = Arc::new(CircuitBreaker::new(3, Duration::from_secs(60)));
+        let cb = CircuitBreakerChatModel::new(
+            inner.clone() as Arc<dyn ChatModel>,
+            breaker.clone(),
+        );
+        // Two failures: should be passed-through provider errors.
+        for _ in 0..2 {
+            let err = cb
+                .invoke(vec![Message::user("hi")], &ChatOptions::default())
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, Error::Provider(ref m) if m.contains("502")),
+                "expected pass-through, got {err:?}",
+            );
+        }
+        assert_eq!(inner.seen.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn circuit_breaker_short_circuits_after_threshold() {
+        let inner = Arc::new(AlwaysFailModel {
+            seen: AtomicU32::new(0),
+        });
+        let breaker = Arc::new(CircuitBreaker::new(2, Duration::from_secs(60)));
+        let cb = CircuitBreakerChatModel::new(
+            inner.clone() as Arc<dyn ChatModel>,
+            breaker.clone(),
+        );
+        // Trip the breaker.
+        for _ in 0..2 {
+            let _ = cb
+                .invoke(vec![Message::user("hi")], &ChatOptions::default())
+                .await;
+        }
+        // Subsequent calls fail-fast WITHOUT invoking inner.
+        for _ in 0..3 {
+            let err = cb
+                .invoke(vec![Message::user("hi")], &ChatOptions::default())
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, Error::Provider(ref m) if m.contains("circuit breaker open")),
+                "expected circuit-open error, got {err:?}",
+            );
+        }
+        assert_eq!(
+            inner.seen.load(Ordering::SeqCst),
+            2,
+            "inner was invoked while breaker was open",
+        );
+    }
+
+    #[tokio::test]
+    async fn circuit_breaker_streams_also_short_circuit() {
+        let inner = Arc::new(AlwaysFailModel {
+            seen: AtomicU32::new(0),
+        });
+        let breaker = Arc::new(CircuitBreaker::new(1, Duration::from_secs(60)));
+        let cb = CircuitBreakerChatModel::new(
+            inner.clone() as Arc<dyn ChatModel>,
+            breaker.clone(),
+        );
+        // First stream() error trips it.
+        let _ = cb
+            .stream(vec![Message::user("hi")], &ChatOptions::default())
+            .await;
+        let baseline = inner.seen.load(Ordering::SeqCst);
+        // Now stream() must fail-fast.
+        let r = cb
+            .stream(vec![Message::user("hi")], &ChatOptions::default())
+            .await;
+        match r {
+            Ok(_) => panic!("stream should have failed-fast"),
+            Err(Error::Provider(m)) => {
+                assert!(m.contains("circuit breaker open"), "got: {m}")
+            }
+            Err(other) => panic!("expected circuit-open error, got {other:?}"),
+        }
+        assert_eq!(
+            inner.seen.load(Ordering::SeqCst),
+            baseline,
+            "stream invoked inner despite open breaker",
+        );
+    }
+
+    /// Always-succeeds model for closed-path test.
+    struct AlwaysOkModel;
+
+    #[async_trait]
+    impl ChatModel for AlwaysOkModel {
+        fn name(&self) -> &str {
+            "always-ok"
+        }
+        async fn invoke(
+            &self,
+            _m: Vec<Message>,
+            _o: &ChatOptions,
+        ) -> Result<ChatResponse> {
+            Ok(ChatResponse {
+                message: Message {
+                    role: Role::Assistant,
+                    content: vec![ContentPart::Text { text: "hi".into() }],
+                    tool_calls: vec![],
+                    tool_call_id: None,
+                    name: None,
+                    cache: false,
+                },
+                finish_reason: FinishReason::Stop,
+                usage: TokenUsage::default(),
+                model: "always-ok".into(),
+            })
+        }
+        async fn stream(
+            &self,
+            _m: Vec<Message>,
+            _o: &ChatOptions,
+        ) -> Result<ChatStream> {
+            unimplemented!()
+        }
+    }
+
+    #[tokio::test]
+    async fn circuit_breaker_closed_passes_successes_through() {
+        let inner: Arc<dyn ChatModel> = Arc::new(AlwaysOkModel);
+        let breaker = Arc::new(CircuitBreaker::new(2, Duration::from_secs(60)));
+        let cb = CircuitBreakerChatModel::new(inner, breaker);
+        for _ in 0..5 {
+            let resp = cb
+                .invoke(vec![Message::user("hi")], &ChatOptions::default())
+                .await
+                .unwrap();
+            assert_eq!(resp.message.text_content(), "hi");
+        }
+    }
+
+    #[tokio::test]
+    async fn circuit_breaker_name_proxies_inner() {
+        let inner: Arc<dyn ChatModel> = Arc::new(AlwaysOkModel);
+        let breaker = Arc::new(CircuitBreaker::new(2, Duration::from_secs(60)));
+        let cb = CircuitBreakerChatModel::new(inner, breaker);
+        assert_eq!(cb.name(), "always-ok");
     }
 }
 
