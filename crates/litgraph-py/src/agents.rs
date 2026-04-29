@@ -41,7 +41,96 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyAgentEventStream>()?;
     m.add_class::<PyTextReActAgent>()?;
     m.add_class::<PyTextReactEventStream>()?;
+    m.add_function(wrap_pyfunction!(batch_chat, m)?)?;
     Ok(())
+}
+
+/// Concurrent batched chat — fan out N invocations across a Tokio task
+/// pool capped at `max_concurrency` in flight. Output order matches
+/// input order. Per-call failures are isolated by default; pass
+/// `fail_fast=True` to raise on the first error and cancel the rest.
+///
+/// Each input is a list of `{"role", "content"}` dicts (same shape as
+/// `model.invoke`). Each output is a dict `{text, finish_reason, usage,
+/// model}` for successes or `{error: "..."}` for failures (when
+/// `fail_fast=False`).
+///
+/// ```python
+/// from litgraph.agents import batch_chat
+/// inputs = [
+///     [{"role": "user", "content": "translate hello to french"}],
+///     [{"role": "user", "content": "translate hello to spanish"}],
+///     [{"role": "user", "content": "translate hello to german"}],
+/// ]
+/// results = batch_chat(model, inputs, max_concurrency=8)
+/// for r in results:
+///     print(r.get("text") or f"err: {r['error']}")
+/// ```
+#[pyfunction]
+#[pyo3(signature = (model, inputs, max_concurrency=8, fail_fast=false))]
+fn batch_chat<'py>(
+    py: Python<'py>,
+    model: Bound<'py, PyAny>,
+    inputs: Bound<'py, PyList>,
+    max_concurrency: usize,
+    fail_fast: bool,
+) -> PyResult<Bound<'py, PyList>> {
+    let chat = extract_chat_model(&model)?;
+    let mut parsed: Vec<Vec<Message>> = Vec::with_capacity(inputs.len());
+    for item in inputs.iter() {
+        let lst: Bound<PyList> = item
+            .downcast_into()
+            .map_err(|_| PyValueError::new_err("each input must be a list of message dicts"))?;
+        parsed.push(crate::providers::parse_messages_from_pylist(&lst)?);
+    }
+
+    if fail_fast {
+        let resps = py.allow_threads(|| {
+            block_on_compat(async move {
+                litgraph_core::batch_concurrent_fail_fast(
+                    chat,
+                    parsed,
+                    ChatOptions::default(),
+                    max_concurrency,
+                )
+                .await
+            })
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })?;
+        let out = PyList::empty_bound(py);
+        for r in resps {
+            out.append(crate::providers::response_to_py_dict(py, &r)?)?;
+        }
+        return Ok(out);
+    }
+
+    let results = py.allow_threads(|| {
+        block_on_compat(async move {
+            Ok::<_, litgraph_core::Error>(
+                litgraph_core::batch_concurrent(
+                    chat,
+                    parsed,
+                    ChatOptions::default(),
+                    max_concurrency,
+                )
+                .await,
+            )
+        })
+        .map_err(|e: litgraph_core::Error| PyRuntimeError::new_err(e.to_string()))
+    })?;
+
+    let out = PyList::empty_bound(py);
+    for r in results {
+        match r {
+            Ok(resp) => out.append(crate::providers::response_to_py_dict(py, &resp)?)?,
+            Err(e) => {
+                let d = PyDict::new_bound(py);
+                d.set_item("error", e.to_string())?;
+                out.append(d)?;
+            }
+        }
+    }
+    Ok(out)
 }
 
 fn extract_tools(tools: &Bound<'_, PyList>) -> PyResult<Vec<Arc<dyn litgraph_core::tool::Tool>>> {

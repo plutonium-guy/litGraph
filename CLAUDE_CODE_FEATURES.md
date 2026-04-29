@@ -40,7 +40,7 @@ long-term Store. Older (v0.3) features rolled in from prior audit.
 | Vision (image-in) | Multimodal agents | ✅ |
 | Audio I/O (whisper, TTS) | Voice agents | ✅ `WhisperTool`, `TtsTool` |
 | Image generation (DALL-E) | Creative agents | ✅ `DalleTool` |
-| Async batch API | Bulk evaluation | 🟡 `batch` per provider |
+| Async batch API | Bulk evaluation | ✅ `litgraph_core::batch_concurrent` (+ `_fail_fast`) — bounded-concurrency parallel `ChatModel.invoke` over Tokio + Semaphore, order-preserving, per-call `Result`. Python: `litgraph.agents.batch_chat(model, inputs, max_concurrency, fail_fast=False)`. (iter 182) |
 | Token counters (tiktoken/HF) | Pre-flight cost/context limits | ✅ `litgraph.tokenizers` |
 
 ## 2. Resilience — survive prod

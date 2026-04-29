@@ -53,8 +53,10 @@ Total = sum. Anything ≥18 is fair game for the next ten iters.
 
 ## Tier 1 — ship in the next ~10 iters
 
-### 1. EnsembleRetriever — weighted RRF (iter 181 candidate)
-- **Status:** ❌. `HybridRetriever` exists but uses *unweighted* RRF.
+### 1. EnsembleRetriever — weighted RRF ✅ shipped iter 181
+- **Status:** ✅. `litgraph_retrieval::EnsembleRetriever` — per-child
+  weights, weighted RRF, `tokio::join_all` fan-out. Python:
+  `litgraph.retrieval.EnsembleRetriever`.
 - **What:** `Vec<(Arc<dyn Retriever>, f32)>` fanned out via
   `tokio::join_all`, fused with weighted reciprocal rank
   fusion: `score(d) = Σ_i w_i / (k_rrf + rank_i(d))`.
@@ -198,8 +200,8 @@ patterns").
 | Eval harness                | bounded `Semaphore` fan-out   | Lets a 1k-case suite run with 50-way concurrency safely |
 | Send fan-out scheduler      | per-node `tokio::spawn`       | Pregel-style supersteps |
 | `RerankingRetriever` batch  | one model call for N docs     | Tower of 1 vs N |
-
-EnsembleRetriever (Tier 1 #1) joins this list when it lands.
+| `EnsembleRetriever` (iter 181) | weighted RRF + `join_all`  | Per-child weights with parallel fan-out — LangChain serialises |
+| `batch_concurrent` (iter 182) | `Semaphore` + `JoinSet`     | Bounded-concurrency batch over any `ChatModel`; order-preserving, per-call `Result` |
 
 ---
 

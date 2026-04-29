@@ -34,6 +34,7 @@ pub mod dataset_version;
 pub mod prompt_hub;
 pub mod langmem;
 pub mod assistants;
+pub mod batch;
 pub mod table_parser;
 
 pub use error::{Error, Result};
@@ -80,6 +81,7 @@ pub use dataset_version::{
 pub use prompt_hub::{CachingPromptHub, FilesystemPromptHub, PromptHub, PromptRef};
 pub use langmem::{EpisodicMemory, Memory, MemoryExtractor, DEFAULT_EXTRACTION_SYSTEM_PROMPT};
 pub use assistants::{Assistant, AssistantManager, AssistantPatch};
+pub use batch::{batch_concurrent, batch_concurrent_fail_fast};
 pub use table_parser::{
     format_instructions as table_format_instructions, parse_table_csv, parse_table_json,
     parse_table_value, Table, TableQuery,

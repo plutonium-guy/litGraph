@@ -1119,7 +1119,7 @@ fn chat_event_to_py_dict<'py>(py: Python<'py>, ev: &ChatStreamEvent) -> PyResult
     Ok(d)
 }
 
-fn response_to_py_dict<'py>(
+pub(crate) fn response_to_py_dict<'py>(
     py: Python<'py>,
     resp: &litgraph_core::ChatResponse,
 ) -> PyResult<Bound<'py, PyDict>> {
