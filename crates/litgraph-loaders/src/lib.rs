@@ -76,6 +76,8 @@ pub mod http_prompt_hub;
 pub use http_prompt_hub::HttpPromptHub;
 pub mod youtube;
 pub use youtube::YouTubeTranscriptLoader;
+pub mod discord;
+pub use discord::DiscordChannelLoader;
 
 #[derive(Debug, thiserror::Error)]
 pub enum LoaderError {

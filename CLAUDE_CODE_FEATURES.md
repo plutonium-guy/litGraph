@@ -242,7 +242,7 @@ long-term Store. Older (v0.3) features rolled in from prior audit.
 | Linear · Jira · Gmail · GDrive | ✅ |
 | S3 / R2 / B2 / MinIO | ✅ |
 | Jupyter notebook | ✅ |
-| Discord / Telegram / WhatsApp | ❌ |
+| Discord / Telegram / WhatsApp | 🟡 `litgraph_loaders::DiscordChannelLoader` (REST `/messages` paginated via `before` cursor; bot/bearer auth; per-message author/timestamp/attachments/mentions metadata; oldest-first delivery; capped fetch). Telegram bot API is push-only — no usable history loader. WhatsApp still pending. |
 | YouTube transcript / Vimeo | 🟡 `litgraph_loaders::YouTubeTranscriptLoader` (timedtext endpoint, no auth/key; full transcript → content, per-cue start_ms/dur_ms in metadata; URL/short/embed/shorts/live/bare-id all extract). Vimeo still pending. |
 | arXiv / Wikipedia / PubMed | ✅ `litgraph_loaders::ArxivLoader` (Atom), `WikipediaLoader` (MediaWiki Action API), `PubMedLoader` (NCBI E-utilities — esearch+efetch, structured-abstract section labels preserved, MeSH terms, DOI/PMCID, normalised pub_date, API-key support) |
 | Office365 / Outlook | ❌ |
