@@ -203,6 +203,7 @@ patterns").
 | `EnsembleRetriever` (iter 181) | weighted RRF + `join_all`  | Per-child weights with parallel fan-out — LangChain serialises |
 | `batch_concurrent` (iter 182) | `Semaphore` + `JoinSet`     | Bounded-concurrency batch over any `ChatModel`; order-preserving, per-call `Result` |
 | `embed_documents_concurrent` (iter 183) | chunk + `JoinSet` | Splits inputs into chunks, fans chunks across `Semaphore`; aligned output, fail-fast |
+| `RaceChatModel` (iter 184) | `JoinSet` + `abort_all` | Hedged-request pattern: invoke N concurrently, first success wins, losers cancelled. Tail-latency reduction across providers/regions |
 
 ---
 

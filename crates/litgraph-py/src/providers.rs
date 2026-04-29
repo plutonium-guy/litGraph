@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use futures::StreamExt;
 use litgraph_cache::{CachedModel, SemanticCachedModel};
 use litgraph_resilience::{
-    CostCappedChatModel, FallbackChatModel, PiiScrubbingChatModel, PromptCachingChatModel,
+    CostCappedChatModel, FallbackChatModel, PiiScrubbingChatModel, PromptCachingChatModel, RaceChatModel,
     RateLimitConfig, RateLimitedChatModel, RetryConfig, RetryingChatModel,
     SelfConsistencyChatModel, TokenBudgetChatModel,
 };
@@ -40,6 +40,7 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyChatStream>()?;
     m.add_class::<PyStructuredChatModel>()?;
     m.add_class::<PyFallbackChat>()?;
+    m.add_class::<PyRaceChat>()?;
     m.add_class::<PyTokenBudgetChat>()?;
     m.add_class::<PyPiiScrubbingChat>()?;
     m.add_class::<PyPromptCachingChat>()?;
@@ -1483,6 +1484,92 @@ impl PyFallbackChat {
 }
 
 impl PyFallbackChat {
+    pub(crate) fn chat_model(&self) -> Arc<dyn ChatModel> {
+        self.inner.clone()
+    }
+}
+
+/// Race N chat models concurrently — first success wins, the rest are
+/// aborted. For latency-critical paths where it's worth paying for
+/// parallel requests to cut tail-latency.
+///
+/// All inner models are issued requests at the same instant; whichever
+/// returns first becomes the response, the others are cancelled. If
+/// every inner fails, raises a `RuntimeError` whose message lists each
+/// inner's failure for debugging.
+///
+/// Distinct from `FallbackChat`:
+///   - `FallbackChat`: try A, on failure try B (sequential, cost-min).
+///   - `RaceChat`: try A and B at the same time, take the winner
+///     (concurrent, latency-min).
+///
+/// ```python
+/// from litgraph.providers import OpenAIChat, AnthropicChat, RaceChat
+/// race = RaceChat([
+///     OpenAIChat(api_key=..., model="gpt-4o"),
+///     AnthropicChat(api_key=..., model="claude-sonnet-4-6"),
+/// ])
+/// resp = race.invoke([{"role": "user", "content": "hi"}])
+/// # resp["model"] tells you which provider won.
+/// ```
+#[pyclass(name = "RaceChat", module = "litgraph.providers")]
+pub struct PyRaceChat {
+    inner: Arc<dyn ChatModel>,
+    name_label: String,
+}
+
+#[pymethods]
+impl PyRaceChat {
+    #[new]
+    fn new(models: Bound<'_, PyList>) -> PyResult<Self> {
+        if models.is_empty() {
+            return Err(PyValueError::new_err(
+                "RaceChat: need at least one inner model",
+            ));
+        }
+        let mut inners: Vec<Arc<dyn ChatModel>> = Vec::with_capacity(models.len());
+        let mut labels: Vec<String> = Vec::with_capacity(models.len());
+        for item in models.iter() {
+            let m = crate::agents::extract_chat_model(&item)?;
+            labels.push(m.name().to_string());
+            inners.push(m);
+        }
+        let chain = RaceChatModel::new(inners);
+        let name_label = format!("race({})", labels.join(", "));
+        Ok(Self {
+            inner: Arc::new(chain),
+            name_label,
+        })
+    }
+
+    #[pyo3(signature = (messages, temperature=None, max_tokens=None))]
+    fn invoke<'py>(
+        &self,
+        py: Python<'py>,
+        messages: Bound<'py, PyList>,
+        temperature: Option<f32>,
+        max_tokens: Option<u32>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let msgs = parse_messages(&messages)?;
+        let opts = ChatOptions {
+            temperature,
+            max_tokens,
+            ..Default::default()
+        };
+        let m = self.inner.clone();
+        let resp = py.allow_threads(|| {
+            block_on_compat(async move { m.invoke(msgs, &opts).await })
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })?;
+        response_to_py_dict(py, &resp)
+    }
+
+    fn __repr__(&self) -> String {
+        self.name_label.clone()
+    }
+}
+
+impl PyRaceChat {
     pub(crate) fn chat_model(&self) -> Arc<dyn ChatModel> {
         self.inner.clone()
     }

@@ -340,6 +340,131 @@ impl ChatModel for FallbackChatModel {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// RaceChatModel — concurrent invoke, first-success-wins
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Invokes N inner `ChatModel`s **concurrently**, returns the first one
+/// that succeeds. Outstanding invocations are aborted as soon as a
+/// winner emerges.
+///
+/// Use this when latency matters more than cost: paying for N parallel
+/// requests buys you `min(t_1, .., t_N)` end-to-end. Typical patterns:
+///
+/// - Multi-region failover where the request hedges across regions
+///   instead of waiting for one to time out.
+/// - Latency-critical paths backed by both a fast cheap model and a
+///   slow strong model — race them and take whichever finishes first.
+/// - Cross-provider speculative serving (OpenAI + Anthropic +
+///   Bedrock) for tail-latency reduction.
+///
+/// # Cost model
+///
+/// All N requests are *issued*. Cancellation aborts the in-flight
+/// future, but providers have already begun processing — most bill for
+/// any tokens generated before the connection closes. Budget for
+/// `cost_floor ≈ N × p50_inference_cost` even though latency is `p_min`.
+///
+/// # Failure
+///
+/// Returns `Ok` as soon as **any** inner returns `Ok`. Returns `Err`
+/// only if **every** inner fails — error message aggregates all
+/// failures (newline-separated) so the caller can debug.
+///
+/// # Streaming
+///
+/// `stream()` falls through to `inners[0]`. Racing token streams is
+/// possible (race for first chunk, then commit) but inviting in
+/// practice — providers' first chunks vary wildly in latency and
+/// quality, and switching mid-stream is impossible. Consumers who
+/// need it can race `invoke()` calls themselves.
+///
+/// # Composition
+///
+/// `Race(Retry(A), Retry(B))` is the typical shape — let each branch
+/// handle its own transient errors, race the steady-state outcomes.
+/// Avoid `Race(Race(A,B), C)` — flatten the chain into a single
+/// `Race(A, B, C)` so cancellation works across the whole set.
+///
+/// ```ignore
+/// use std::sync::Arc;
+/// use litgraph_resilience::RaceChatModel;
+/// let race = RaceChatModel::new(vec![openai_arc, anthropic_arc, bedrock_arc]);
+/// // First to return wins; the other two are aborted.
+/// let resp = race.invoke(messages, &opts).await?;
+/// ```
+pub struct RaceChatModel {
+    pub inners: Vec<Arc<dyn ChatModel>>,
+}
+
+impl RaceChatModel {
+    /// Build a race set. Panics if `inners` is empty (a race with no
+    /// runners can't yield a winner).
+    pub fn new(inners: Vec<Arc<dyn ChatModel>>) -> Self {
+        assert!(
+            !inners.is_empty(),
+            "RaceChatModel: need at least one inner model",
+        );
+        Self { inners }
+    }
+}
+
+#[async_trait]
+impl ChatModel for RaceChatModel {
+    fn name(&self) -> &str {
+        "race"
+    }
+
+    async fn invoke(
+        &self,
+        messages: Vec<Message>,
+        opts: &ChatOptions,
+    ) -> Result<ChatResponse> {
+        use tokio::task::JoinSet;
+
+        // Single-inner shortcut keeps the spawn-overhead off the hot
+        // path for users who probe with a one-element race.
+        if self.inners.len() == 1 {
+            return self.inners[0].invoke(messages, opts).await;
+        }
+
+        let mut set: JoinSet<Result<ChatResponse>> = JoinSet::new();
+        for inner in self.inners.iter() {
+            let inner = inner.clone();
+            let msgs = messages.clone();
+            let opts = opts.clone();
+            set.spawn(async move { inner.invoke(msgs, &opts).await });
+        }
+
+        let mut errors: Vec<String> = Vec::with_capacity(self.inners.len());
+        while let Some(joined) = set.join_next().await {
+            match joined {
+                Ok(Ok(resp)) => {
+                    // Winner — abort everything else and return.
+                    set.abort_all();
+                    return Ok(resp);
+                }
+                Ok(Err(e)) => errors.push(e.to_string()),
+                Err(e) => errors.push(format!("task join: {e}")),
+            }
+        }
+        Err(Error::other(format!(
+            "RaceChatModel: all {} inners failed:\n  - {}",
+            self.inners.len(),
+            errors.join("\n  - "),
+        )))
+    }
+
+    async fn stream(
+        &self,
+        messages: Vec<Message>,
+        opts: &ChatOptions,
+    ) -> Result<ChatStream> {
+        // Mid-stream switching is unworkable. See module doc.
+        self.inners[0].stream(messages, opts).await
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Per-invocation token budget
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -1247,6 +1372,152 @@ mod tests {
     #[should_panic(expected = "chain must have at least one model")]
     async fn fallback_panics_on_empty_chain() {
         let _ = FallbackChatModel::new(vec![]);
+    }
+
+    // ---- RaceChatModel tests ----------------------------------------------
+
+    /// Sleeps `delay_ms` then either returns a labelled response or errors.
+    struct DelayedModel {
+        label: &'static str,
+        delay_ms: u64,
+        succeed: bool,
+        invocations: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ChatModel for DelayedModel {
+        fn name(&self) -> &str {
+            self.label
+        }
+        async fn invoke(
+            &self,
+            _m: Vec<Message>,
+            _o: &ChatOptions,
+        ) -> Result<ChatResponse> {
+            self.invocations
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(self.delay_ms)).await;
+            if self.succeed {
+                Ok(ChatResponse {
+                    message: Message {
+                        role: Role::Assistant,
+                        content: vec![ContentPart::Text {
+                            text: self.label.into(),
+                        }],
+                        tool_calls: vec![],
+                        tool_call_id: None,
+                        name: None,
+                        cache: false,
+                    },
+                    finish_reason: FinishReason::Stop,
+                    usage: TokenUsage::default(),
+                    model: self.label.into(),
+                })
+            } else {
+                Err(Error::provider(format!("{} failed", self.label)))
+            }
+        }
+        async fn stream(&self, _m: Vec<Message>, _o: &ChatOptions) -> Result<ChatStream> {
+            unimplemented!()
+        }
+    }
+
+    fn arc_dm(
+        label: &'static str,
+        delay_ms: u64,
+        succeed: bool,
+    ) -> (Arc<dyn ChatModel>, Arc<std::sync::atomic::AtomicUsize>) {
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let m = DelayedModel {
+            label,
+            delay_ms,
+            succeed,
+            invocations: count.clone(),
+        };
+        (Arc::new(m), count)
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "at least one inner model")]
+    async fn race_panics_on_empty() {
+        let _ = RaceChatModel::new(vec![]);
+    }
+
+    #[tokio::test]
+    async fn race_returns_first_winner() {
+        // A finishes in 5ms, B in 50ms — A must win.
+        let (a, _) = arc_dm("a", 5, true);
+        let (b, _) = arc_dm("b", 50, true);
+        let race = RaceChatModel::new(vec![a, b]);
+        let resp = race
+            .invoke(vec![Message::user("hi")], &ChatOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(resp.model, "a");
+        assert_eq!(resp.message.text_content(), "a");
+    }
+
+    #[tokio::test]
+    async fn race_falls_through_failures() {
+        // A fails immediately, B succeeds slowly — B is the answer.
+        let (a, _) = arc_dm("a", 1, false);
+        let (b, _) = arc_dm("b", 10, true);
+        let race = RaceChatModel::new(vec![a, b]);
+        let resp = race
+            .invoke(vec![Message::user("hi")], &ChatOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(resp.model, "b");
+    }
+
+    #[tokio::test]
+    async fn race_aggregates_when_all_fail() {
+        let (a, _) = arc_dm("a", 1, false);
+        let (b, _) = arc_dm("b", 2, false);
+        let (c, _) = arc_dm("c", 3, false);
+        let race = RaceChatModel::new(vec![a, b, c]);
+        let err = race
+            .invoke(vec![Message::user("hi")], &ChatOptions::default())
+            .await
+            .unwrap_err();
+        let s = format!("{err}");
+        assert!(s.contains("all 3 inners failed"), "got: {s}");
+        assert!(s.contains("a failed"));
+        assert!(s.contains("b failed"));
+        assert!(s.contains("c failed"));
+    }
+
+    #[tokio::test]
+    async fn race_single_inner_passes_through() {
+        let (a, count) = arc_dm("a", 0, true);
+        let race = RaceChatModel::new(vec![a]);
+        let _ = race
+            .invoke(vec![Message::user("hi")], &ChatOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn race_aborts_losers_after_winner() {
+        // A finishes in 5ms; B sleeps 500ms. After A wins, B's task
+        // should be aborted — measured by the wall-clock total being
+        // closer to A's 5ms than B's 500ms.
+        let (a, _) = arc_dm("a", 5, true);
+        let (b, _) = arc_dm("b", 500, true);
+        let race = RaceChatModel::new(vec![a, b]);
+        let started = std::time::Instant::now();
+        let _ = race
+            .invoke(vec![Message::user("hi")], &ChatOptions::default())
+            .await
+            .unwrap();
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        // Allow generous slack for CI variance, but B's 500ms must NOT
+        // dominate.
+        assert!(
+            elapsed_ms < 200,
+            "elapsed {elapsed_ms}ms — losers were not aborted",
+        );
     }
 
     // ---- TokenBudgetChatModel tests -----------------------------------

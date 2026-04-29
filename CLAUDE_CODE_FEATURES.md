@@ -50,6 +50,7 @@ long-term Store. Older (v0.3) features rolled in from prior audit.
 | Retry w/ exp backoff + jitter | Flaky upstream | ✅ `RetryingChatModel` |
 | Rate limiter | Per-key RPM/TPM caps | ✅ `RateLimitedChatModel` |
 | Fallback chain | Model A down → try B | ✅ `FallbackChatModel` |
+| Race / hedged requests | Latency-min: A and B in parallel, first wins | ✅ `litgraph_resilience::RaceChatModel` — Tokio `JoinSet` + `abort_all` cancels losers as soon as a winner emerges; aggregates errors only if every inner fails. Python: `litgraph.providers.RaceChat(models)`. (iter 184) |
 | Token budget guard | Stop runaway prompts | ✅ `TokenBudgetChatModel` |
 | Cost cap | Hard $ ceiling per run | ✅ `CostCappedChatModel` |
 | PII scrubber (input/output) | Compliance | ✅ `PiiScrubbingChatModel` |
