@@ -24,6 +24,7 @@
 //! retrieve 50 → MMR-select 10 → long-context-reorder.
 
 use litgraph_core::Document;
+use rayon::prelude::*;
 
 /// Cosine similarity of two equal-length vectors. Returns 0.0 if either
 /// vector is all-zero (avoids NaN). Lengths must match — caller's
@@ -84,37 +85,56 @@ pub fn mmr_select(
         .filter(|&i| candidate_embeddings[i].len() == query_embedding.len())
         .collect();
 
-    // Pre-compute query similarities for the survivors.
+    // Pre-compute query similarities for the survivors. Rayon-parallel
+    // since each cosine sim is independent — meaningful win on big
+    // candidate pools (1k+ docs from over-fetch retrievers).
     let mut q_sim: Vec<f32> = vec![0.0; n];
-    for &i in &available {
-        q_sim[i] = cosine_sim(query_embedding, &candidate_embeddings[i]);
+    let q_pairs: Vec<(usize, f32)> = available
+        .par_iter()
+        .map(|&i| (i, cosine_sim(query_embedding, &candidate_embeddings[i])))
+        .collect();
+    for (i, sim) in q_pairs {
+        q_sim[i] = sim;
     }
 
     let mut picked: Vec<usize> = Vec::with_capacity(k);
 
     while picked.len() < k && !available.is_empty() {
-        let mut best_idx: Option<usize> = None;
-        let mut best_score = f32::NEG_INFINITY;
+        // Score every available candidate against the current picked
+        // set in parallel. Each candidate's score is independent, so
+        // Rayon can shred this across cores. The "pick the max" reduce
+        // is a `max_by` on the resulting Vec — O(|available|), still
+        // cheap.
+        let scored: Vec<(usize, f32)> = available
+            .par_iter()
+            .map(|&i| {
+                let max_sim_to_picked = if picked.is_empty() {
+                    0.0
+                } else {
+                    picked
+                        .iter()
+                        .map(|&j| {
+                            cosine_sim(&candidate_embeddings[i], &candidate_embeddings[j])
+                        })
+                        .fold(f32::NEG_INFINITY, f32::max)
+                };
+                let score = lambda * q_sim[i] - (1.0 - lambda) * max_sim_to_picked;
+                (i, score)
+            })
+            .collect();
 
-        for &i in &available {
-            // Diversity term: max similarity to anything already picked.
-            let diversity = picked
-                .iter()
-                .map(|&j| cosine_sim(&candidate_embeddings[i], &candidate_embeddings[j]))
-                .fold(f32::NEG_INFINITY, f32::max);
-            let max_sim_to_picked = if picked.is_empty() {
-                0.0
-            } else {
-                diversity
-            };
-            let score = lambda * q_sim[i] - (1.0 - lambda) * max_sim_to_picked;
-            if score > best_score {
-                best_score = score;
-                best_idx = Some(i);
-            }
-        }
-
-        let chosen = best_idx.expect("non-empty available set must have a winner");
+        // Tie-break on lower index so the parallel pick order is
+        // bit-identical to a sequential left-to-right scan. Without
+        // this, λ=0.0 (pure diversity, first-pick all-tied scores)
+        // would non-deterministically depend on Rayon thread scheduling.
+        let (chosen, _best) = scored
+            .into_iter()
+            .max_by(|a, b| {
+                a.1.partial_cmp(&b.1)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| b.0.cmp(&a.0))
+            })
+            .expect("non-empty available set must have a winner");
         picked.push(chosen);
         available.retain(|&i| i != chosen);
     }
@@ -358,5 +378,125 @@ mod tests {
         assert_eq!(reordered.len(), 3);
         // MMR returns rank 0 (best) first, so reorder keeps it at pos 0.
         assert_eq!(reordered[0].content, mmr[0].content);
+    }
+
+    /// Sequential reference impl — mirrors the pre-iter-198 algorithm
+    /// without Rayon. Keeps tests honest: the parallel version must
+    /// produce **bit-identical** picks (modulo the documented tie-break
+    /// freedom of `partial_cmp`-based max).
+    fn mmr_select_sequential(
+        query_embedding: &[f32],
+        candidates: &[Document],
+        candidate_embeddings: &[Vec<f32>],
+        k: usize,
+        lambda_mult: f32,
+    ) -> Vec<Document> {
+        let lambda = lambda_mult.clamp(0.0, 1.0);
+        let n = candidates.len();
+        let k = k.min(n);
+        if k == 0 {
+            return Vec::new();
+        }
+        let mut available: Vec<usize> = (0..n)
+            .filter(|&i| candidate_embeddings[i].len() == query_embedding.len())
+            .collect();
+        let mut q_sim: Vec<f32> = vec![0.0; n];
+        for &i in &available {
+            q_sim[i] = cosine_sim(query_embedding, &candidate_embeddings[i]);
+        }
+        let mut picked: Vec<usize> = Vec::with_capacity(k);
+        while picked.len() < k && !available.is_empty() {
+            let mut best_idx: Option<usize> = None;
+            let mut best_score = f32::NEG_INFINITY;
+            for &i in &available {
+                let max_sim_to_picked = if picked.is_empty() {
+                    0.0
+                } else {
+                    picked
+                        .iter()
+                        .map(|&j| {
+                            cosine_sim(&candidate_embeddings[i], &candidate_embeddings[j])
+                        })
+                        .fold(f32::NEG_INFINITY, f32::max)
+                };
+                let score = lambda * q_sim[i] - (1.0 - lambda) * max_sim_to_picked;
+                if score > best_score {
+                    best_score = score;
+                    best_idx = Some(i);
+                }
+            }
+            let chosen = best_idx.unwrap();
+            picked.push(chosen);
+            available.retain(|&i| i != chosen);
+        }
+        picked.into_iter().map(|i| candidates[i].clone()).collect()
+    }
+
+    /// Hash-stable doc identifier for cross-impl pick-list comparison.
+    fn ids(docs: &[Document]) -> Vec<String> {
+        docs.iter().map(|d| d.content.clone()).collect()
+    }
+
+    #[test]
+    fn parallel_mmr_matches_sequential_on_small_pool() {
+        // 12 docs, k=5. Both impls must agree on the pick set.
+        let q = vec![1.0, 0.0, 0.0];
+        let docs: Vec<Document> = (0..12)
+            .map(|i| Document::new(format!("doc-{i}")))
+            .collect();
+        // Spread embeddings around the unit circle in dim 1-2 with a
+        // dim-0 (relevance) component that varies — gives MMR a real
+        // diversity-vs-relevance tradeoff to make.
+        let embs: Vec<Vec<f32>> = (0..12)
+            .map(|i| {
+                let theta = (i as f32) * 0.5;
+                vec![1.0 - (i as f32) / 24.0, theta.cos(), theta.sin()]
+            })
+            .collect();
+        let par = mmr_select(&q, &docs, &embs, 5, 0.5);
+        let seq = mmr_select_sequential(&q, &docs, &embs, 5, 0.5);
+        assert_eq!(ids(&par), ids(&seq));
+    }
+
+    #[test]
+    fn parallel_mmr_matches_sequential_on_larger_pool() {
+        // 64 docs, k=10 — exercises the parallel score loop with
+        // enough work to actually use multiple cores.
+        let q = vec![0.7, 0.7];
+        let docs: Vec<Document> = (0..64)
+            .map(|i| Document::new(format!("doc-{i}")))
+            .collect();
+        // Deterministic-but-spread embeddings.
+        let embs: Vec<Vec<f32>> = (0..64)
+            .map(|i| {
+                let a = ((i * 17 + 3) % 100) as f32 / 100.0;
+                let b = ((i * 23 + 7) % 100) as f32 / 100.0;
+                vec![a, b]
+            })
+            .collect();
+        let par = mmr_select(&q, &docs, &embs, 10, 0.6);
+        let seq = mmr_select_sequential(&q, &docs, &embs, 10, 0.6);
+        assert_eq!(ids(&par), ids(&seq));
+    }
+
+    #[test]
+    fn parallel_mmr_lambda_extremes_match_sequential() {
+        // λ = 1.0 (pure relevance) and λ = 0.0 (pure diversity) are
+        // edge cases — make sure the parallel impl handles both.
+        let q = vec![1.0, 0.0];
+        let docs: Vec<Document> = (0..15)
+            .map(|i| Document::new(format!("d{i}")))
+            .collect();
+        let embs: Vec<Vec<f32>> = (0..15)
+            .map(|i| {
+                let t = (i as f32) * 0.4;
+                vec![t.cos(), t.sin()]
+            })
+            .collect();
+        for &lambda in &[1.0_f32, 0.0_f32] {
+            let par = mmr_select(&q, &docs, &embs, 6, lambda);
+            let seq = mmr_select_sequential(&q, &docs, &embs, 6, lambda);
+            assert_eq!(ids(&par), ids(&seq), "λ={lambda} mismatch");
+        }
     }
 }

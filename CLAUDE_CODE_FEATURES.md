@@ -198,7 +198,7 @@ long-term Store. Older (v0.3) features rolled in from prior audit.
 | Reranking retriever (Cohere/Jina/Voyage) | Quality lift | ✅ |
 | EnsembleReranker (concurrent reranker fusion) | Reduce per-model bias | ✅ `litgraph_retrieval::EnsembleReranker` — fans N rerankers over the same candidates concurrently via `tokio::join_all`, fuses orderings with weighted RRF (rank-based, scale-free across providers). Python: `litgraph.retrieval.EnsembleReranker(children, weights, rrf_k)`; composes as `RerankingRetriever(base, ensemble)`. (iter 186) |
 | Local ONNX reranker (no API key) | Air-gap quality lift | ✅ `litgraph-rerankers-fastembed::FastembedReranker` — ONNX cross-encoder via fastembed; `BGERerankerBase` default (English), `BGERerankerV2M3`/`JINARerankerV2BaseMultilingual` for multilingual; CPU-bound calls in `spawn_blocking`; live-verified rerank picks correct top-1 |
-| MaxMarginalRelevance | Diversity | ✅ |
+| MaxMarginalRelevance | Diversity | ✅ — `mmr_select` runs Rayon-parallel candidate scoring (iter 203). Each candidate's per-iteration score is independent so the inner loop scales linear-with-cores; deterministic tie-break on lower index keeps picks bit-identical to a sequential reference. |
 | ParentDocumentRetriever | Small-chunk match, big-chunk return | ✅ |
 | MultiVectorRetriever | N caller-supplied perspectives per parent | ✅ `litgraph_retrieval::MultiVectorRetriever` — caller supplies summaries / hypothetical Qs / chunks per parent; indexing fans out via `embed_documents_concurrent` (iter 183), retrieval dedups by parent_id and returns the parent. Python: `litgraph.retrieval.MultiVectorRetriever(vector_store, embeddings, parent_store)`. (iter 188) |
 | MultiQueryRetriever | Query rewriting | ✅ |
