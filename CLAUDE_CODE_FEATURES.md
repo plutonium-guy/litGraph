@@ -408,7 +408,7 @@ Distinct from short-term checkpointer — JSON document store keyed by
 |---|---|---|
 | `BaseStore` namespace+key API | Multi-tenant long-term mem | ✅ `litgraph_core::store::Store` trait |
 | `InMemoryStore` (dev) | Local prototyping | ✅ `litgraph.store.InMemoryStore` |
-| `PostgresStore` (prod) | Durable distributed | ❌ pending crate |
+| `PostgresStore` (prod) | Durable distributed | ✅ `litgraph-store-postgres::PostgresStore` — `TEXT[]` namespace + GIN index, JSONB values, per-item TTL with lazy + manual `evict_expired()` sweep, SQL-side `query_text` ILIKE + JSON-path `#>` matches (up to 8 clauses, falls back to client-side beyond), shared deadpool with checkpointer |
 | Vector-indexed semantic search on Store | Memory recall by meaning | 🟡 `VectorStoreMemory` separate; not yet bolted onto Store |
 | `LangMem` SDK (episodic memory) | Auto-extract memories | ✅ `litgraph_core::{EpisodicMemory, MemoryExtractor, Memory}` — LLM extraction via structured output, kind/importance/source_thread metadata, importance threshold filtering, namespaced storage on any `Store` impl, `recall(query, k)` + `recall_as_system_message` ready-to-prepend |
 | TTL on memory entries | Auto-expire stale | ✅ `ttl_ms` per put, lazy eviction on read/search |
