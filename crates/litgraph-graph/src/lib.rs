@@ -27,6 +27,7 @@ pub mod scheduler;
 pub mod checkpoint;
 pub mod event;
 pub mod interrupt;
+pub mod visualize;
 
 pub use state::{Reducer, merge_append, merge_replace};
 pub use node::{NodeOutput, NodeFn};

@@ -139,7 +139,7 @@ long-term Store. Older (v0.3) features rolled in from prior audit.
 | Cycle detection | Catch bad graphs | ✅ |
 | Cancellation token | Abort runs | ✅ |
 | Streaming modes (values/updates/messages/custom) | Live UI | ✅ |
-| Visualize graph (mermaid/png) | Debug | ❌ no exporter |
+| Visualize graph (Mermaid `graph TD`) | Debug | ✅ `StateGraph.to_mermaid()` / `.to_ascii()` (also on `CompiledGraph`); conditional edges shown as `{?}` diamond |
 
 ## 8. Persistence + Time Travel
 
@@ -449,7 +449,7 @@ Top gaps to close, ranked by user-impact for a no-code-glue path:
 7. ❌ **fastembed-rs local embeddings** — air-gap RAG without OpenAI key.
 8. ❌ **candle / mistral.rs local chat** — full offline agent.
 9. ❌ **LangServe-style HTTP serve crate** — `litgraph serve graph.py` → REST + SSE one command.
-10. ❌ **Graph visualizer (mermaid/png)** — show users the agent graph.
+10. ✅ **Graph visualizer (Mermaid)** — `to_mermaid()` + `to_ascii()` on StateGraph + CompiledGraph (8 Rust + 9 Py tests). PNG render still pending (out-of-process via `mmdc` or `kroki`).
 11. ❌ **Trajectory + pairwise evaluators · synthetic eval-set generation** — full agent eval.
 12. ❌ **Redis chat history · Discord/YouTube/arXiv loaders** — long-tail integrations.
 

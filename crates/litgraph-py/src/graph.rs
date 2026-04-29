@@ -204,6 +204,24 @@ impl PyStateGraph {
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         Ok(PyCompiledGraph { inner: Arc::new(compiled) })
     }
+
+    /// Render the graph as a Mermaid `graph TD` flowchart string. Conditional
+    /// edges appear as dashed arrows to a `{?}` diamond — concrete targets
+    /// only known at runtime.
+    fn to_mermaid(&self) -> PyResult<String> {
+        let g = self.inner.as_ref().ok_or_else(|| {
+            PyRuntimeError::new_err("graph already compiled — use CompiledGraph.to_mermaid")
+        })?;
+        Ok(g.to_mermaid())
+    }
+
+    /// Render the graph as a plain-text adjacency listing.
+    fn to_ascii(&self) -> PyResult<String> {
+        let g = self.inner.as_ref().ok_or_else(|| {
+            PyRuntimeError::new_err("graph already compiled — use CompiledGraph.to_ascii")
+        })?;
+        Ok(g.to_ascii())
+    }
 }
 
 #[pyclass(name = "CompiledGraph", module = "litgraph.graph")]
@@ -353,6 +371,16 @@ impl PyCompiledGraph {
             block_on_compat(async move { cp.clear_thread(&thread_id).await })
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))
         })
+    }
+
+    /// Render the compiled graph as Mermaid `graph TD`.
+    fn to_mermaid(&self) -> String {
+        self.inner.to_mermaid()
+    }
+
+    /// Plain-text adjacency listing of the compiled graph.
+    fn to_ascii(&self) -> String {
+        self.inner.to_ascii()
     }
 }
 
