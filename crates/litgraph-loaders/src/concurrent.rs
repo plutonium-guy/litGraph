@@ -31,11 +31,14 @@
 //!    blocking-thread pool (default 512), which can wedge unrelated
 //!    `spawn_blocking` consumers in the same process.
 
+use std::pin::Pin;
 use std::sync::Arc;
 
+use futures::Stream;
 use litgraph_core::Document;
-use tokio::sync::Semaphore;
+use tokio::sync::{mpsc, Semaphore};
 use tokio::task::JoinSet;
+use tokio_stream::wrappers::ReceiverStream;
 
 use crate::{Loader, LoaderError, LoaderResult};
 
@@ -121,6 +124,76 @@ pub async fn load_concurrent(
     out.into_iter()
         .map(|s| s.unwrap_or_else(|| Err(LoaderError::Other("loader slot lost".into()))))
         .collect()
+}
+
+/// One item from [`load_concurrent_stream`] — the input loader
+/// index plus that loader's outcome, emitted in completion order.
+pub type LoadStreamItem = (usize, LoaderResult<Vec<Document>>);
+
+/// Streaming variant of [`load_concurrent`]. Yields
+/// `(loader_idx, LoaderResult<Vec<Document>>)` pairs as each
+/// loader's blocking `load()` finishes — caller drains in
+/// completion order, can index documents into a vector store as
+/// they land, and dropping the stream aborts in-flight loaders.
+///
+/// Streaming-variant pattern from iters 210/211/212/213/214
+/// extended to the loader axis. The blocking loader call still
+/// runs on `spawn_blocking` like [`load_concurrent`].
+///
+/// `max_concurrency = 0` is normalised to 1 (sequential).
+pub fn load_concurrent_stream(
+    loaders: Vec<Arc<dyn Loader>>,
+    max_concurrency: usize,
+) -> Pin<Box<dyn Stream<Item = LoadStreamItem> + Send>> {
+    if loaders.is_empty() {
+        return Box::pin(futures::stream::empty());
+    }
+    let cap = max_concurrency.max(1);
+    let n = loaders.len();
+    let buf = n.min(cap.max(8));
+    let (tx, rx) = mpsc::channel::<LoadStreamItem>(buf);
+
+    tokio::spawn(async move {
+        let sem = Arc::new(Semaphore::new(cap));
+        let mut set: JoinSet<LoadStreamItem> = JoinSet::new();
+        for (idx, loader) in loaders.into_iter().enumerate() {
+            let sem = sem.clone();
+            set.spawn(async move {
+                let _permit = match sem.acquire_owned().await {
+                    Ok(p) => p,
+                    Err(_) => {
+                        return (
+                            idx,
+                            Err(LoaderError::Other("loader semaphore closed".into())),
+                        )
+                    }
+                };
+                let join = tokio::task::spawn_blocking(move || loader.load()).await;
+                let r = match join {
+                    Ok(r) => r,
+                    Err(e) => Err(LoaderError::Other(format!(
+                        "loader task panicked: {e}",
+                    ))),
+                };
+                (idx, r)
+            });
+        }
+        while let Some(joined) = set.join_next().await {
+            let item = match joined {
+                Ok(it) => it,
+                Err(e) => (
+                    usize::MAX,
+                    Err(LoaderError::Other(format!("loader join: {e}"))),
+                ),
+            };
+            if tx.send(item).await.is_err() {
+                set.abort_all();
+                break;
+            }
+        }
+    });
+
+    Box::pin(ReceiverStream::new(rx))
 }
 
 /// Like `load_concurrent` but flattens successful results into a
@@ -287,5 +360,93 @@ mod tests {
         let bad: Arc<dyn Loader> = Arc::new(AlwaysFail);
         let r = load_concurrent_flat(vec![good, bad], 4).await;
         assert!(r.is_err());
+    }
+
+    // ---- load_concurrent_stream tests ---------------------------------
+
+    use futures::StreamExt;
+
+    #[tokio::test]
+    async fn stream_yields_one_item_per_loader() {
+        let (_tmp, paths) = write_files("stream_one", 5);
+        let loaders: Vec<Arc<dyn Loader>> = paths
+            .iter()
+            .map(|p| Arc::new(TextLoader::new(p)) as Arc<dyn Loader>)
+            .collect();
+        let mut s = load_concurrent_stream(loaders, 3);
+        let mut indices: Vec<usize> = Vec::new();
+        while let Some((idx, r)) = s.next().await {
+            assert!(r.is_ok());
+            indices.push(idx);
+        }
+        indices.sort();
+        assert_eq!(indices, vec![0, 1, 2, 3, 4]);
+    }
+
+    #[tokio::test]
+    async fn stream_idx_aligns_with_input_loader() {
+        let (_tmp, paths) = write_files("stream_align", 4);
+        let loaders: Vec<Arc<dyn Loader>> = paths
+            .iter()
+            .map(|p| Arc::new(TextLoader::new(p)) as Arc<dyn Loader>)
+            .collect();
+        let mut s = load_concurrent_stream(loaders, 2);
+        while let Some((idx, r)) = s.next().await {
+            let docs = r.unwrap();
+            assert_eq!(docs.len(), 1);
+            assert_eq!(docs[0].content, format!("body of file {idx}"));
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_per_loader_failure_arrives_as_err_item() {
+        let (_tmp, paths) = write_files("stream_err", 1);
+        let good: Arc<dyn Loader> = Arc::new(TextLoader::new(&paths[0]));
+        let bad: Arc<dyn Loader> = Arc::new(AlwaysFail);
+        let mut s = load_concurrent_stream(vec![good, bad], 2);
+        let mut count = 0;
+        let mut errors = 0;
+        while let Some((_idx, r)) = s.next().await {
+            count += 1;
+            if r.is_err() {
+                errors += 1;
+            }
+        }
+        assert_eq!(count, 2);
+        assert_eq!(errors, 1);
+    }
+
+    #[tokio::test]
+    async fn stream_empty_loaders_yields_empty() {
+        let mut s = load_concurrent_stream(vec![], 4);
+        assert!(s.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn stream_caller_drop_aborts_in_flight_loaders() {
+        // 30 sleep-50ms loaders × cap=2 — full sequential ~750ms.
+        // Drop after first item; total wall-clock should be far less.
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let loaders: Vec<Arc<dyn Loader>> = (0..30)
+            .map(|i| {
+                Arc::new(DelayProbe {
+                    delay_ms: 50,
+                    in_flight: in_flight.clone(),
+                    peak: peak.clone(),
+                    label: format!("p{i}"),
+                }) as Arc<dyn Loader>
+            })
+            .collect();
+        let started = std::time::Instant::now();
+        {
+            let mut s = load_concurrent_stream(loaders, 2);
+            let _first = s.next().await.unwrap();
+        }
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        assert!(
+            elapsed_ms < 400,
+            "elapsed {elapsed_ms}ms — caller-drop didn't abort remaining loaders",
+        );
     }
 }

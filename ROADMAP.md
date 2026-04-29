@@ -230,6 +230,7 @@ patterns").
 | `retrieve_concurrent_stream` (iter 212) | mpsc-backed streaming variant of iter 190 | Streaming-variant pattern extended to the retriever axis. Yields `(query_idx, Result<Vec<Document>>)` as each query completes — eval harnesses can render rows live; drop the stream to abort the rest |
 | `tool_dispatch_concurrent_stream` (iter 213) | mpsc-backed streaming variant of iter 191 | Streaming-variant pattern extended to the tool dispatch axis. Yields `(call_idx, Result<Value>)` as each tool call completes — orchestrators can chain follow-ups on fast tools without waiting for the slowest |
 | `rerank_concurrent_stream` (iter 214) | mpsc-backed streaming variant of iter 197 | Streaming-variant pattern extended to the rerank axis. Yields `(pair_idx, Result<Vec<Document>>)` as each rerank call completes; closes 5 of 6 streaming-variant axes |
+| `load_concurrent_stream` (iter 215) | mpsc-backed streaming variant of iter 187 | Streaming-variant pattern extended to the loader axis. Yields `(loader_idx, LoaderResult<Vec<Document>>)` as each blocking `load()` returns from `spawn_blocking`. Sixth distinct primitive in the streaming family — alongside the buffered-Vec and progress-aware patterns, the parallel-batch toolbox now offers three consumer shapes per axis |
 
 ---
 

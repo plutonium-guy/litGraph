@@ -81,7 +81,10 @@ pub use discord::DiscordChannelLoader;
 pub mod outlook;
 pub use outlook::OutlookMessagesLoader;
 pub mod concurrent;
-pub use concurrent::{load_concurrent, load_concurrent_flat, DEFAULT_LOAD_CONCURRENCY};
+pub use concurrent::{
+    load_concurrent, load_concurrent_flat, load_concurrent_stream, LoadStreamItem,
+    DEFAULT_LOAD_CONCURRENCY,
+};
 pub mod ingest;
 pub use ingest::{
     ingest_to_stream, ingest_to_stream_with_progress, IngestBatch, IngestConfig, IngestProgress,
