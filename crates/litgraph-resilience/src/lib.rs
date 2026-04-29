@@ -1254,6 +1254,73 @@ impl Embeddings for RateLimitedEmbeddings {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// CircuitBreakerEmbeddings — embed-side mirror of CircuitBreakerChatModel
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Wrap any [`Embeddings`] with a [`CircuitBreaker`] so persistent
+/// upstream failures stop bleeding load against a sick service.
+/// Embed-axis mirror of [`CircuitBreakerChatModel`].
+///
+/// Same composition story: stack with [`FallbackEmbeddings`] so
+/// circuit-open routes immediately to the secondary embedder.
+/// Both `embed_query` and `embed_documents` admission-gate
+/// through the breaker; one shared breaker covers both call
+/// shapes so a flapping query path also opens the breaker for
+/// document indexing (and vice-versa).
+pub struct CircuitBreakerEmbeddings {
+    pub inner: Arc<dyn Embeddings>,
+    pub breaker: Arc<CircuitBreaker>,
+}
+
+impl CircuitBreakerEmbeddings {
+    pub fn new(inner: Arc<dyn Embeddings>, breaker: Arc<CircuitBreaker>) -> Self {
+        Self { inner, breaker }
+    }
+}
+
+#[async_trait]
+impl Embeddings for CircuitBreakerEmbeddings {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+    fn dimensions(&self) -> usize {
+        self.inner.dimensions()
+    }
+
+    async fn embed_query(&self, text: &str) -> Result<Vec<f32>> {
+        let inner = self.inner.clone();
+        let text = text.to_owned();
+        let r = self
+            .breaker
+            .call(move || async move { inner.embed_query(&text).await })
+            .await;
+        match r {
+            Ok(v) => Ok(v),
+            Err(CircuitCallError::CircuitOpen) => {
+                Err(Error::Provider("circuit breaker open".into()))
+            }
+            Err(CircuitCallError::Inner(e)) => Err(e),
+        }
+    }
+
+    async fn embed_documents(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        let inner = self.inner.clone();
+        let texts = texts.to_vec();
+        let r = self
+            .breaker
+            .call(move || async move { inner.embed_documents(&texts).await })
+            .await;
+        match r {
+            Ok(v) => Ok(v),
+            Err(CircuitCallError::CircuitOpen) => {
+                Err(Error::Provider("circuit breaker open".into()))
+            }
+            Err(CircuitCallError::Inner(e)) => Err(e),
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // PII scrubbing chat wrapper
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -3136,6 +3203,100 @@ mod tests {
         let breaker = Arc::new(CircuitBreaker::new(2, Duration::from_secs(60)));
         let cb = CircuitBreakerChatModel::new(inner, breaker);
         assert_eq!(cb.name(), "always-ok");
+    }
+
+    // ---- CircuitBreakerEmbeddings tests ---------------------------------
+
+    #[tokio::test]
+    async fn circuit_breaker_embeddings_short_circuits_after_threshold() {
+        // u32::MAX fails => effectively always-fail; lets us observe
+        // that inner is NOT invoked while the breaker is open.
+        let inner = flaky_embed(u32::MAX, EmbedFlakyKind::Provider5xx, 4);
+        let breaker = Arc::new(CircuitBreaker::new(2, Duration::from_secs(60)));
+        let cb = CircuitBreakerEmbeddings::new(
+            inner.clone() as Arc<dyn Embeddings>,
+            breaker,
+        );
+        // Two failures pass through and trip the breaker.
+        for _ in 0..2 {
+            let err = cb.embed_query("hi").await.unwrap_err();
+            assert!(matches!(err, Error::Provider(ref m) if m.contains("502")));
+        }
+        let baseline = inner.total_calls.load(Ordering::SeqCst);
+        // Subsequent calls fail-fast WITHOUT invoking inner.
+        for _ in 0..3 {
+            let err = cb.embed_query("hi").await.unwrap_err();
+            assert!(matches!(err, Error::Provider(ref m) if m.contains("circuit breaker open")));
+        }
+        // embed_documents path also short-circuits via the SAME breaker.
+        let err = cb
+            .embed_documents(&["a".into(), "b".into()])
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Provider(ref m) if m.contains("circuit breaker open")));
+        assert_eq!(
+            inner.total_calls.load(Ordering::SeqCst),
+            baseline,
+            "inner was invoked while breaker was open",
+        );
+    }
+
+    #[tokio::test]
+    async fn circuit_breaker_embeddings_closed_passes_successes() {
+        // Zero fails => always succeeds; verifies the closed path.
+        let inner = flaky_embed(0, EmbedFlakyKind::Provider5xx, 3);
+        let breaker = Arc::new(CircuitBreaker::new(2, Duration::from_secs(60)));
+        let cb = CircuitBreakerEmbeddings::new(
+            inner as Arc<dyn Embeddings>,
+            breaker,
+        );
+        let v = cb.embed_query("hi").await.unwrap();
+        assert_eq!(v.len(), 3);
+        let docs = cb
+            .embed_documents(&["a".into(), "b".into()])
+            .await
+            .unwrap();
+        assert_eq!(docs.len(), 2);
+        assert_eq!(docs[0].len(), 3);
+    }
+
+    #[tokio::test]
+    async fn circuit_breaker_embeddings_query_failures_open_breaker_for_documents() {
+        // One shared breaker spans both call shapes: a flapping
+        // embed_query path opens the breaker so a subsequent
+        // embed_documents call also fails fast.
+        let inner = flaky_embed(u32::MAX, EmbedFlakyKind::Provider5xx, 2);
+        let breaker = Arc::new(CircuitBreaker::new(2, Duration::from_secs(60)));
+        let cb = CircuitBreakerEmbeddings::new(
+            inner.clone() as Arc<dyn Embeddings>,
+            breaker,
+        );
+        for _ in 0..2 {
+            let _ = cb.embed_query("hi").await;
+        }
+        let baseline = inner.total_calls.load(Ordering::SeqCst);
+        let err = cb
+            .embed_documents(&["a".into()])
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Provider(ref m) if m.contains("circuit breaker open")));
+        assert_eq!(
+            inner.total_calls.load(Ordering::SeqCst),
+            baseline,
+            "embed_documents invoked inner despite the query path opening the breaker",
+        );
+    }
+
+    #[tokio::test]
+    async fn circuit_breaker_embeddings_dimensions_proxy_inner() {
+        let inner = flaky_embed(0, EmbedFlakyKind::Provider5xx, 7);
+        let breaker = Arc::new(CircuitBreaker::new(2, Duration::from_secs(60)));
+        let cb = CircuitBreakerEmbeddings::new(
+            inner as Arc<dyn Embeddings>,
+            breaker,
+        );
+        assert_eq!(cb.dimensions(), 7);
+        assert_eq!(cb.name(), "flaky-embed");
     }
 }
 
