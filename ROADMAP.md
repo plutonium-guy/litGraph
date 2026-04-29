@@ -231,6 +231,7 @@ patterns").
 | `tool_dispatch_concurrent_stream` (iter 213) | mpsc-backed streaming variant of iter 191 | Streaming-variant pattern extended to the tool dispatch axis. Yields `(call_idx, Result<Value>)` as each tool call completes — orchestrators can chain follow-ups on fast tools without waiting for the slowest |
 | `rerank_concurrent_stream` (iter 214) | mpsc-backed streaming variant of iter 197 | Streaming-variant pattern extended to the rerank axis. Yields `(pair_idx, Result<Vec<Document>>)` as each rerank call completes; closes 5 of 6 streaming-variant axes |
 | `load_concurrent_stream` (iter 215) | mpsc-backed streaming variant of iter 187 | Streaming-variant pattern extended to the loader axis. Yields `(loader_idx, LoaderResult<Vec<Document>>)` as each blocking `load()` returns from `spawn_blocking`. Sixth distinct primitive in the streaming family — alongside the buffered-Vec and progress-aware patterns, the parallel-batch toolbox now offers three consumer shapes per axis |
+| `batch_concurrent_stream_with_progress` (iter 216) | Composes iter 205 + iter 210 | First combination of two consumer shapes (stream + watcher) in one call. Per-row events drive a UI list view while `BatchProgress { total, completed, errors }` drives a summary progress bar — both backed by the same batch task. Demonstrates the four-quadrant matrix per axis: buffered Vec / progress-aware Vec / streaming / streaming-with-progress |
 
 ---
 

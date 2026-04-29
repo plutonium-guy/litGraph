@@ -271,6 +271,86 @@ pub fn batch_concurrent_stream(
     Box::pin(ReceiverStream::new(rx))
 }
 
+/// Combined streaming + progress-watcher variant. Yields the same
+/// `(idx, Result)` items as [`batch_concurrent_stream`] AND updates
+/// the supplied [`Progress<BatchProgress>`] watcher as each call
+/// completes — same per-call accounting as
+/// [`batch_concurrent_with_progress`].
+///
+/// Real prod use: an eval harness rendering a row per response as
+/// it lands (the stream side) **and** a summary progress bar
+/// counting `{total, completed, errors}` (the watcher side), both
+/// backed by the same underlying batch.
+///
+/// Composition: first iter combining two existing consumer shapes
+/// (iter 205 progress-aware + iter 210 streaming) in a single
+/// call. Three-way symmetry across the parallel-batch family is
+/// now possible — buffered Vec / progress-aware Vec / streaming /
+/// streaming-with-progress.
+pub fn batch_concurrent_stream_with_progress(
+    model: Arc<dyn ChatModel>,
+    inputs: Vec<Vec<Message>>,
+    opts: ChatOptions,
+    max_concurrency: usize,
+    progress: Progress<BatchProgress>,
+) -> Pin<Box<dyn Stream<Item = BatchStreamItem> + Send>> {
+    if inputs.is_empty() {
+        return Box::pin(futures::stream::empty());
+    }
+    let total = inputs.len() as u64;
+    let _ = progress.update(|p| BatchProgress {
+        total,
+        ..p.clone()
+    });
+
+    let cap = max_concurrency.max(1);
+    let n = inputs.len();
+    let buf = n.min(cap.max(8));
+    let (tx, rx) = mpsc::channel::<BatchStreamItem>(buf);
+
+    tokio::spawn(async move {
+        let sem = Arc::new(Semaphore::new(cap));
+        let mut set: JoinSet<BatchStreamItem> = JoinSet::new();
+        for (idx, msgs) in inputs.into_iter().enumerate() {
+            let sem = sem.clone();
+            let model = model.clone();
+            let opts = opts.clone();
+            set.spawn(async move {
+                let _permit = match sem.acquire_owned().await {
+                    Ok(p) => p,
+                    Err(_) => return (idx, Err(Error::other("batch semaphore closed"))),
+                };
+                let r = model.invoke(msgs, &opts).await;
+                (idx, r)
+            });
+        }
+        while let Some(joined) = set.join_next().await {
+            let item = match joined {
+                Ok(it) => it,
+                Err(e) => (
+                    usize::MAX,
+                    Err(Error::other(format!("batch task join: {e}"))),
+                ),
+            };
+            // Update progress BEFORE sending — observers see the
+            // counter tick first, then consumers of the stream
+            // pick up the item. Keeps the two views consistent.
+            let is_err = item.1.is_err();
+            let _ = progress.update(|p| BatchProgress {
+                completed: p.completed + 1,
+                errors: p.errors + if is_err { 1 } else { 0 },
+                ..p.clone()
+            });
+            if tx.send(item).await.is_err() {
+                set.abort_all();
+                break;
+            }
+        }
+    });
+
+    Box::pin(ReceiverStream::new(rx))
+}
+
 /// Like `batch_concurrent` but fail-fast: returns `Err` on the first
 /// failed invocation and cancels the rest. Useful when partial results
 /// aren't useful (e.g. all-or-nothing parallel rendering pipeline).
@@ -605,6 +685,138 @@ mod tests {
     // ---- batch_concurrent_stream tests --------------------------------
 
     use futures::StreamExt;
+
+    // ---- batch_concurrent_stream_with_progress tests ------------------
+
+    #[tokio::test]
+    async fn stream_with_progress_yields_items_and_advances_counters() {
+        let model: Arc<dyn ChatModel> = Arc::new(ConcurrencyProbe {
+            in_flight: Arc::new(AtomicUsize::new(0)),
+            peak: Arc::new(AtomicUsize::new(0)),
+            delay_ms: 5,
+        });
+        let inputs: Vec<Vec<Message>> =
+            (0..6).map(|i| input(&format!("q{i}"))).collect();
+        let progress = Progress::new(BatchProgress::default());
+        let obs = progress.observer();
+        let mut s = batch_concurrent_stream_with_progress(
+            model,
+            inputs,
+            ChatOptions::default(),
+            3,
+            progress,
+        );
+        let mut count = 0;
+        while let Some((_idx, r)) = s.next().await {
+            assert!(r.is_ok());
+            count += 1;
+        }
+        assert_eq!(count, 6);
+        let snap = obs.snapshot();
+        assert_eq!(snap.total, 6);
+        assert_eq!(snap.completed, 6);
+        assert_eq!(snap.errors, 0);
+    }
+
+    #[tokio::test]
+    async fn stream_with_progress_records_errors_and_emits_err_items() {
+        let model: Arc<dyn ChatModel> = Arc::new(FailOn {
+            bad_index: 2,
+            seen: Arc::new(AtomicUsize::new(0)),
+        });
+        let inputs: Vec<Vec<Message>> =
+            (0..5).map(|i| input(&format!("idx={i}"))).collect();
+        let progress = Progress::new(BatchProgress::default());
+        let obs = progress.observer();
+        let mut s = batch_concurrent_stream_with_progress(
+            model,
+            inputs,
+            ChatOptions::default(),
+            3,
+            progress,
+        );
+        let mut errors_in_stream = 0;
+        while let Some((_idx, r)) = s.next().await {
+            if r.is_err() {
+                errors_in_stream += 1;
+            }
+        }
+        let snap = obs.snapshot();
+        assert_eq!(snap.completed, 5);
+        assert_eq!(snap.errors, 1);
+        // Stream's error count and progress's error count must agree.
+        assert_eq!(errors_in_stream, snap.errors);
+    }
+
+    #[tokio::test]
+    async fn stream_with_progress_total_set_at_start() {
+        let model: Arc<dyn ChatModel> = Arc::new(ConcurrencyProbe {
+            in_flight: Arc::new(AtomicUsize::new(0)),
+            peak: Arc::new(AtomicUsize::new(0)),
+            delay_ms: 0,
+        });
+        let inputs: Vec<Vec<Message>> =
+            (0..4).map(|i| input(&format!("q{i}"))).collect();
+        let progress = Progress::new(BatchProgress::default());
+        let obs = progress.observer();
+        let _s = batch_concurrent_stream_with_progress(
+            model,
+            inputs,
+            ChatOptions::default(),
+            2,
+            progress,
+        );
+        // total set synchronously before any stream item lands.
+        assert_eq!(obs.snapshot().total, 4);
+    }
+
+    #[tokio::test]
+    async fn stream_with_progress_empty_inputs_no_updates() {
+        let model: Arc<dyn ChatModel> = Arc::new(ConcurrencyProbe {
+            in_flight: Arc::new(AtomicUsize::new(0)),
+            peak: Arc::new(AtomicUsize::new(0)),
+            delay_ms: 0,
+        });
+        let progress = Progress::new(BatchProgress::default());
+        let obs = progress.observer();
+        let mut s = batch_concurrent_stream_with_progress(
+            model,
+            vec![],
+            ChatOptions::default(),
+            4,
+            progress,
+        );
+        assert!(s.next().await.is_none());
+        assert_eq!(obs.snapshot(), BatchProgress::default());
+    }
+
+    #[tokio::test]
+    async fn stream_with_progress_caller_drop_aborts_in_flight() {
+        let model: Arc<dyn ChatModel> = Arc::new(ConcurrencyProbe {
+            in_flight: Arc::new(AtomicUsize::new(0)),
+            peak: Arc::new(AtomicUsize::new(0)),
+            delay_ms: 50,
+        });
+        let inputs: Vec<Vec<Message>> =
+            (0..50).map(|i| input(&format!("q{i}"))).collect();
+        let progress = Progress::new(BatchProgress::default());
+        let started = std::time::Instant::now();
+        {
+            let mut s = batch_concurrent_stream_with_progress(
+                model,
+                inputs,
+                ChatOptions::default(),
+                2,
+                progress,
+            );
+            let _first = s.next().await.unwrap();
+        }
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        assert!(
+            elapsed_ms < 400,
+            "elapsed {elapsed_ms}ms — caller-drop didn't abort remaining tasks",
+        );
+    }
 
     #[tokio::test]
     async fn stream_yields_every_input_exactly_once() {
