@@ -208,6 +208,7 @@ patterns").
 | `tool_dispatch_concurrent` (iter 191) | Tokio `JoinSet` + `Semaphore` over heterogeneous `Tool::run` | Fourth in the parallel-batch family — different topology (HashMap router, heterogeneous tools per call). Standalone helper for Plan-and-Execute and custom orchestrators outside the React loop |
 | `RaceEmbeddings` (iter 192) | Tokio `JoinSet` + `abort_all` over `Embeddings` | Embeddings analogue of iter 184 `RaceChatModel`. Hedge OpenAI / Voyage / local fastembed for tail-latency cuts on the embed-query critical path |
 | `RaceRetriever` (iter 193) | Tokio `JoinSet` + `abort_all` over `Retriever` | Completes the race trio across the read-side traits (Chat/Embeddings/Retriever). Hedge a fast cache against a slow primary for latency-min retrieval; vs `EnsembleRetriever` which fuses for quality |
+| `TimeoutChatModel` + `TimeoutEmbeddings` (iter 194) | `tokio::time::timeout` (concurrent inner-future vs deadline-timer, `select`-style) | Different shape from `JoinSet/abort_all` race patterns: the "competitor" is a deadline timer, not another provider. Drops the inner future on timeout, releasing connection / parse state |
 
 ---
 

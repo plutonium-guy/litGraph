@@ -15,7 +15,7 @@ use litgraph_providers_jina::{JinaEmbeddings, JinaEmbeddingsConfig};
 use litgraph_providers_openai::{OpenAIEmbeddings, OpenAIEmbeddingsConfig};
 use litgraph_providers_voyage::{VoyageEmbeddings, VoyageEmbeddingsConfig};
 use litgraph_resilience::{
-    FallbackEmbeddings, RaceEmbeddings, RateLimitConfig, RateLimitedEmbeddings, RetryConfig, RetryingEmbeddings,
+    FallbackEmbeddings, RaceEmbeddings, RateLimitConfig, RateLimitedEmbeddings, RetryConfig, RetryingEmbeddings, TimeoutEmbeddings,
 };
 use pyo3::exceptions::{PyRuntimeError, PyTypeError};
 use pyo3::prelude::*;
@@ -34,6 +34,7 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyJinaEmbeddings>()?;
     m.add_class::<PyFallbackEmbeddings>()?;
     m.add_class::<PyRaceEmbeddings>()?;
+    m.add_class::<PyTimeoutEmbeddings>()?;
     m.add_class::<PyRetryingEmbeddings>()?;
     m.add_class::<PyRateLimitedEmbeddings>()?;
     m.add_function(wrap_pyfunction!(tei_embeddings, m)?)?;
@@ -105,6 +106,9 @@ pub(crate) fn extract_embeddings(bound: &Bound<'_, PyAny>) -> PyResult<Arc<dyn E
         return Ok(e.as_embeddings());
     }
     if let Ok(e) = bound.extract::<PyRef<PyRaceEmbeddings>>() {
+        return Ok(e.as_embeddings());
+    }
+    if let Ok(e) = bound.extract::<PyRef<PyTimeoutEmbeddings>>() {
         return Ok(e.as_embeddings());
     }
     if let Ok(e) = bound.extract::<PyRef<PyRetryingEmbeddings>>() {
@@ -906,6 +910,73 @@ impl PyRaceEmbeddings {
 }
 
 impl PyRaceEmbeddings {
+    pub(crate) fn as_embeddings(&self) -> Arc<dyn Embeddings> {
+        self.inner.clone()
+    }
+}
+
+/// Wrap any embeddings provider with a per-call deadline. On timeout
+/// returns a Python `RuntimeError` (Rust `Error::Timeout`) and the
+/// inner future is dropped. Embeddings analogue of `TimeoutChat`.
+///
+/// Composes naturally with the other embedding wrappers — e.g.
+/// `RetryingEmbeddings(TimeoutEmbeddings(inner, 5000))` gives each
+/// retry attempt its own 5s deadline.
+///
+/// ```python
+/// from litgraph.embeddings import OpenAIEmbeddings, TimeoutEmbeddings
+/// raw = OpenAIEmbeddings(api_key=..., model="text-embedding-3-small")
+/// emb = TimeoutEmbeddings(raw, timeout_ms=2000)
+/// vec = emb.embed_query("hi")
+/// ```
+#[pyclass(name = "TimeoutEmbeddings", module = "litgraph.embeddings")]
+pub struct PyTimeoutEmbeddings {
+    inner: Arc<dyn Embeddings>,
+}
+
+#[pymethods]
+impl PyTimeoutEmbeddings {
+    #[new]
+    fn new(inner: Bound<'_, PyAny>, timeout_ms: u64) -> PyResult<Self> {
+        let e = extract_embeddings(&inner)?;
+        let wrapped = TimeoutEmbeddings::new(
+            e,
+            std::time::Duration::from_millis(timeout_ms),
+        );
+        Ok(Self { inner: Arc::new(wrapped) })
+    }
+
+    #[getter]
+    fn dimensions(&self) -> usize {
+        self.inner.dimensions()
+    }
+
+    fn embed_query<'py>(&self, py: Python<'py>, text: String) -> PyResult<Vec<f32>> {
+        let inner = self.inner.clone();
+        py.allow_threads(|| {
+            block_on_compat(async move { inner.embed_query(&text).await })
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })
+    }
+
+    fn embed_documents<'py>(
+        &self,
+        py: Python<'py>,
+        texts: Vec<String>,
+    ) -> PyResult<Vec<Vec<f32>>> {
+        let inner = self.inner.clone();
+        py.allow_threads(|| {
+            block_on_compat(async move { inner.embed_documents(&texts).await })
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })
+    }
+
+    fn __repr__(&self) -> String {
+        "TimeoutEmbeddings()".into()
+    }
+}
+
+impl PyTimeoutEmbeddings {
     pub(crate) fn as_embeddings(&self) -> Arc<dyn Embeddings> {
         self.inner.clone()
     }

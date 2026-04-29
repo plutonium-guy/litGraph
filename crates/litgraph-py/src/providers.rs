@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use futures::StreamExt;
 use litgraph_cache::{CachedModel, SemanticCachedModel};
 use litgraph_resilience::{
-    CostCappedChatModel, FallbackChatModel, PiiScrubbingChatModel, PromptCachingChatModel, RaceChatModel,
+    CostCappedChatModel, FallbackChatModel, PiiScrubbingChatModel, PromptCachingChatModel, RaceChatModel, TimeoutChatModel,
     RateLimitConfig, RateLimitedChatModel, RetryConfig, RetryingChatModel,
     SelfConsistencyChatModel, TokenBudgetChatModel,
 };
@@ -41,6 +41,7 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyStructuredChatModel>()?;
     m.add_class::<PyFallbackChat>()?;
     m.add_class::<PyRaceChat>()?;
+    m.add_class::<PyTimeoutChat>()?;
     m.add_class::<PyTokenBudgetChat>()?;
     m.add_class::<PyPiiScrubbingChat>()?;
     m.add_class::<PyPromptCachingChat>()?;
@@ -1570,6 +1571,77 @@ impl PyRaceChat {
 }
 
 impl PyRaceChat {
+    pub(crate) fn chat_model(&self) -> Arc<dyn ChatModel> {
+        self.inner.clone()
+    }
+}
+
+/// Wrap any chat model with a per-invocation deadline. On timeout the
+/// inner future is cancelled and the call returns a Python
+/// `RuntimeError` (Rust `Error::Timeout`). Streaming passes through
+/// unwrapped — per-call deadlines don't compose cleanly with token
+/// streams; consumers wanting that should run their own
+/// `asyncio.wait_for` per chunk.
+///
+/// Stacks naturally with other wrappers:
+///   `RetryingChat(TimeoutChat(inner, 5s), max_retries=3)` →
+///     each attempt has a 5s deadline; transient errors retry.
+///
+/// ```python
+/// from litgraph.providers import OpenAIChat, TimeoutChat
+/// raw = OpenAIChat(api_key=..., model="gpt-4o-mini")
+/// chat = TimeoutChat(raw, timeout_ms=5000)
+/// resp = chat.invoke([{"role": "user", "content": "hi"}])
+/// ```
+#[pyclass(name = "TimeoutChat", module = "litgraph.providers")]
+pub struct PyTimeoutChat {
+    inner: Arc<dyn ChatModel>,
+}
+
+#[pymethods]
+impl PyTimeoutChat {
+    #[new]
+    #[pyo3(signature = (model, timeout_ms))]
+    fn new(model: Py<PyAny>, timeout_ms: u64) -> PyResult<Self> {
+        let chat_model: Arc<dyn ChatModel> =
+            Python::with_gil(|py| crate::agents::extract_chat_model(model.bind(py)))?;
+        let wrapped = TimeoutChatModel::new(
+            chat_model,
+            std::time::Duration::from_millis(timeout_ms),
+        );
+        Ok(Self {
+            inner: Arc::new(wrapped),
+        })
+    }
+
+    #[pyo3(signature = (messages, temperature=None, max_tokens=None))]
+    fn invoke<'py>(
+        &self,
+        py: Python<'py>,
+        messages: Bound<'py, PyList>,
+        temperature: Option<f32>,
+        max_tokens: Option<u32>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let msgs = parse_messages(&messages)?;
+        let opts = ChatOptions {
+            temperature,
+            max_tokens,
+            ..Default::default()
+        };
+        let m = self.inner.clone();
+        let resp = py.allow_threads(|| {
+            block_on_compat(async move { m.invoke(msgs, &opts).await })
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })?;
+        response_to_py_dict(py, &resp)
+    }
+
+    fn __repr__(&self) -> String {
+        "TimeoutChat()".into()
+    }
+}
+
+impl PyTimeoutChat {
     pub(crate) fn chat_model(&self) -> Arc<dyn ChatModel> {
         self.inner.clone()
     }

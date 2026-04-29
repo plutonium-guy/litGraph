@@ -495,6 +495,8 @@ pub(crate) fn extract_chat_model(bound: &Bound<'_, PyAny>) -> PyResult<Arc<dyn C
         Ok(f.chat_model())
     } else if let Ok(rc) = bound.extract::<PyRef<crate::providers::PyRaceChat>>() {
         Ok(rc.chat_model())
+    } else if let Ok(tc) = bound.extract::<PyRef<crate::providers::PyTimeoutChat>>() {
+        Ok(tc.chat_model())
     } else if let Ok(tb) = bound.extract::<PyRef<PyTokenBudgetChat>>() {
         Ok(tb.chat_model())
     } else if let Ok(ps) = bound.extract::<PyRef<PyPiiScrubbingChat>>() {
