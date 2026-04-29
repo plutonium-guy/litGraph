@@ -224,7 +224,7 @@ long-term Store. Older (v0.3) features rolled in from prior audit.
 | Gemini embeddings | Vertex stack | ✅ |
 | Bedrock embeddings (Titan) | AWS | ✅ |
 | Jina embeddings | OSS option | ✅ |
-| fastembed-rs (local, no network) | Air-gapped | ❌ |
+| fastembed-rs (local, no network) | Air-gapped | ✅ `litgraph-embeddings-fastembed::FastembedEmbeddings` — ONNX-backed, default `bge-small-en-v1.5` 384-dim, batch `embed_documents`, all `EmbeddingModel` variants (BGE/E5/MiniLM/multilingual) selectable via `with_model`; CPU-bound calls run in `spawn_blocking` so async runtime stays free; rustls TLS so no openssl dep |
 | Embedding retry/fallback | Prod | ✅ |
 | Zero-copy numpy interop | Speed | ✅ rust-numpy |
 
@@ -449,7 +449,7 @@ Top gaps to close, ranked by user-impact for a no-code-glue path:
 4. ❌ **Functional API** (`@entrypoint` + `@task`) — Python decorator alternative to graph DSL. Trims LOC for simple workflows.
 5. ❌ **Pydantic-coerced state in Python** — type-safe stream chunks, IDE-narrow types. (Rust side already typed.)
 6. ❌ **`pyo3-stub-gen` auto-stubs** — manual stubs go stale. Pyright import warnings hurt agent-authored code.
-7. ❌ **fastembed-rs local embeddings** — air-gap RAG without OpenAI key.
+7. ✅ **fastembed-rs local embeddings** — `litgraph-embeddings-fastembed::FastembedEmbeddings` ships ONNX-backed local embeddings; default `bge-small-en-v1.5`, all fastembed models selectable.
 8. ❌ **candle / mistral.rs local chat** — full offline agent.
 9. ✅ **LangServe-style HTTP serve crate** — `litgraph-serve::serve_chat(model, addr)` ships REST + SSE in one call. (CLI wrapper still pending.)
 10. ✅ **Graph visualizer (Mermaid)** — `to_mermaid()` + `to_ascii()` on StateGraph + CompiledGraph (8 Rust + 9 Py tests). PNG render still pending (out-of-process via `mmdc` or `kroki`).

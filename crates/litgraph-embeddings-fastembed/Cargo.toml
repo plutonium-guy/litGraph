@@ -1,0 +1,24 @@
+[package]
+name = "litgraph-embeddings-fastembed"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Local ONNX-backed embeddings for litGraph via fastembed-rs. No API key, no network at inference time, models cached locally."
+
+[dependencies]
+litgraph-core.workspace = true
+async-trait.workspace = true
+tokio = { workspace = true }
+parking_lot.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+# fastembed pulls in ort (ONNX runtime) + tokenizers + hf-hub.
+# Use rustls-tls so we don't drag native OpenSSL into the build, and
+# disable image-models since we only need text embeddings here.
+fastembed = { version = "5", default-features = false, features = [
+    "hf-hub-rustls-tls",
+    "ort-download-binaries-rustls-tls",
+] }

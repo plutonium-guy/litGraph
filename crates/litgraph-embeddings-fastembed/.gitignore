@@ -1,0 +1,4 @@
+# Local model cache. Created by fastembed via hf-hub on first
+# instantiation; ~30MB+ of ONNX weights + tokenizer files. Not for
+# version control.
+.fastembed_cache/

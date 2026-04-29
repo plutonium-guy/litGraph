@@ -21,6 +21,7 @@ members = [
     "crates/litgraph-memory-postgres",
     "crates/litgraph-memory-redis",
     "crates/litgraph-store-postgres",
+    "crates/litgraph-embeddings-fastembed",
     "crates/litgraph-rerankers-cohere",
     "crates/litgraph-rerankers-voyage",
     "crates/litgraph-rerankers-jina",
@@ -158,6 +159,7 @@ litgraph-memory-sqlite = { path = "crates/litgraph-memory-sqlite", version = "0.
 litgraph-memory-postgres = { path = "crates/litgraph-memory-postgres", version = "0.1.0" }
 litgraph-memory-redis = { path = "crates/litgraph-memory-redis", version = "0.1.0" }
 litgraph-store-postgres = { path = "crates/litgraph-store-postgres", version = "0.1.0" }
+litgraph-embeddings-fastembed = { path = "crates/litgraph-embeddings-fastembed", version = "0.1.0" }
 litgraph-rerankers-cohere = { path = "crates/litgraph-rerankers-cohere", version = "0.1.0" }
 litgraph-rerankers-voyage = { path = "crates/litgraph-rerankers-voyage", version = "0.1.0" }
 litgraph-rerankers-jina = { path = "crates/litgraph-rerankers-jina", version = "0.1.0" }
