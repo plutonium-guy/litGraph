@@ -47,6 +47,7 @@ pub mod countdown_latch;
 pub mod keyed_mutex;
 pub mod rate_limiter;
 pub mod circuit_breaker;
+pub mod bulkhead;
 pub mod tool_dispatch;
 pub mod table_parser;
 
@@ -121,6 +122,7 @@ pub use countdown_latch::CountDownLatch;
 pub use keyed_mutex::KeyedMutex;
 pub use rate_limiter::RateLimiter;
 pub use circuit_breaker::{CallError as CircuitCallError, CircuitBreaker, CircuitState};
+pub use bulkhead::{Bulkhead, BulkheadGuard};
 pub use tool_dispatch::{
     tool_dispatch_concurrent, tool_dispatch_concurrent_fail_fast,
     tool_dispatch_concurrent_stream, tool_dispatch_concurrent_stream_with_progress,
