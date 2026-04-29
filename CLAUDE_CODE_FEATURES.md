@@ -303,9 +303,9 @@ long-term Store. Older (v0.3) features rolled in from prior audit.
 
 | Feature | Why | Status |
 |---|---|---|
-| LangServe REST endpoints | Quick HTTP API | ❌ no serve crate |
+| LangServe REST endpoints | Quick HTTP API | ✅ `litgraph-serve::serve_chat(model, addr)` — axum-backed; `/invoke`, `/stream` (SSE + `[DONE]` sentinel), `/batch`, `/health`, `/info`. `router_for(model)` returns the bare `Router` for tower middleware (CORS/auth/rate-limit). |
 | LangGraph Cloud / Platform | Hosted runtime | 🚫 out of scope |
-| FastAPI integration example | DIY serve | ❌ no example shipped |
+| FastAPI integration example | DIY serve | 🟡 native `litgraph-serve` covers the use case; standalone FastAPI example deferred |
 | WebSocket streaming | Live UI | 🟡 user wires it |
 | MCP server | Expose agent as MCP | ✅ |
 
@@ -431,7 +431,7 @@ Distinct from short-term checkpointer — JSON document store keyed by
 
 | Feature | Why | Status |
 |---|---|---|
-| LangServe drop-in REST | One-line serve | ❌ |
+| LangServe drop-in REST | One-line serve | ✅ `litgraph-serve::serve_chat` |
 | LangGraph Server | Hosted runtime + UI | 🚫 out of scope |
 | LangGraph Studio (visual debugger) | Step-debug graph | ❌ no native UI |
 | Assistants API (LangGraph) | Per-graph config snapshots | ❌ |
@@ -451,7 +451,7 @@ Top gaps to close, ranked by user-impact for a no-code-glue path:
 6. ❌ **`pyo3-stub-gen` auto-stubs** — manual stubs go stale. Pyright import warnings hurt agent-authored code.
 7. ❌ **fastembed-rs local embeddings** — air-gap RAG without OpenAI key.
 8. ❌ **candle / mistral.rs local chat** — full offline agent.
-9. ❌ **LangServe-style HTTP serve crate** — `litgraph serve graph.py` → REST + SSE one command.
+9. ✅ **LangServe-style HTTP serve crate** — `litgraph-serve::serve_chat(model, addr)` ships REST + SSE in one call. (CLI wrapper still pending.)
 10. ✅ **Graph visualizer (Mermaid)** — `to_mermaid()` + `to_ascii()` on StateGraph + CompiledGraph (8 Rust + 9 Py tests). PNG render still pending (out-of-process via `mmdc` or `kroki`).
 11. ✅ **Eval coverage** — trajectory evaluator, `PairwiseEvaluator`, and `synthesize_eval_cases` shipped. Eval suite covers golden-set runs, trajectory grading, A/B judging, and seed-based dataset synthesis.
 12. 🟡 **Discord/YouTube loaders** — long-tail integrations remaining. (Redis chat history shipped iter 164. arXiv + Wikipedia loaders shipped iter 165. PubMed loader shipped iter 166.)

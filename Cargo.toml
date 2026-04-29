@@ -39,6 +39,7 @@ members = [
     "crates/litgraph-macros",
     "crates/litgraph-bench",
     "crates/litgraph-mcp",
+    "crates/litgraph-serve",
     "crates/litgraph-py",
 ]
 
@@ -173,6 +174,7 @@ litgraph-checkpoint-sqlite = { path = "crates/litgraph-checkpoint-sqlite", versi
 litgraph-checkpoint-postgres = { path = "crates/litgraph-checkpoint-postgres", version = "0.1.0" }
 litgraph-checkpoint-redis = { path = "crates/litgraph-checkpoint-redis", version = "0.1.0" }
 litgraph-mcp = { path = "crates/litgraph-mcp", version = "0.1.0" }
+litgraph-serve = { path = "crates/litgraph-serve", version = "0.1.0" }
 
 [profile.release]
 lto = "thin"
