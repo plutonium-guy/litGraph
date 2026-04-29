@@ -98,6 +98,7 @@ pub use batch::{
 pub use embed_batch::{
     embed_documents_concurrent, embed_documents_concurrent_stream,
     embed_documents_concurrent_stream_with_progress,
+    embed_documents_concurrent_stream_with_shutdown,
     embed_documents_concurrent_with_progress, embed_documents_concurrent_with_shutdown,
     EmbedProgress, EmbedStreamItem, DEFAULT_EMBED_CHUNK_SIZE, DEFAULT_EMBED_CONCURRENCY,
 };

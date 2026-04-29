@@ -283,6 +283,92 @@ pub fn embed_documents_concurrent_stream(
     Box::pin(ReceiverStream::new(rx))
 }
 
+/// Streaming variant of [`embed_documents_concurrent_with_shutdown`].
+/// Yields `(chunk_idx, Result)` items in completion order until
+/// either every chunk finishes or `shutdown` fires. On shutdown
+/// the producer aborts in-flight chunks and drops the channel —
+/// the consumer's stream ends cleanly.
+///
+/// Same producer-side-vs-consumer-side distinction as iter 233:
+///
+/// - **Drop**: consumer-side end-of-interest (existing behavior of
+///   [`embed_documents_concurrent_stream`]).
+/// - **Shutdown**: producer-side / orchestrator end-of-interest.
+///   One signal stops every parallel embed stream a bulk-ingestion
+///   driver owns without it tracking each receiver.
+///
+/// Real prod use: a multi-collection bulk-ingestor pumping 5
+/// embed streams into 5 vector-store collections in parallel. A
+/// shared `ShutdownSignal` from a Ctrl+C or pod-shutdown handler
+/// terminates every embed stream cleanly so each collection's
+/// already-flushed chunks stay valid.
+///
+/// Pre-fired signal returns an empty stream (no work spawned).
+/// `chunk_size = 0` normalised to one chunk; `max_concurrency = 0`
+/// to 1.
+///
+/// Composition: combines iter 211
+/// (`embed_documents_concurrent_stream`) + iter 225
+/// (`ShutdownSignal`). Mirror of iter 233 on the embeddings axis.
+pub fn embed_documents_concurrent_stream_with_shutdown(
+    embedder: Arc<dyn Embeddings>,
+    texts: Vec<String>,
+    chunk_size: usize,
+    max_concurrency: usize,
+    shutdown: ShutdownSignal,
+) -> Pin<Box<dyn Stream<Item = EmbedStreamItem> + Send>> {
+    if texts.is_empty() || shutdown.is_signaled() {
+        return Box::pin(futures::stream::empty());
+    }
+    let cap = max_concurrency.max(1);
+    let chunk = if chunk_size == 0 { texts.len() } else { chunk_size };
+    let chunks: Vec<Vec<String>> = texts.chunks(chunk).map(|s| s.to_vec()).collect();
+    let n_chunks = chunks.len();
+    let buf = n_chunks.min(cap.max(8));
+    let (tx, rx) = mpsc::channel::<EmbedStreamItem>(buf);
+
+    tokio::spawn(async move {
+        let sem = Arc::new(Semaphore::new(cap));
+        let mut set: JoinSet<EmbedStreamItem> = JoinSet::new();
+        for (idx, chunk_texts) in chunks.into_iter().enumerate() {
+            let sem = sem.clone();
+            let embedder = embedder.clone();
+            set.spawn(async move {
+                let _permit = match sem.acquire_owned().await {
+                    Ok(p) => p,
+                    Err(_) => return (idx, Err(Error::other("embed semaphore closed"))),
+                };
+                let r = embedder.embed_documents(&chunk_texts).await;
+                (idx, r)
+            });
+        }
+        loop {
+            tokio::select! {
+                joined = set.join_next() => {
+                    let item = match joined {
+                        Some(Ok(it)) => it,
+                        Some(Err(e)) => (
+                            usize::MAX,
+                            Err(Error::other(format!("embed task join: {e}"))),
+                        ),
+                        None => break,
+                    };
+                    if tx.send(item).await.is_err() {
+                        set.abort_all();
+                        break;
+                    }
+                }
+                _ = shutdown.wait() => {
+                    set.abort_all();
+                    break;
+                }
+            }
+        }
+    });
+
+    Box::pin(ReceiverStream::new(rx))
+}
+
 /// Combined streaming + progress-watcher variant. Yields the same
 /// `(chunk_idx, Result)` items as
 /// [`embed_documents_concurrent_stream`] AND updates the supplied
@@ -1063,5 +1149,69 @@ mod tests {
             .unwrap();
         assert!(out.is_empty());
         assert_eq!(obs.snapshot(), EmbedProgress::default());
+    }
+
+    // ---- embed_documents_concurrent_stream_with_shutdown tests --------
+
+    #[tokio::test]
+    async fn stream_shutdown_no_signal_emits_full_set() {
+        let (e, _peak, _seen) = probe(0);
+        let texts = ts(8);
+        let shutdown = ShutdownSignal::new();
+        let mut s = embed_documents_concurrent_stream_with_shutdown(e, texts, 2, 4, shutdown);
+        let mut count = 0;
+        while let Some((_idx, r)) = s.next().await {
+            assert!(r.is_ok());
+            count += 1;
+        }
+        // 8 texts with chunk_size=2 → 4 chunks
+        assert_eq!(count, 4);
+    }
+
+    #[tokio::test]
+    async fn stream_shutdown_pre_fired_yields_empty_stream() {
+        let (e, _peak, _seen) = probe(0);
+        let texts = ts(4);
+        let shutdown = ShutdownSignal::new();
+        shutdown.signal();
+        let mut s = embed_documents_concurrent_stream_with_shutdown(e, texts, 1, 4, shutdown);
+        assert!(s.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn stream_shutdown_mid_run_emits_prefix_then_ends() {
+        // 30 chunks × 50ms × cap=2 ≈ 750ms sequential. Fire shutdown
+        // at 80ms; consumer should observe a prefix and the stream
+        // ends well before the natural duration.
+        let (e, _peak, _seen) = probe(50);
+        let texts = ts(30);
+        let shutdown = ShutdownSignal::new();
+        let s2 = shutdown.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            s2.signal();
+        });
+        let started = std::time::Instant::now();
+        let mut s = embed_documents_concurrent_stream_with_shutdown(e, texts, 1, 2, shutdown);
+        let mut count = 0;
+        while let Some((_idx, r)) = s.next().await {
+            assert!(r.is_ok());
+            count += 1;
+        }
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(400),
+            "elapsed {elapsed:?} — shutdown didn't terminate stream early",
+        );
+        assert!(count >= 1, "no items reached the consumer before shutdown");
+        assert!(count < 30, "stream emitted full set despite shutdown");
+    }
+
+    #[tokio::test]
+    async fn stream_shutdown_empty_texts_yields_empty() {
+        let (e, _peak, _seen) = probe(0);
+        let shutdown = ShutdownSignal::new();
+        let mut s = embed_documents_concurrent_stream_with_shutdown(e, vec![], 1, 4, shutdown);
+        assert!(s.next().await.is_none());
     }
 }
