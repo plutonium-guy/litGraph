@@ -91,8 +91,8 @@ pub use langmem::{EpisodicMemory, Memory, MemoryExtractor, DEFAULT_EXTRACTION_SY
 pub use assistants::{Assistant, AssistantManager, AssistantPatch};
 pub use batch::{
     batch_concurrent, batch_concurrent_fail_fast, batch_concurrent_stream,
-    batch_concurrent_stream_with_progress, batch_concurrent_with_progress, BatchProgress,
-    BatchStreamItem,
+    batch_concurrent_stream_with_progress, batch_concurrent_with_progress,
+    batch_concurrent_with_shutdown, BatchProgress, BatchStreamItem,
 };
 pub use embed_batch::{
     embed_documents_concurrent, embed_documents_concurrent_stream,

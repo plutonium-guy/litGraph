@@ -31,7 +31,7 @@ use tokio::sync::{mpsc, Semaphore};
 use tokio::task::JoinSet;
 use tokio_stream::wrappers::ReceiverStream;
 
-use crate::{ChatModel, ChatOptions, ChatResponse, Error, Message, Progress, Result};
+use crate::{ChatModel, ChatOptions, ChatResponse, Error, Message, Progress, Result, ShutdownSignal};
 
 /// Run N invocations of `model` concurrently, capped at `max_concurrency`
 /// in flight. Returns a `Vec` of `Result<ChatResponse>` aligned with the
@@ -351,6 +351,93 @@ pub fn batch_concurrent_stream_with_progress(
     Box::pin(ReceiverStream::new(rx))
 }
 
+/// `batch_concurrent` plus graceful cancellation via [`ShutdownSignal`].
+/// Output aligned 1:1 with `inputs`:
+///
+/// - `Ok(resp)` — completed successfully before shutdown.
+/// - `Err(model error)` — completed with the model's own failure.
+/// - `Err(_)` with message "cancelled by shutdown" — task was still
+///   in flight when shutdown fired and was aborted.
+///
+/// Distinct from wrapping `batch_concurrent` in
+/// `until_shutdown` (which discards everything if shutdown wins):
+/// this preserves **partial progress**. A long eval batch that
+/// finishes 60% of its calls before the user hits Ctrl+C banks
+/// those 60% as `Ok` and marks the rest as cancelled — none of
+/// them are lost.
+///
+/// Composition: combines iter 182 (`batch_concurrent`) + iter 225
+/// (`ShutdownSignal`). The first composition that bridges the
+/// parallel-batch family with the coordination primitives.
+pub async fn batch_concurrent_with_shutdown(
+    model: Arc<dyn ChatModel>,
+    inputs: Vec<Vec<Message>>,
+    opts: ChatOptions,
+    max_concurrency: usize,
+    shutdown: &ShutdownSignal,
+) -> Vec<Result<ChatResponse>> {
+    if inputs.is_empty() {
+        return Vec::new();
+    }
+    // Pre-fired signal: nothing started, all slots cancelled.
+    if shutdown.is_signaled() {
+        return (0..inputs.len())
+            .map(|_| Err(Error::other("cancelled by shutdown")))
+            .collect();
+    }
+
+    let cap = max_concurrency.max(1);
+    let sem = Arc::new(Semaphore::new(cap));
+    let mut set: JoinSet<(usize, Result<ChatResponse>)> = JoinSet::new();
+
+    for (idx, msgs) in inputs.into_iter().enumerate() {
+        let sem = sem.clone();
+        let model = model.clone();
+        let opts = opts.clone();
+        set.spawn(async move {
+            let _permit = match sem.acquire_owned().await {
+                Ok(p) => p,
+                Err(_) => return (idx, Err(Error::other("batch semaphore closed"))),
+            };
+            let r = model.invoke(msgs, &opts).await;
+            (idx, r)
+        });
+    }
+
+    let n = set.len();
+    let mut results: Vec<Option<Result<ChatResponse>>> = (0..n).map(|_| None).collect();
+
+    loop {
+        tokio::select! {
+            // Drain whichever finishes first.
+            joined = set.join_next() => {
+                match joined {
+                    Some(Ok((idx, r))) => results[idx] = Some(r),
+                    Some(Err(e)) => {
+                        if let Some(slot) = results.iter_mut().find(|s| s.is_none()) {
+                            *slot = Some(Err(Error::other(format!("batch task join: {e}"))));
+                        }
+                    }
+                    None => break, // every task finished
+                }
+            }
+            _ = shutdown.wait() => {
+                // Abort whatever's still running. Already-completed
+                // slots stay as Some(Ok/Err); the remaining None
+                // slots become "cancelled by shutdown" below.
+                set.abort_all();
+                break;
+            }
+        }
+    }
+
+    // Fill cancelled slots.
+    results
+        .into_iter()
+        .map(|s| s.unwrap_or_else(|| Err(Error::other("cancelled by shutdown"))))
+        .collect()
+}
+
 /// Like `batch_concurrent` but fail-fast: returns `Err` on the first
 /// failed invocation and cancels the rest. Useful when partial results
 /// aren't useful (e.g. all-or-nothing parallel rendering pipeline).
@@ -580,6 +667,155 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out.len(), 3);
+    }
+
+    // ---- batch_concurrent_with_shutdown tests --------------------------
+
+    #[tokio::test]
+    async fn shutdown_no_signal_completes_normally() {
+        let model: Arc<dyn ChatModel> = Arc::new(ConcurrencyProbe {
+            in_flight: Arc::new(AtomicUsize::new(0)),
+            peak: Arc::new(AtomicUsize::new(0)),
+            delay_ms: 1,
+        });
+        let inputs: Vec<Vec<Message>> =
+            (0..5).map(|i| input(&format!("q{i}"))).collect();
+        let shutdown = ShutdownSignal::new();
+        let out = batch_concurrent_with_shutdown(
+            model,
+            inputs,
+            ChatOptions::default(),
+            4,
+            &shutdown,
+        )
+        .await;
+        assert_eq!(out.len(), 5);
+        assert!(out.iter().all(|r| r.is_ok()));
+    }
+
+    #[tokio::test]
+    async fn shutdown_pre_fired_returns_all_cancelled() {
+        let model: Arc<dyn ChatModel> = Arc::new(ConcurrencyProbe {
+            in_flight: Arc::new(AtomicUsize::new(0)),
+            peak: Arc::new(AtomicUsize::new(0)),
+            delay_ms: 0,
+        });
+        let inputs: Vec<Vec<Message>> =
+            (0..4).map(|i| input(&format!("q{i}"))).collect();
+        let shutdown = ShutdownSignal::new();
+        shutdown.signal();
+        let out = batch_concurrent_with_shutdown(
+            model,
+            inputs,
+            ChatOptions::default(),
+            4,
+            &shutdown,
+        )
+        .await;
+        assert_eq!(out.len(), 4);
+        for r in &out {
+            let msg = format!("{}", r.as_ref().err().unwrap());
+            assert!(msg.contains("cancelled by shutdown"));
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_mid_run_preserves_completed_cancels_rest() {
+        // 20 inputs with delay 50ms, cap=2 → most still in flight
+        // when we signal early. Done ones must stay Ok; pending
+        // ones become "cancelled by shutdown".
+        let model: Arc<dyn ChatModel> = Arc::new(ConcurrencyProbe {
+            in_flight: Arc::new(AtomicUsize::new(0)),
+            peak: Arc::new(AtomicUsize::new(0)),
+            delay_ms: 50,
+        });
+        let inputs: Vec<Vec<Message>> =
+            (0..20).map(|i| input(&format!("q{i}"))).collect();
+        let shutdown = ShutdownSignal::new();
+        let s2 = shutdown.clone();
+        // Fire shutdown after 80ms — gives ~3-4 calls time to finish
+        // at cap=2 with 50ms each.
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            s2.signal();
+        });
+        let started = std::time::Instant::now();
+        let out = batch_concurrent_with_shutdown(
+            model,
+            inputs,
+            ChatOptions::default(),
+            2,
+            &shutdown,
+        )
+        .await;
+        let elapsed = started.elapsed();
+        // Must return well before the full 500ms (20*50ms / cap 2)
+        // would take; shutdown should abort early.
+        assert!(
+            elapsed < Duration::from_millis(300),
+            "elapsed {elapsed:?} — shutdown didn't abort early",
+        );
+        assert_eq!(out.len(), 20);
+        // At least some completed ok; the rest are cancelled.
+        let ok_count = out.iter().filter(|r| r.is_ok()).count();
+        let cancelled = out
+            .iter()
+            .filter(|r| {
+                r.as_ref()
+                    .err()
+                    .map(|e| e.to_string().contains("cancelled by shutdown"))
+                    .unwrap_or(false)
+            })
+            .count();
+        assert!(ok_count >= 1, "expected at least one to complete");
+        assert!(cancelled >= 1, "expected at least one to be cancelled");
+        assert_eq!(ok_count + cancelled, 20);
+    }
+
+    #[tokio::test]
+    async fn shutdown_empty_inputs_returns_empty() {
+        let model: Arc<dyn ChatModel> = Arc::new(ConcurrencyProbe {
+            in_flight: Arc::new(AtomicUsize::new(0)),
+            peak: Arc::new(AtomicUsize::new(0)),
+            delay_ms: 0,
+        });
+        let shutdown = ShutdownSignal::new();
+        let out = batch_concurrent_with_shutdown(
+            model,
+            vec![],
+            ChatOptions::default(),
+            4,
+            &shutdown,
+        )
+        .await;
+        assert!(out.is_empty());
+    }
+
+    #[tokio::test]
+    async fn shutdown_aligns_completed_slots_to_input_index() {
+        // Without shutdown: every slot[i] must hold the response
+        // for input[i]. The shutdown variant must preserve that
+        // alignment for completed slots.
+        let model: Arc<dyn ChatModel> = Arc::new(ConcurrencyProbe {
+            in_flight: Arc::new(AtomicUsize::new(0)),
+            peak: Arc::new(AtomicUsize::new(0)),
+            delay_ms: 5,
+        });
+        let inputs: Vec<Vec<Message>> =
+            (0..6).map(|i| input(&format!("q{i}"))).collect();
+        let shutdown = ShutdownSignal::new();
+        let out = batch_concurrent_with_shutdown(
+            model,
+            inputs,
+            ChatOptions::default(),
+            3,
+            &shutdown,
+        )
+        .await;
+        for (i, r) in out.iter().enumerate() {
+            let resp = r.as_ref().unwrap();
+            assert_eq!(resp.message.text_content(), format!("q{i}"));
+        }
     }
 
     // ---- batch_concurrent_with_progress tests --------------------------
