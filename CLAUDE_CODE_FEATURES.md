@@ -363,8 +363,8 @@ skills directory, prompt-caching middleware.
 
 | Feature | Why | Status |
 |---|---|---|
-| Planning tool (todo write/read) | Agent self-organizes long tasks | ❌ no built-in `PlanningTool` |
-| Virtual filesystem backend | Sandboxed scratch space across turns | 🟡 `ReadFile`/`WriteFile` real-FS, no virtual layer |
+| Planning tool (todo write/read) | Agent self-organizes long tasks | ✅ `litgraph.tools.PlanningTool` (list/add/set_status/update/clear; status: pending/in_progress/done/cancelled) |
+| Virtual filesystem backend | Sandboxed scratch space across turns | ✅ `litgraph.tools.VirtualFilesystemTool` (read/write/append/list/delete/exists; size cap; `..` rejected) |
 | Subagent spawn primitive | Delegate to scoped sub-agent | 🟡 `SupervisorAgent` covers static fan-out, no dynamic spawn |
 | AGENTS.md / memory files loader | Persistent system-prompt context | ❌ |
 | Skills directory loader | Domain-specific prompt packs | ❌ |
@@ -442,7 +442,7 @@ Top gaps to close, ranked by user-impact for a no-code-glue path:
 
 1. 🟡 **Long-term memory `Store`** — core trait + `InMemoryStore` shipped (`litgraph.store`, 17 Py tests). Postgres backend + vector-indexed semantic search on Store still pending.
 2. 🟡 **Middleware chain primitive** — `before/after_model` chain shipped (`litgraph.middleware`, 7 Py + 6 Rust tests). Built-ins: Logging, MessageWindow, SystemPrompt. `before/after_tool` hooks + tool-result offload still pending.
-3. ❌ **Deep Agents harness** — `PlanningTool` + virtual filesystem + dynamic subagent spawn + `AGENTS.md`/skills loaders. The new "default agent" pattern.
+3. 🟡 **Deep Agents harness** — `PlanningTool` (`litgraph.tools.PlanningTool`) + `VirtualFilesystemTool` shipped (22 Rust + 13 Py tests). Dynamic subagent spawn + `AGENTS.md`/skills loaders still pending.
 4. ❌ **Functional API** (`@entrypoint` + `@task`) — Python decorator alternative to graph DSL. Trims LOC for simple workflows.
 5. ❌ **Pydantic-coerced state in Python** — type-safe stream chunks, IDE-narrow types. (Rust side already typed.)
 6. ❌ **`pyo3-stub-gen` auto-stubs** — manual stubs go stale. Pyright import warnings hurt agent-authored code.

@@ -27,9 +27,10 @@ use crate::runtime::{block_on_compat, rt};
 use crate::tools::{
     PyBraveSearchTool, PyCachedTool, PyCalculatorTool, PyDalleImageTool, PyDuckDuckGoSearchTool,
     PyFunctionTool, PyHttpRequestTool, PyListDirectoryTool, PyPythonReplTool, PyReadFileTool,
-    PyGmailSendTool, PyRetryTool, PyShellTool, PySqliteQueryTool, PyTavilyExtractTool,
-    PyTavilySearchTool, PyTimeoutTool, PyTtsAudioTool, PyWebFetchTool, PyWebhookTool,
-    PyWhisperTranscribeTool, PyWriteFileTool,
+    PyGmailSendTool, PyPlanningTool, PyRetryTool, PyShellTool, PySqliteQueryTool,
+    PyTavilyExtractTool, PyTavilySearchTool, PyTimeoutTool, PyTtsAudioTool,
+    PyVirtualFilesystemTool, PyWebFetchTool, PyWebhookTool, PyWhisperTranscribeTool,
+    PyWriteFileTool,
 };
 use crate::mcp::PyMcpTool;
 
@@ -92,6 +93,10 @@ fn extract_tools(tools: &Bound<'_, PyList>) -> PyResult<Vec<Arc<dyn litgraph_cor
             tool_vec.push(tt.as_tool());
         } else if let Ok(rt) = item.extract::<PyRef<PyRetryTool>>() {
             tool_vec.push(rt.as_tool());
+        } else if let Ok(p) = item.extract::<PyRef<PyPlanningTool>>() {
+            tool_vec.push(p.as_tool());
+        } else if let Ok(v) = item.extract::<PyRef<PyVirtualFilesystemTool>>() {
+            tool_vec.push(v.as_tool());
         } else {
             return Err(PyValueError::new_err(
                 "tools must be FunctionTool, BraveSearchTool, TavilySearchTool, \
@@ -211,13 +216,17 @@ impl PyReactAgent {
                 tool_vec.push(tt.as_tool());
             } else if let Ok(rt) = item.extract::<PyRef<PyRetryTool>>() {
                 tool_vec.push(rt.as_tool());
+            } else if let Ok(p) = item.extract::<PyRef<PyPlanningTool>>() {
+                tool_vec.push(p.as_tool());
+            } else if let Ok(v) = item.extract::<PyRef<PyVirtualFilesystemTool>>() {
+                tool_vec.push(v.as_tool());
             } else {
                 return Err(PyValueError::new_err(
                     "tools must be FunctionTool, BraveSearchTool, TavilySearchTool, \
                      TavilyExtractTool, DuckDuckGoSearchTool, CalculatorTool, HttpRequestTool, \
                      ReadFileTool, WriteFileTool, ListDirectoryTool, ShellTool, SqliteQueryTool, \
                      WhisperTranscribeTool, DalleImageTool, TtsAudioTool, CachedTool, \
-                     PythonReplTool, WebhookTool, or McpTool",
+                     PythonReplTool, WebhookTool, PlanningTool, VirtualFilesystemTool, or McpTool",
                 ));
             }
         }

@@ -15,10 +15,10 @@ use litgraph_tools_search::{
 };
 use litgraph_tools_utils::{
     CachedTool, CalculatorTool, DalleConfig, DalleImageTool, FsRoot, GmailSendConfig, GmailSendTool,
-    HttpRequestConfig, HttpRequestTool, ListDirectoryTool, PythonReplConfig, PythonReplTool,
-    ReadFileTool, RetryConfig as ToolRetryConfig, RetryTool, ShellTool, SqliteQueryTool,
-    TimeoutTool, TtsAudioTool, TtsConfig, WebFetchConfig, WebFetchTool, WebhookConfig, WebhookTool,
-    WhisperConfig, WhisperTranscribeTool, WriteFileTool,
+    HttpRequestConfig, HttpRequestTool, ListDirectoryTool, PlanningTool, PythonReplConfig,
+    PythonReplTool, ReadFileTool, RetryConfig as ToolRetryConfig, RetryTool, ShellTool,
+    SqliteQueryTool, TimeoutTool, TtsAudioTool, TtsConfig, VirtualFilesystemTool, WebFetchConfig,
+    WebFetchTool, WebhookConfig, WebhookTool, WhisperConfig, WhisperTranscribeTool, WriteFileTool,
 };
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
@@ -49,6 +49,8 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyWebFetchTool>()?;
     m.add_class::<PyTimeoutTool>()?;
     m.add_class::<PyRetryTool>()?;
+    m.add_class::<PyPlanningTool>()?;
+    m.add_class::<PyVirtualFilesystemTool>()?;
     m.add_function(pyo3::wrap_pyfunction!(tool, m)?)?;
     Ok(())
 }
@@ -121,6 +123,12 @@ pub(crate) fn extract_tool_arc(bound: &Bound<'_, PyAny>) -> PyResult<Arc<dyn Too
         return Ok(t.as_tool());
     }
     if let Ok(t) = bound.extract::<PyRef<PyWebhookTool>>() {
+        return Ok(t.as_tool());
+    }
+    if let Ok(t) = bound.extract::<PyRef<PyPlanningTool>>() {
+        return Ok(t.as_tool());
+    }
+    if let Ok(t) = bound.extract::<PyRef<PyVirtualFilesystemTool>>() {
         return Ok(t.as_tool());
     }
     Err(pyo3::exceptions::PyValueError::new_err(
@@ -1260,5 +1268,75 @@ impl PyRetryTool {
 }
 
 impl PyRetryTool {
+    pub(crate) fn as_tool(&self) -> Arc<dyn Tool> { self.inner.clone() as Arc<dyn Tool> }
+}
+
+/// Stateful todo-list tool for long-horizon agent tasks. Each instance owns
+/// its own list — instantiate once per agent session. Mirrors LangChain
+/// `deepagents` planning primitive.
+#[pyclass(name = "PlanningTool", module = "litgraph.tools")]
+#[derive(Clone)]
+pub struct PyPlanningTool { pub(crate) inner: Arc<PlanningTool> }
+
+#[pymethods]
+impl PyPlanningTool {
+    #[new]
+    fn new() -> Self { Self { inner: Arc::new(PlanningTool::new()) } }
+
+    /// Snapshot the current plan as a list of dicts. Useful for inspection
+    /// outside the tool-call protocol.
+    fn snapshot<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let items = self.inner.snapshot();
+        let json_val = serde_json::to_value(&items).map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!("snapshot encode: {e}"))
+        })?;
+        json_to_py(py, &json_val)
+    }
+
+    fn clear(&self) -> usize { self.inner.clear() }
+
+    #[getter] fn name(&self) -> &'static str { "planning" }
+    fn __repr__(&self) -> String {
+        format!("PlanningTool(items={})", self.inner.snapshot().len())
+    }
+}
+
+impl PyPlanningTool {
+    pub(crate) fn as_tool(&self) -> Arc<dyn Tool> { self.inner.clone() as Arc<dyn Tool> }
+}
+
+/// Sandboxed in-memory virtual filesystem for an agent session. Use
+/// `max_total_bytes` to cap accumulated state (0 = unlimited). Mirrors the
+/// `deepagents` virtual-FS backend.
+#[pyclass(name = "VirtualFilesystemTool", module = "litgraph.tools")]
+#[derive(Clone)]
+pub struct PyVirtualFilesystemTool { pub(crate) inner: Arc<VirtualFilesystemTool> }
+
+#[pymethods]
+impl PyVirtualFilesystemTool {
+    #[new]
+    #[pyo3(signature = (max_total_bytes=0))]
+    fn new(max_total_bytes: usize) -> Self {
+        let inner = if max_total_bytes == 0 {
+            VirtualFilesystemTool::new()
+        } else {
+            VirtualFilesystemTool::with_max_total_bytes(max_total_bytes)
+        };
+        Self { inner: Arc::new(inner) }
+    }
+
+    /// Snapshot the filesystem as `{path: content}`.
+    fn snapshot(&self) -> std::collections::BTreeMap<String, String> { self.inner.snapshot() }
+
+    fn total_bytes(&self) -> usize { self.inner.total_bytes() }
+
+    #[getter] fn name(&self) -> &'static str { "vfs" }
+    fn __repr__(&self) -> String {
+        format!("VirtualFilesystemTool(files={}, bytes={})",
+                self.inner.snapshot().len(), self.inner.total_bytes())
+    }
+}
+
+impl PyVirtualFilesystemTool {
     pub(crate) fn as_tool(&self) -> Arc<dyn Tool> { self.inner.clone() as Arc<dyn Tool> }
 }
