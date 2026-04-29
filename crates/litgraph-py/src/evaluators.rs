@@ -10,10 +10,11 @@ use litgraph_core::{
     exact_match_strict as core_exact_match_strict, jaccard_similarity as core_jaccard_similarity,
     json_validity as core_json_validity, levenshtein as core_levenshtein,
     levenshtein_ratio as core_levenshtein_ratio, luhn_valid as core_luhn_valid,
-    regex_match as core_regex_match, run_eval as core_run_eval, ChatModel, ContainsAllScorer,
-    EvalCase, EvalDataset, ExactMatchScorer, JaccardScorer, LevenshteinScorer, LlmJudge,
-    LlmJudgeScorer, PairwiseEvaluator, PiiScrubber as CorePiiScrubber, RegexScorer, Scorer,
-    TrajectoryPolicy, TrajectoryStep, Winner,
+    regex_match as core_regex_match, run_eval as core_run_eval,
+    synthesize_eval_cases as core_synthesize, ChatModel, ContainsAllScorer, EvalCase, EvalDataset,
+    ExactMatchScorer, JaccardScorer, LevenshteinScorer, LlmJudge, LlmJudgeScorer,
+    PairwiseEvaluator, PiiScrubber as CorePiiScrubber, RegexScorer, Scorer, TrajectoryPolicy,
+    TrajectoryStep, Winner,
 };
 use pyo3::types::PyList;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
@@ -39,6 +40,7 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(luhn_valid, m)?)?;
     m.add_function(wrap_pyfunction!(run_eval, m)?)?;
     m.add_function(wrap_pyfunction!(evaluate_trajectory, m)?)?;
+    m.add_function(wrap_pyfunction!(synthesize_eval_cases, m)?)?;
     Ok(())
 }
 
@@ -534,4 +536,77 @@ fn run_eval<'py>(
         .downcast_into()
         .map_err(|_| PyRuntimeError::new_err("report wasn't a dict"))?;
     Ok(dict)
+}
+
+/// Synthesise additional eval cases from a few seeds. Asks the LLM to
+/// produce `target_count` more cases that match the seeds' shape.
+///
+/// `seeds` — list of dicts `{"input": str, "expected": str?}`.
+/// `model` — chat model (any litgraph chat-model wrapper).
+/// `target_count` — desired number of new cases. Caller may receive fewer
+/// after dedup against seeds and after empty-input filtering.
+/// `criteria` — optional plain-English constraint string passed to the LLM
+/// (e.g. "outputs must be ≤20 chars and contain only digits").
+///
+/// Returns a list of dicts shaped like the seeds. Seeds are NOT included
+/// in the output — concatenate yourself if you want a combined dataset.
+///
+/// ```python
+/// from litgraph.evaluators import synthesize_eval_cases
+/// seeds = [
+///     {"input": "What is 2+2?", "expected": "4"},
+///     {"input": "What is 5*3?", "expected": "15"},
+/// ]
+/// new_cases = synthesize_eval_cases(seeds, model=chat, target_count=10,
+///                                   criteria="single arithmetic question")
+/// dataset = seeds + new_cases
+/// ```
+#[pyfunction]
+#[pyo3(signature = (seeds, model, target_count, criteria=None))]
+fn synthesize_eval_cases<'py>(
+    py: Python<'py>,
+    seeds: Bound<'py, PyList>,
+    model: Py<PyAny>,
+    target_count: usize,
+    criteria: Option<String>,
+) -> PyResult<Bound<'py, PyList>> {
+    let mut seed_vec: Vec<EvalCase> = Vec::with_capacity(seeds.len());
+    for item in seeds.iter() {
+        let d: Bound<'_, PyDict> = item
+            .downcast_into()
+            .map_err(|_| PyValueError::new_err("each seed must be a dict"))?;
+        let input: String = d
+            .get_item("input")?
+            .ok_or_else(|| PyValueError::new_err("seed missing `input`"))?
+            .extract()?;
+        let expected: Option<String> = match d.get_item("expected")? {
+            Some(v) if !v.is_none() => Some(v.extract()?),
+            _ => None,
+        };
+        let mut c = EvalCase::new(input);
+        if let Some(e) = expected {
+            c = c.with_expected(e);
+        }
+        seed_vec.push(c);
+    }
+
+    let chat = crate::agents::extract_chat_model(&model.bind(py).clone())?;
+    let criteria_owned = criteria.clone();
+    let cases = py.allow_threads(|| {
+        block_on_compat(async move {
+            core_synthesize(chat, &seed_vec, target_count, criteria_owned.as_deref()).await
+        })
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    })?;
+
+    let out = PyList::empty_bound(py);
+    for c in cases {
+        let d = PyDict::new_bound(py);
+        d.set_item("input", c.input)?;
+        if let Some(e) = c.expected {
+            d.set_item("expected", e)?;
+        }
+        out.append(d)?;
+    }
+    Ok(out)
 }
