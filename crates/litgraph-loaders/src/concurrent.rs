@@ -374,6 +374,106 @@ pub fn load_concurrent_stream(
     Box::pin(ReceiverStream::new(rx))
 }
 
+/// Streaming variant of [`load_concurrent_with_shutdown`]. Yields
+/// `(loader_idx, LoaderResult<Vec<Document>>)` items in completion
+/// order until either every loader finishes or `shutdown` fires.
+/// On shutdown the producer aborts the join-await phase and drops
+/// the channel — the consumer's stream ends cleanly.
+///
+/// **Closes the stream + coordination bridge family.** All six
+/// parallel-batch axes (chat / embed / retriever / tool / rerank /
+/// loader) now expose both Vec + shutdown and stream + shutdown
+/// variants — every async fan-out in litGraph can plug into a
+/// shared `ShutdownSignal` for graceful end-of-interest from
+/// either consumer-drop or producer-side signal.
+///
+/// Loader-axis caveat (mirrors iter 232): `Loader::load()` runs
+/// on `spawn_blocking`, so an OS thread that's already mid-call
+/// finishes its current `load()` naturally — `abort_all()` only
+/// cancels the waiting-on-permit phase plus the join await. The
+/// consumer just stops seeing items past the prefix that
+/// completed before the signal; in-flight blocking threads finish
+/// silently and their results are discarded along with the
+/// dropped channel.
+///
+/// Real prod use: a multi-source ingestion crawler streaming docs
+/// from S3 + sitemap + GitHub + Confluence loaders into a single
+/// downstream chunker. Ctrl+C fires the shared `ShutdownSignal`,
+/// every loader stream ends cleanly, the partial corpus already
+/// drained into the chunker stays valid for a partial index.
+///
+/// Pre-fired signal returns an empty stream (no work spawned).
+/// `max_concurrency = 0` normalised to 1 (sequential).
+///
+/// Composition: combines iter 215 (`load_concurrent_stream`) +
+/// iter 225 (`ShutdownSignal`). Sixth and final mirror in the
+/// stream + coordination bridge family (after iters
+/// 233/234/235/236/237).
+pub fn load_concurrent_stream_with_shutdown(
+    loaders: Vec<Arc<dyn Loader>>,
+    max_concurrency: usize,
+    shutdown: ShutdownSignal,
+) -> Pin<Box<dyn Stream<Item = LoadStreamItem> + Send>> {
+    if loaders.is_empty() || shutdown.is_signaled() {
+        return Box::pin(futures::stream::empty());
+    }
+    let cap = max_concurrency.max(1);
+    let n = loaders.len();
+    let buf = n.min(cap.max(8));
+    let (tx, rx) = mpsc::channel::<LoadStreamItem>(buf);
+
+    tokio::spawn(async move {
+        let sem = Arc::new(Semaphore::new(cap));
+        let mut set: JoinSet<LoadStreamItem> = JoinSet::new();
+        for (idx, loader) in loaders.into_iter().enumerate() {
+            let sem = sem.clone();
+            set.spawn(async move {
+                let _permit = match sem.acquire_owned().await {
+                    Ok(p) => p,
+                    Err(_) => {
+                        return (
+                            idx,
+                            Err(LoaderError::Other("loader semaphore closed".into())),
+                        )
+                    }
+                };
+                let join = tokio::task::spawn_blocking(move || loader.load()).await;
+                let r = match join {
+                    Ok(r) => r,
+                    Err(e) => Err(LoaderError::Other(format!(
+                        "loader task panicked: {e}",
+                    ))),
+                };
+                (idx, r)
+            });
+        }
+        loop {
+            tokio::select! {
+                joined = set.join_next() => {
+                    let item = match joined {
+                        Some(Ok(it)) => it,
+                        Some(Err(e)) => (
+                            usize::MAX,
+                            Err(LoaderError::Other(format!("loader join: {e}"))),
+                        ),
+                        None => break,
+                    };
+                    if tx.send(item).await.is_err() {
+                        set.abort_all();
+                        break;
+                    }
+                }
+                _ = shutdown.wait() => {
+                    set.abort_all();
+                    break;
+                }
+            }
+        }
+    });
+
+    Box::pin(ReceiverStream::new(rx))
+}
+
 /// `load_concurrent` plus graceful cancellation via
 /// [`ShutdownSignal`]. Output aligned 1:1 with `loaders`:
 ///
@@ -904,5 +1004,83 @@ mod tests {
             elapsed_ms < 400,
             "elapsed {elapsed_ms}ms — caller-drop didn't abort remaining loaders",
         );
+    }
+
+    // ---- load_concurrent_stream_with_shutdown tests -------------------
+
+    #[tokio::test]
+    async fn stream_shutdown_no_signal_emits_full_set() {
+        let (_tmp, paths) = write_files("ssd_ok", 5);
+        let loaders: Vec<Arc<dyn Loader>> = paths
+            .iter()
+            .map(|p| Arc::new(TextLoader::new(p)) as Arc<dyn Loader>)
+            .collect();
+        let shutdown = ShutdownSignal::new();
+        let mut s = load_concurrent_stream_with_shutdown(loaders, 3, shutdown);
+        let mut count = 0;
+        while let Some((_idx, r)) = s.next().await {
+            assert!(r.is_ok());
+            count += 1;
+        }
+        assert_eq!(count, 5);
+    }
+
+    #[tokio::test]
+    async fn stream_shutdown_pre_fired_yields_empty_stream() {
+        let (_tmp, paths) = write_files("ssd_pre", 3);
+        let loaders: Vec<Arc<dyn Loader>> = paths
+            .iter()
+            .map(|p| Arc::new(TextLoader::new(p)) as Arc<dyn Loader>)
+            .collect();
+        let shutdown = ShutdownSignal::new();
+        shutdown.signal();
+        let mut s = load_concurrent_stream_with_shutdown(loaders, 4, shutdown);
+        assert!(s.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn stream_shutdown_mid_run_emits_prefix_then_ends() {
+        // 30 loaders × 50ms × cap=2 ≈ 750ms sequential. Fire signal
+        // at 80ms; consumer should see a prefix and the stream ends
+        // far before the natural duration.
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let loaders: Vec<Arc<dyn Loader>> = (0..30)
+            .map(|i| {
+                Arc::new(DelayProbe {
+                    delay_ms: 50,
+                    in_flight: in_flight.clone(),
+                    peak: peak.clone(),
+                    label: format!("p{i}"),
+                }) as Arc<dyn Loader>
+            })
+            .collect();
+        let shutdown = ShutdownSignal::new();
+        let s2 = shutdown.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            s2.signal();
+        });
+        let started = std::time::Instant::now();
+        let mut s = load_concurrent_stream_with_shutdown(loaders, 2, shutdown);
+        let mut count = 0;
+        while let Some((_idx, r)) = s.next().await {
+            assert!(r.is_ok());
+            count += 1;
+        }
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(400),
+            "elapsed {elapsed:?} — shutdown didn't terminate stream early",
+        );
+        assert!(count >= 1, "no items reached the consumer before shutdown");
+        assert!(count < 30, "stream emitted full set despite shutdown");
+    }
+
+    #[tokio::test]
+    async fn stream_shutdown_empty_loaders_yields_empty() {
+        let shutdown = ShutdownSignal::new();
+        let mut s = load_concurrent_stream_with_shutdown(vec![], 4, shutdown);
+        assert!(s.next().await.is_none());
     }
 }
