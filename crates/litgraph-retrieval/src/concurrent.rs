@@ -42,7 +42,8 @@
 
 use std::sync::Arc;
 
-use litgraph_core::{Document, Error, Result};
+use litgraph_core::{Document, Error, Progress, Result};
+use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
@@ -88,6 +89,96 @@ pub async fn retrieve_concurrent(
                 if let Some(slot) = results.iter_mut().find(|s| s.is_none()) {
                     *slot = Some(Err(Error::other(format!("retrieve task join: {e}"))));
                 }
+            }
+        }
+    }
+
+    results
+        .into_iter()
+        .map(|s| s.unwrap_or_else(|| Err(Error::other("retrieve slot lost"))))
+        .collect()
+}
+
+/// Counters maintained by [`retrieve_concurrent_with_progress`].
+/// Snapshot from any `Progress<RetrieveProgress>` observer to drive
+/// a progress bar over a multi-query eval run.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RetrieveProgress {
+    /// Total queries submitted (set once on entry).
+    pub total: u64,
+    /// Queries whose `retrieve` has finished, success or failure.
+    pub completed: u64,
+    /// Total documents returned across all successful queries.
+    pub docs_returned: u64,
+    /// Subset of `completed` that returned `Err`.
+    pub errors: u64,
+}
+
+/// Same as [`retrieve_concurrent`] but updates `progress` as each
+/// query completes. Real prod use: an eval harness scoring a
+/// retriever over hundreds of test queries with a live counter.
+///
+/// Composition: fourth progress-aware sibling after iter 200
+/// (ingest), iter 205 (chat batch), iter 206 (embed batch).
+pub async fn retrieve_concurrent_with_progress(
+    retriever: Arc<dyn Retriever>,
+    queries: Vec<String>,
+    k: usize,
+    max_concurrency: usize,
+    progress: Progress<RetrieveProgress>,
+) -> Vec<Result<Vec<Document>>> {
+    if queries.is_empty() {
+        return Vec::new();
+    }
+    let total = queries.len() as u64;
+    let _ = progress.update(|p| RetrieveProgress {
+        total,
+        ..p.clone()
+    });
+
+    let cap = max_concurrency.max(1);
+    let sem = Arc::new(Semaphore::new(cap));
+    let mut set: JoinSet<(usize, Result<Vec<Document>>)> = JoinSet::new();
+
+    for (idx, q) in queries.into_iter().enumerate() {
+        let sem = sem.clone();
+        let retriever = retriever.clone();
+        set.spawn(async move {
+            let _permit = match sem.acquire_owned().await {
+                Ok(p) => p,
+                Err(_) => return (idx, Err(Error::other("retrieve semaphore closed"))),
+            };
+            let r = retriever.retrieve(&q, k).await;
+            (idx, r)
+        });
+    }
+
+    let n = set.len();
+    let mut results: Vec<Option<Result<Vec<Document>>>> = (0..n).map(|_| None).collect();
+    while let Some(joined) = set.join_next().await {
+        match joined {
+            Ok((idx, r)) => {
+                let (n_docs, is_err) = match &r {
+                    Ok(docs) => (docs.len() as u64, false),
+                    Err(_) => (0, true),
+                };
+                results[idx] = Some(r);
+                let _ = progress.update(|p| RetrieveProgress {
+                    completed: p.completed + 1,
+                    docs_returned: p.docs_returned + n_docs,
+                    errors: p.errors + if is_err { 1 } else { 0 },
+                    ..p.clone()
+                });
+            }
+            Err(e) => {
+                if let Some(slot) = results.iter_mut().find(|s| s.is_none()) {
+                    *slot = Some(Err(Error::other(format!("retrieve task join: {e}"))));
+                }
+                let _ = progress.update(|p| RetrieveProgress {
+                    completed: p.completed + 1,
+                    errors: p.errors + 1,
+                    ..p.clone()
+                });
             }
         }
     }
@@ -247,5 +338,91 @@ mod tests {
         let out = retrieve_concurrent_fail_fast(r, qs(3), 1, 4).await.unwrap();
         assert_eq!(out.len(), 3);
         assert_eq!(out[0][0].content, "q0");
+    }
+
+    // ---- retrieve_concurrent_with_progress tests -----------------------
+
+    #[tokio::test]
+    async fn progress_total_set_and_completed_counts_advance() {
+        let (r, _peak) = probe(0);
+        let progress = Progress::new(RetrieveProgress::default());
+        let obs = progress.observer();
+        let out =
+            retrieve_concurrent_with_progress(r, qs(6), 1, 4, progress).await;
+        assert_eq!(out.len(), 6);
+        let snap = obs.snapshot();
+        assert_eq!(snap.total, 6);
+        assert_eq!(snap.completed, 6);
+        // probe returns 1 doc per query (k=1, min(k, 3)=1).
+        assert_eq!(snap.docs_returned, 6);
+        assert_eq!(snap.errors, 0);
+    }
+
+    #[tokio::test]
+    async fn progress_records_per_query_errors() {
+        struct FailOnQ {
+            bad: String,
+        }
+        #[async_trait::async_trait]
+        impl Retriever for FailOnQ {
+            async fn retrieve(
+                &self,
+                query: &str,
+                _k: usize,
+            ) -> Result<Vec<Document>> {
+                if query == self.bad {
+                    Err(Error::other("synthetic"))
+                } else {
+                    Ok(vec![Document::new(query)])
+                }
+            }
+        }
+        let r: Arc<dyn Retriever> = Arc::new(FailOnQ {
+            bad: "q2".into(),
+        });
+        let progress = Progress::new(RetrieveProgress::default());
+        let obs = progress.observer();
+        let _ = retrieve_concurrent_with_progress(r, qs(5), 1, 4, progress).await;
+        let snap = obs.snapshot();
+        assert_eq!(snap.total, 5);
+        assert_eq!(snap.completed, 5);
+        assert_eq!(snap.errors, 1);
+        // 4 successes × 1 doc each = 4 docs returned.
+        assert_eq!(snap.docs_returned, 4);
+    }
+
+    #[tokio::test]
+    async fn progress_observer_polls_mid_run() {
+        let (r, _peak) = probe(15);
+        let progress = Progress::new(RetrieveProgress::default());
+        let mut obs = progress.observer();
+        let queries = qs(8);
+        let progress_clone = progress.clone();
+        let h = tokio::spawn(async move {
+            retrieve_concurrent_with_progress(r, queries, 1, 2, progress_clone).await
+        });
+        let _ = obs.changed().await;
+        let mid = obs.snapshot();
+        assert_eq!(mid.total, 8);
+        let _ = h.await.unwrap();
+        let snap = obs.snapshot();
+        assert_eq!(snap.completed, 8);
+    }
+
+    #[tokio::test]
+    async fn progress_empty_queries_no_updates() {
+        let (r, _peak) = probe(0);
+        let progress = Progress::new(RetrieveProgress::default());
+        let obs = progress.observer();
+        let out = retrieve_concurrent_with_progress(
+            r,
+            vec![],
+            5,
+            4,
+            progress,
+        )
+        .await;
+        assert!(out.is_empty());
+        assert_eq!(obs.snapshot(), RetrieveProgress::default());
     }
 }

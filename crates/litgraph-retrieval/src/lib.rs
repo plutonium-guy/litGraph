@@ -30,7 +30,10 @@ pub use hybrid::{HybridRetriever, rrf_fuse};
 pub use ensemble::{EnsembleRetriever, weighted_rrf_fuse};
 pub use ensemble_rerank::{EnsembleReranker, weighted_rrf_fuse_rerank};
 pub use multi_vector::{MultiVectorItem, MultiVectorRetriever};
-pub use concurrent::{retrieve_concurrent, retrieve_concurrent_fail_fast};
+pub use concurrent::{
+    retrieve_concurrent, retrieve_concurrent_fail_fast, retrieve_concurrent_with_progress,
+    RetrieveProgress,
+};
 pub use race::RaceRetriever;
 pub use rerank_concurrent::{rerank_concurrent, rerank_concurrent_fail_fast};
 pub use rerank::{Reranker, RerankingRetriever};

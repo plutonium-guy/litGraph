@@ -222,6 +222,7 @@ patterns").
 | `embedding_redundant_filter` parallel (iter 204) | Rayon `par_iter::any` with short-circuit | Sibling pattern to iter 203: outer kept-list loop sequential, inner "is candidate similar to ANY kept doc?" probe parallelizes across cores via `any` (which short-circuits on first hit, just like the sequential `for ... break`). 3 cross-impl tests cover small / larger / threshold-extreme pools |
 | `batch_concurrent_with_progress` (iter 205) | Composes iter 182 + iter 199 | Second progress-aware composition (after iter 200's progress-aware ingestion). `BatchProgress { total, completed, errors }` watcher updated as each `ChatModel.invoke` completes — drop-in replacement for `batch_concurrent` when the caller wants live eval-harness counters |
 | `embed_documents_concurrent_with_progress` (iter 206) | Composes iter 183 + iter 199 | Third progress-aware composition. `EmbedProgress { total_texts, total_chunks, completed_chunks, completed_texts, errors }` watcher updated as each chunk's embed call returns — drop-in replacement for bulk-indexing flows that want a tqdm-style counter / ETA |
+| `retrieve_concurrent_with_progress` (iter 207) | Composes iter 190 + iter 199 | Fourth progress-aware composition. `RetrieveProgress { total, completed, docs_returned, errors }` watcher updated as each query completes — eval-harness pattern with a live counter |
 
 ---
 
