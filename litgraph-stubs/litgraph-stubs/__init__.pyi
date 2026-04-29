@@ -8,6 +8,7 @@ from . import (
     providers as providers,
     retrieval as retrieval,
     splitters as splitters,
+    store as store,
     tokenizers as tokenizers,
     tools as tools,
 )

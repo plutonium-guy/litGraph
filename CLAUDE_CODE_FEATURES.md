@@ -400,14 +400,17 @@ Distinct from short-term checkpointer — JSON document store keyed by
 
 | Feature | Why | Status |
 |---|---|---|
-| `BaseStore` namespace+key API | Multi-tenant long-term mem | ❌ no `Store` trait yet |
-| `InMemoryStore` (dev) | Local prototyping | 🟡 `BufferMemory`/`VectorStoreMemory` cover thread-scoped |
-| `PostgresStore` (prod) | Durable distributed | 🟡 `PostgresChatHistory` thread-scoped only |
-| Vector-indexed semantic search on Store | Memory recall by meaning | ✅ `VectorStoreMemory` (no namespace dimension) |
+| `BaseStore` namespace+key API | Multi-tenant long-term mem | ✅ `litgraph_core::store::Store` trait |
+| `InMemoryStore` (dev) | Local prototyping | ✅ `litgraph.store.InMemoryStore` |
+| `PostgresStore` (prod) | Durable distributed | ❌ pending crate |
+| Vector-indexed semantic search on Store | Memory recall by meaning | 🟡 `VectorStoreMemory` separate; not yet bolted onto Store |
 | `LangMem` SDK (episodic memory) | Auto-extract memories | ❌ |
-| TTL on memory entries | Auto-expire stale | ❌ |
-| Per-user namespace isolation | GDPR / multi-tenant | 🟡 thread_id covers single dimension |
-| `put` / `get` / `search` ops | CRUD on long-term mem | ❌ |
+| TTL on memory entries | Auto-expire stale | ✅ `ttl_ms` per put, lazy eviction on read/search |
+| Per-user namespace isolation | GDPR / multi-tenant | ✅ namespace tuple + prefix search |
+| `put` / `get` / `delete` / `search` / `list_namespaces` ops | CRUD on long-term mem | ✅ |
+| `pop(ns, key)` convenience | Atomic get+delete | ✅ Python-only |
+| JSON-pointer match filter | Field-eq filtering on search | ✅ `matches=[("/role", "admin")]` |
+| `query_text` substring filter | Cheap full-text scan | ✅ case-insensitive |
 
 ## 27. Pydantic 2 / typed state
 
@@ -434,7 +437,7 @@ Distinct from short-term checkpointer — JSON document store keyed by
 
 Top gaps to close, ranked by user-impact for a no-code-glue path:
 
-1. ❌ **Long-term memory `Store` trait** (namespace+key JSON, semantic search, Postgres backend) — biggest LC 1.0 / LangGraph 1.1 gap. Today only thread-scoped checkpointer + chat history.
+1. 🟡 **Long-term memory `Store`** — core trait + `InMemoryStore` shipped (`litgraph.store`, 17 Py tests). Postgres backend + vector-indexed semantic search on Store still pending.
 2. ❌ **Middleware chain primitive** — composable `before/after_model`, `before/after_tool` hooks. Today resilience is wrapper-stacking; LC 1.0 reframes everything around middleware.
 3. ❌ **Deep Agents harness** — `PlanningTool` + virtual filesystem + dynamic subagent spawn + `AGENTS.md`/skills loaders. The new "default agent" pattern.
 4. ❌ **Functional API** (`@entrypoint` + `@task`) — Python decorator alternative to graph DSL. Trims LOC for simple workflows.
