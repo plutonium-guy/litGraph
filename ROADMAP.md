@@ -228,6 +228,7 @@ patterns").
 | `batch_concurrent_stream` (iter 210) | mpsc-backed streaming variant of iter 182 | Yields `(idx, Result<ChatResponse>)` pairs in completion order as each invoke finishes, instead of buffering the whole `Vec`. Caller can render results live, dispatch downstream work on early completers, or drop the stream to abort remaining in-flight work (the spawned pump calls `set.abort_all()` on receiver-drop). First "stream-out" variant in the parallel-batch family — same primitive, different consumer shape |
 | `embed_documents_concurrent_stream` (iter 211) | mpsc-backed streaming variant of iter 183 | Streaming-variant pattern extended to the embeddings axis. Yields `(chunk_idx, Result<Vec<Vec<f32>>>)` as each chunk's embed call returns; bulk indexers upsert chunks into a vector store on early completers without waiting for the slowest. Same abort-on-drop semantics as iter 210 |
 | `retrieve_concurrent_stream` (iter 212) | mpsc-backed streaming variant of iter 190 | Streaming-variant pattern extended to the retriever axis. Yields `(query_idx, Result<Vec<Document>>)` as each query completes — eval harnesses can render rows live; drop the stream to abort the rest |
+| `tool_dispatch_concurrent_stream` (iter 213) | mpsc-backed streaming variant of iter 191 | Streaming-variant pattern extended to the tool dispatch axis. Yields `(call_idx, Result<Value>)` as each tool call completes — orchestrators can chain follow-ups on fast tools without waiting for the slowest |
 
 ---
 

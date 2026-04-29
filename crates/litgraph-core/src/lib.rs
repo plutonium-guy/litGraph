@@ -107,7 +107,8 @@ pub use progress::{Progress, ProgressObserver};
 pub use resume_registry::{ResumeFuture, ResumeRegistry};
 pub use tool_dispatch::{
     tool_dispatch_concurrent, tool_dispatch_concurrent_fail_fast,
-    tool_dispatch_concurrent_with_progress, ToolDispatchProgress,
+    tool_dispatch_concurrent_stream, tool_dispatch_concurrent_with_progress,
+    ToolDispatchProgress, ToolDispatchStreamItem,
 };
 pub use table_parser::{
     format_instructions as table_format_instructions, parse_table_csv, parse_table_json,
