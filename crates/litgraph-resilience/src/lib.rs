@@ -25,7 +25,7 @@ use backon::{ExponentialBuilder, Retryable};
 use litgraph_core::model::ChatStream;
 use litgraph_core::{
     ChatModel, ChatOptions, ChatResponse, CircuitBreaker, CircuitCallError, ContentPart,
-    Embeddings, Error, Message, PiiScrubber, Result,
+    Embeddings, Error, Message, PiiScrubber, RateLimiter, Result,
 };
 use tracing::{debug, warn};
 
@@ -1249,6 +1249,109 @@ impl Embeddings for RateLimitedEmbeddings {
 
     async fn embed_documents(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
         self.acquire().await;
+        self.inner.embed_documents(texts).await
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SharedRateLimitedChatModel — one bucket, many wrapped models
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Wrap any [`ChatModel`] so each call charges against a SHARED
+/// [`RateLimiter`] (iter 242). Distinct from
+/// [`RateLimitedChatModel`] which owns its own bucket: this
+/// takes an `Arc<RateLimiter>` so multiple wrapped models can
+/// charge against ONE budget.
+///
+/// # Why this exists
+///
+/// One provider API key typically has ONE quota (TPM/RPM) shared
+/// across every model variant served by that key. The realistic
+/// prod pattern: a router that dispatches to gpt-4, gpt-4-turbo,
+/// gpt-4o-mini based on heuristics — all three calls draw from
+/// the same key's TPM. With per-model `RateLimitedChatModel`
+/// each variant has its own bucket and the aggregate exceeds
+/// the real budget. With this wrapper they all charge against
+/// one shared `RateLimiter`.
+///
+/// Per-call weight is fixed at 1 token (one request charge) by
+/// default. For weight-by-tokens-estimate use cases, wrap with
+/// a custom adapter or call `limiter.acquire(estimate).await`
+/// directly upstream. We pick 1-token-per-request as the
+/// minimum-surprise default.
+///
+/// # Streaming
+///
+/// `stream()` charges 1 token at handshake, same as `invoke`.
+/// Mid-stream tokens don't deduct further.
+pub struct SharedRateLimitedChatModel {
+    pub inner: Arc<dyn ChatModel>,
+    pub limiter: Arc<RateLimiter>,
+}
+
+impl SharedRateLimitedChatModel {
+    pub fn new(inner: Arc<dyn ChatModel>, limiter: Arc<RateLimiter>) -> Self {
+        Self { inner, limiter }
+    }
+}
+
+#[async_trait]
+impl ChatModel for SharedRateLimitedChatModel {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    async fn invoke(
+        &self,
+        messages: Vec<Message>,
+        opts: &ChatOptions,
+    ) -> Result<ChatResponse> {
+        self.limiter.acquire(1).await;
+        self.inner.invoke(messages, opts).await
+    }
+
+    async fn stream(
+        &self,
+        messages: Vec<Message>,
+        opts: &ChatOptions,
+    ) -> Result<ChatStream> {
+        self.limiter.acquire(1).await;
+        self.inner.stream(messages, opts).await
+    }
+}
+
+/// Embed-axis sibling. Both `embed_query` and `embed_documents`
+/// charge 1 token per call against the shared bucket. For
+/// chunked-embedding pipelines, charge once per chunk (not per
+/// document) by sizing your bucket accordingly — `RateLimiter`
+/// is request-count agnostic.
+pub struct SharedRateLimitedEmbeddings {
+    pub inner: Arc<dyn Embeddings>,
+    pub limiter: Arc<RateLimiter>,
+}
+
+impl SharedRateLimitedEmbeddings {
+    pub fn new(inner: Arc<dyn Embeddings>, limiter: Arc<RateLimiter>) -> Self {
+        Self { inner, limiter }
+    }
+}
+
+#[async_trait]
+impl Embeddings for SharedRateLimitedEmbeddings {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+    fn dimensions(&self) -> usize {
+        self.inner.dimensions()
+    }
+
+    async fn embed_query(&self, text: &str) -> Result<Vec<f32>> {
+        self.limiter.acquire(1).await;
+        self.inner.embed_query(text).await
+    }
+
+    async fn embed_documents(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        self.limiter.acquire(1).await;
         self.inner.embed_documents(texts).await
     }
 }
@@ -3297,6 +3400,103 @@ mod tests {
         );
         assert_eq!(cb.dimensions(), 7);
         assert_eq!(cb.name(), "flaky-embed");
+    }
+
+    // ---- SharedRateLimited{Chat,Embed} tests ---------------------------
+
+    #[tokio::test]
+    async fn shared_rate_limit_two_chat_models_share_one_budget() {
+        // Bucket: capacity 2, refill 50/sec ≈ 20ms/token. Two distinct
+        // wrapped models share the limiter. Four total calls (2 per
+        // model) must take >= 2 * 20ms = 40ms (the 3rd and 4th wait).
+        let limiter = Arc::new(RateLimiter::new(2, 50));
+        let m1: Arc<dyn ChatModel> = Arc::new(AlwaysOkModel);
+        let m2: Arc<dyn ChatModel> = Arc::new(AlwaysOkModel);
+        let s1 = Arc::new(SharedRateLimitedChatModel::new(m1, limiter.clone()));
+        let s2 = Arc::new(SharedRateLimitedChatModel::new(m2, limiter.clone()));
+        let started = std::time::Instant::now();
+        let mut handles = Vec::new();
+        for _ in 0..2 {
+            let s = s1.clone();
+            handles.push(tokio::spawn(async move {
+                s.invoke(vec![Message::user("hi")], &ChatOptions::default()).await
+            }));
+        }
+        for _ in 0..2 {
+            let s = s2.clone();
+            handles.push(tokio::spawn(async move {
+                s.invoke(vec![Message::user("hi")], &ChatOptions::default()).await
+            }));
+        }
+        for h in handles {
+            h.await.unwrap().unwrap();
+        }
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(30),
+            "shared budget didn't throttle: {elapsed:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_rate_limit_chat_serves_burst_immediately() {
+        // Capacity 4, refill 1/sec. Bursting 4 calls must NOT block.
+        let limiter = Arc::new(RateLimiter::new(4, 1));
+        let inner: Arc<dyn ChatModel> = Arc::new(AlwaysOkModel);
+        let s = Arc::new(SharedRateLimitedChatModel::new(inner, limiter));
+        let started = std::time::Instant::now();
+        for _ in 0..4 {
+            s.invoke(vec![Message::user("hi")], &ChatOptions::default())
+                .await
+                .unwrap();
+        }
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(50),
+            "burst was throttled: {elapsed:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_rate_limit_embed_query_and_documents_share_budget() {
+        // Bucket: capacity 1, refill 50/sec. Three calls
+        // (embed_query, embed_documents, embed_query) on the same
+        // wrapper must take >= 2 * 20ms.
+        let limiter = Arc::new(RateLimiter::new(1, 50));
+        let inner = flaky_embed(0, EmbedFlakyKind::Provider5xx, 3);
+        let s = Arc::new(SharedRateLimitedEmbeddings::new(
+            inner as Arc<dyn Embeddings>,
+            limiter,
+        ));
+        let started = std::time::Instant::now();
+        s.embed_query("a").await.unwrap();
+        s.embed_documents(&["x".into()]).await.unwrap();
+        s.embed_query("b").await.unwrap();
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(20),
+            "shared embed budget didn't throttle: {elapsed:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_rate_limit_chat_name_proxies_inner() {
+        let limiter = Arc::new(RateLimiter::new(10, 10));
+        let inner: Arc<dyn ChatModel> = Arc::new(AlwaysOkModel);
+        let s = SharedRateLimitedChatModel::new(inner, limiter);
+        assert_eq!(s.name(), "always-ok");
+    }
+
+    #[tokio::test]
+    async fn shared_rate_limit_embed_dimensions_proxy_inner() {
+        let limiter = Arc::new(RateLimiter::new(10, 10));
+        let inner = flaky_embed(0, EmbedFlakyKind::Provider5xx, 5);
+        let s = SharedRateLimitedEmbeddings::new(
+            inner as Arc<dyn Embeddings>,
+            limiter,
+        );
+        assert_eq!(s.dimensions(), 5);
+        assert_eq!(s.name(), "flaky-embed");
     }
 }
 
