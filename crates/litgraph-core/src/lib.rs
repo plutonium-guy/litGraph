@@ -29,6 +29,7 @@ pub mod skill_loader;
 pub mod trajectory;
 pub mod pairwise;
 pub mod eval_synth;
+pub mod tool_offload;
 
 pub use error::{Error, Result};
 pub use structured::StructuredChatModel;
@@ -62,6 +63,11 @@ pub use skill_loader::{load_agents_md, load_skills_dir, Skill, SystemPromptBuild
 pub use trajectory::{evaluate_trajectory, TrajectoryPolicy, TrajectoryStep};
 pub use pairwise::{PairwiseEvaluator, PairwiseResult, Winner};
 pub use eval_synth::{parse_synth_response, synthesize_eval_cases};
+pub use tool_offload::{
+    default_offload_dir, is_offloaded_marker, resolve_handle, FilesystemOffloadBackend,
+    InMemoryOffloadBackend, OffloadBackend, OffloadingTool, DEFAULT_PREVIEW_BYTES,
+    DEFAULT_THRESHOLD_BYTES,
+};
 pub use eval_harness::{
     run_eval, AggregateScores, ContainsAllScorer, EvalCase, EvalCaseResult, EvalDataset,
     EvalReport, ExactMatchScorer, JaccardScorer, LevenshteinScorer, LlmJudgeScorer, RegexScorer,

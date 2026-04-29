@@ -353,7 +353,7 @@ compression, tool-result offload, context quarantine.
 | Conversation compression middleware | Trim long context | ✅ `SummaryBufferMemory` + `MessageWindowMiddleware` |
 | `SystemPromptMiddleware` | Idempotent system prompt injection | ✅ |
 | `LoggingMiddleware` | `tracing` events around every call | ✅ |
-| Tool-result offload middleware | Push large outputs to filesystem/store | ❌ |
+| Tool-result offload middleware | Push large outputs to filesystem/store | ✅ `litgraph_core::OffloadingTool` wraps any `Tool`; oversized results go to `OffloadBackend` (in-memory or filesystem; pluggable trait). Returns a `{_offloaded, handle, size_bytes, preview, tool}` marker so the model still has context. `resolve_handle()` + `is_offloaded_marker()` for fetch-back; default 8 KiB threshold tunable per tool. |
 | Context quarantine (subagent) | Isolate sub-task context | 🟡 `SupervisorAgent` provides isolation |
 | Dynamic system prompt assembly | Per-call system-prompt builder | 🟡 `ChatPromptTemplate.compose` |
 
