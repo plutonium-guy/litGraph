@@ -219,6 +219,7 @@ patterns").
 | `ResumeRegistry` (iter 201) | `tokio::sync::oneshot` per thread id | Fourth channel shape in the lineage: oneshot signal (single-fire, single consumer). Foundation for the LangGraph interrupt-resume pattern — agent parks on `await_resume()`, an HTTP handler / Slack callback fires `resume(thread_id, value)` from anywhere |
 | `resume_router` (iter 202) | axum router over `ResumeRegistry` | Wire-protocol completion of iter 201: `POST /threads/:id/resume {value}` delivers, `DELETE /threads/:id/resume` cancels, `GET /resumes/pending` lists. Composes a coordination primitive into a real prod-ready HTTP feature in <100 LOC of glue |
 | `mmr_select` parallel (iter 203) | Rayon `par_iter` on per-candidate scoring | The greedy-pick outer loop stays sequential (each pick depends on prior picks); the per-iteration score loop is now Rayon-parallel — independent O(\|picked\|) cosine sims per candidate. Deterministic tie-break on lower index keeps parallel picks bit-identical to a sequential reference |
+| `embedding_redundant_filter` parallel (iter 204) | Rayon `par_iter::any` with short-circuit | Sibling pattern to iter 203: outer kept-list loop sequential, inner "is candidate similar to ANY kept doc?" probe parallelizes across cores via `any` (which short-circuits on first hit, just like the sequential `for ... break`). 3 cross-impl tests cover small / larger / threshold-extreme pools |
 
 ---
 

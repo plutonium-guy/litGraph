@@ -207,7 +207,7 @@ long-term Store. Older (v0.3) features rolled in from prior audit.
 | TimeWeightedRetriever | Recent docs first | ✅ |
 | HyDE retriever | Hypothetical doc embed | ✅ |
 | EnsembleRetriever | Weighted fusion | ✅ `litgraph_retrieval::EnsembleRetriever` — per-child weights, weighted RRF, `tokio::join_all` fan-out. Python: `litgraph.retrieval.EnsembleRetriever`. (iter 181) |
-| Doc transformers (MMR, redundant filter, long-context reorder) | Pre-LLM cleanup | ✅ |
+| Doc transformers (MMR, redundant filter, long-context reorder) | Pre-LLM cleanup | ✅ — `mmr_select` (iter 203) and `embedding_redundant_filter` (iter 204) both run Rayon-parallel on their per-candidate inner loops. The greedy outer loops stay sequential (algorithmically required); the parallel inner work scales linear-with-cores for big over-fetch pools. Both verified bit-identical to sequential reference. |
 
 ## 12. Vector Stores
 

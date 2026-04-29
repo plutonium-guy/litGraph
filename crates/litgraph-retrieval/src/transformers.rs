@@ -166,17 +166,17 @@ pub fn embedding_redundant_filter(
     );
     let mut kept_indices: Vec<usize> = Vec::new();
     for i in 0..candidates.len() {
-        let mut redundant = false;
-        for &j in &kept_indices {
+        // Parallel "is candidate `i` similar to ANY kept doc?" probe.
+        // Rayon's `par_iter().any()` stops as soon as any worker
+        // finds a hit — same short-circuit semantics as the
+        // sequential `for ... break`, just spread across cores.
+        // Empty `kept_indices` short-circuits to `false` instantly.
+        let redundant = kept_indices.par_iter().any(|&j| {
             if embeddings[i].len() != embeddings[j].len() {
-                continue;
+                return false;
             }
-            let sim = cosine_sim(&embeddings[i], &embeddings[j]);
-            if sim >= threshold {
-                redundant = true;
-                break;
-            }
-        }
+            cosine_sim(&embeddings[i], &embeddings[j]) >= threshold
+        });
         if !redundant {
             kept_indices.push(i);
         }
@@ -477,6 +477,94 @@ mod tests {
         let par = mmr_select(&q, &docs, &embs, 10, 0.6);
         let seq = mmr_select_sequential(&q, &docs, &embs, 10, 0.6);
         assert_eq!(ids(&par), ids(&seq));
+    }
+
+    /// Sequential reference for `embedding_redundant_filter`. Mirrors
+    /// the pre-iter-204 algorithm without Rayon.
+    fn redundant_filter_sequential(
+        candidates: &[Document],
+        embeddings: &[Vec<f32>],
+        threshold: f32,
+    ) -> Vec<Document> {
+        let mut kept_indices: Vec<usize> = Vec::new();
+        for i in 0..candidates.len() {
+            let mut redundant = false;
+            for &j in &kept_indices {
+                if embeddings[i].len() != embeddings[j].len() {
+                    continue;
+                }
+                let sim = cosine_sim(&embeddings[i], &embeddings[j]);
+                if sim >= threshold {
+                    redundant = true;
+                    break;
+                }
+            }
+            if !redundant {
+                kept_indices.push(i);
+            }
+        }
+        kept_indices.into_iter().map(|i| candidates[i].clone()).collect()
+    }
+
+    #[test]
+    fn parallel_redundant_filter_matches_sequential_on_small_pool() {
+        let docs: Vec<Document> = (0..12)
+            .map(|i| Document::new(format!("doc-{i}")))
+            .collect();
+        let embs: Vec<Vec<f32>> = (0..12)
+            .map(|i| {
+                let theta = (i as f32) * 0.5;
+                vec![theta.cos(), theta.sin()]
+            })
+            .collect();
+        let par = embedding_redundant_filter(&docs, &embs, 0.85);
+        let seq = redundant_filter_sequential(&docs, &embs, 0.85);
+        assert_eq!(ids(&par), ids(&seq));
+    }
+
+    #[test]
+    fn parallel_redundant_filter_matches_sequential_on_larger_pool() {
+        // 80 docs — enough to actually use multiple cores on the
+        // inner par_iter::any check.
+        let docs: Vec<Document> = (0..80)
+            .map(|i| Document::new(format!("d{i}")))
+            .collect();
+        let embs: Vec<Vec<f32>> = (0..80)
+            .map(|i| {
+                let a = ((i * 17 + 3) % 100) as f32 / 100.0;
+                let b = ((i * 23 + 7) % 100) as f32 / 100.0;
+                vec![a, b]
+            })
+            .collect();
+        for &threshold in &[0.5_f32, 0.85_f32, 0.99_f32] {
+            let par = embedding_redundant_filter(&docs, &embs, threshold);
+            let seq = redundant_filter_sequential(&docs, &embs, threshold);
+            assert_eq!(
+                ids(&par),
+                ids(&seq),
+                "threshold={threshold} mismatch"
+            );
+        }
+    }
+
+    #[test]
+    fn parallel_redundant_filter_threshold_extremes_match_sequential() {
+        // threshold=0.0 keeps only the first doc (everything else is
+        // redundant); threshold=1.0001 keeps everything (nothing
+        // crosses the bar). Both should match the sequential ref.
+        let docs: Vec<Document> = (0..6)
+            .map(|i| Document::new(format!("d{i}")))
+            .collect();
+        let embs: Vec<Vec<f32>> = (0..6).map(|_| vec![1.0, 0.0]).collect();
+        for &threshold in &[0.0_f32, 1.001_f32] {
+            let par = embedding_redundant_filter(&docs, &embs, threshold);
+            let seq = redundant_filter_sequential(&docs, &embs, threshold);
+            assert_eq!(
+                ids(&par),
+                ids(&seq),
+                "threshold={threshold} mismatch"
+            );
+        }
     }
 
     #[test]
