@@ -21,7 +21,126 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(default_prices, m)?)?;
     m.add_class::<PyProgress>()?;
     m.add_class::<PyProgressObserver>()?;
+    m.add_class::<PyResumeRegistry>()?;
     Ok(())
+}
+
+/// Pairs paused work with externally-signalable resume values via
+/// `tokio::sync::oneshot`. Foundation for the LangGraph
+/// interrupt-resume pattern: an agent thread parks on a resume,
+/// some external event (Slack click, webhook callback, human
+/// approval) signals it with a JSON payload.
+///
+/// Each thread id may be registered at most once at a time. Resume
+/// without a pending registration is an error; double-resume of a
+/// single id is also an error (the second resume sees no
+/// registration). Cancel cleanly resolves the waiting side with
+/// `None`.
+///
+/// ```python
+/// from litgraph.observability import ResumeRegistry
+/// reg = ResumeRegistry()
+/// # In an agent loop:
+/// fut = reg.register("thread-42")
+/// # ... agent parks on fut.await_resume() ...
+/// # Meanwhile in an HTTP handler:
+/// reg.resume("thread-42", {"approve": True})
+/// # The agent's await_resume() returns {"approve": True}.
+/// ```
+#[pyclass(name = "ResumeRegistry", module = "litgraph.observability")]
+pub struct PyResumeRegistry {
+    inner: litgraph_core::ResumeRegistry,
+}
+
+#[pymethods]
+impl PyResumeRegistry {
+    #[new]
+    fn new() -> Self {
+        Self {
+            inner: litgraph_core::ResumeRegistry::new(),
+        }
+    }
+
+    /// Register a thread expecting a resume. Returns a future
+    /// (PyResumeFuture) whose `await_resume()` blocks until the
+    /// resume arrives or the wait is cancelled.
+    fn register(&self, thread_id: String) -> PyResult<PyResumeFuture> {
+        let fut = self
+            .inner
+            .register(&thread_id)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        Ok(PyResumeFuture {
+            inner: std::sync::Mutex::new(Some(fut)),
+        })
+    }
+
+    /// Deliver a resume value (any JSON-serializable object) to the
+    /// thread that registered for `thread_id`. Raises if no thread
+    /// is currently registered for that id.
+    fn resume(&self, thread_id: String, value: Bound<'_, PyAny>) -> PyResult<()> {
+        let v = crate::graph::py_to_json(value.py(), &value)?;
+        self.inner
+            .resume(&thread_id, v)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// Cancel a pending resume. Returns True if a pending entry was
+    /// removed, False if no thread was registered.
+    fn cancel(&self, thread_id: String) -> bool {
+        self.inner.cancel(&thread_id)
+    }
+
+    /// Number of currently-pending threads.
+    fn pending_count(&self) -> usize {
+        self.inner.pending_count()
+    }
+
+    /// Snapshot of pending thread ids — handy for admin UIs.
+    fn pending_ids(&self) -> Vec<String> {
+        self.inner.pending_ids()
+    }
+
+    fn __repr__(&self) -> String {
+        format!("ResumeRegistry(pending={})", self.inner.pending_count())
+    }
+}
+
+/// Future returned by `ResumeRegistry.register`. Call
+/// `.await_resume()` to block until the resume value arrives;
+/// returns `None` on cancel or registry-side drop.
+#[pyclass(name = "ResumeFuture", module = "litgraph.observability")]
+pub struct PyResumeFuture {
+    inner: std::sync::Mutex<Option<litgraph_core::ResumeFuture>>,
+}
+
+#[pymethods]
+impl PyResumeFuture {
+    /// Block until the resume value arrives (returned as a Python
+    /// object) or the wait is cancelled (returns None). May only be
+    /// called once per future.
+    fn await_resume<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyAny>>> {
+        let mut guard = self.inner.lock().expect("poisoned");
+        let Some(fut) = guard.take() else {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "await_resume can only be called once",
+            ));
+        };
+        drop(guard);
+        let got = py.allow_threads(|| {
+            crate::runtime::block_on_compat(async {
+                Ok::<_, litgraph_core::Error>(fut.await_resume().await)
+            })
+            .unwrap_or(None)
+        });
+        match got {
+            Some(v) => Ok(Some(crate::graph::json_to_py(py, &v)?)),
+            None => Ok(None),
+        }
+    }
+
+    fn __repr__(&self) -> String {
+        "ResumeFuture()".into()
+    }
 }
 
 /// Latest-value progress observable, backed by `tokio::sync::watch`.

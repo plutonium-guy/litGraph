@@ -40,6 +40,7 @@ pub mod semantic_store;
 pub mod stream_multiplex;
 pub mod stream_broadcast;
 pub mod progress;
+pub mod resume_registry;
 pub mod tool_dispatch;
 pub mod table_parser;
 
@@ -98,6 +99,7 @@ pub use stream_broadcast::{
     BroadcastSubscriberStream,
 };
 pub use progress::{Progress, ProgressObserver};
+pub use resume_registry::{ResumeFuture, ResumeRegistry};
 pub use tool_dispatch::{tool_dispatch_concurrent, tool_dispatch_concurrent_fail_fast};
 pub use table_parser::{
     format_instructions as table_format_instructions, parse_table_csv, parse_table_json,
