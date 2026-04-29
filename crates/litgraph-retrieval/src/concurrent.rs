@@ -253,6 +253,83 @@ pub fn retrieve_concurrent_stream(
     Box::pin(ReceiverStream::new(rx))
 }
 
+/// Combined streaming + progress-watcher variant. Yields the same
+/// `(query_idx, Result)` items as [`retrieve_concurrent_stream`]
+/// AND updates the supplied [`Progress<RetrieveProgress>`] watcher
+/// as each query completes.
+///
+/// Real prod use: an eval harness UI rendering a row per query as
+/// it lands (stream side) AND a summary progress bar with `{total,
+/// completed, docs_returned, errors}` (watcher side), both backed
+/// by the same retriever fan-out.
+///
+/// Composition: extends the combined consumer shape from iters
+/// 216 (chat batch) and 217 (embed batch) to the retriever axis.
+/// Same consistency contract — counter ticks before stream item.
+pub fn retrieve_concurrent_stream_with_progress(
+    retriever: Arc<dyn Retriever>,
+    queries: Vec<String>,
+    k: usize,
+    max_concurrency: usize,
+    progress: Progress<RetrieveProgress>,
+) -> Pin<Box<dyn Stream<Item = RetrieveStreamItem> + Send>> {
+    if queries.is_empty() {
+        return Box::pin(futures::stream::empty());
+    }
+    let total = queries.len() as u64;
+    let _ = progress.update(|p| RetrieveProgress {
+        total,
+        ..p.clone()
+    });
+
+    let cap = max_concurrency.max(1);
+    let n = queries.len();
+    let buf = n.min(cap.max(8));
+    let (tx, rx) = mpsc::channel::<RetrieveStreamItem>(buf);
+
+    tokio::spawn(async move {
+        let sem = Arc::new(Semaphore::new(cap));
+        let mut set: JoinSet<RetrieveStreamItem> = JoinSet::new();
+        for (idx, q) in queries.into_iter().enumerate() {
+            let sem = sem.clone();
+            let retriever = retriever.clone();
+            set.spawn(async move {
+                let _permit = match sem.acquire_owned().await {
+                    Ok(p) => p,
+                    Err(_) => return (idx, Err(Error::other("retrieve semaphore closed"))),
+                };
+                let r = retriever.retrieve(&q, k).await;
+                (idx, r)
+            });
+        }
+        while let Some(joined) = set.join_next().await {
+            let item = match joined {
+                Ok(it) => it,
+                Err(e) => (
+                    usize::MAX,
+                    Err(Error::other(format!("retrieve task join: {e}"))),
+                ),
+            };
+            let (n_docs, is_err) = match &item.1 {
+                Ok(docs) => (docs.len() as u64, false),
+                Err(_) => (0, true),
+            };
+            let _ = progress.update(|p| RetrieveProgress {
+                completed: p.completed + 1,
+                docs_returned: p.docs_returned + n_docs,
+                errors: p.errors + if is_err { 1 } else { 0 },
+                ..p.clone()
+            });
+            if tx.send(item).await.is_err() {
+                set.abort_all();
+                break;
+            }
+        }
+    });
+
+    Box::pin(ReceiverStream::new(rx))
+}
+
 /// Like `retrieve_concurrent` but fail-fast: returns `Err` on the
 /// first failed query and aborts the rest. Outputs are aligned to
 /// inputs only on success.
@@ -476,6 +553,95 @@ mod tests {
     // ---- retrieve_concurrent_stream tests -----------------------------
 
     use futures::StreamExt;
+
+    // ---- retrieve_concurrent_stream_with_progress tests ---------------
+
+    #[tokio::test]
+    async fn stream_with_progress_yields_items_and_advances_counters() {
+        let (r, _peak) = probe(2);
+        let progress = Progress::new(RetrieveProgress::default());
+        let obs = progress.observer();
+        let mut s = retrieve_concurrent_stream_with_progress(
+            r, qs(6), 1, 4, progress,
+        );
+        let mut count = 0;
+        while let Some((_idx, res)) = s.next().await {
+            assert!(res.is_ok());
+            count += 1;
+        }
+        assert_eq!(count, 6);
+        let snap = obs.snapshot();
+        assert_eq!(snap.total, 6);
+        assert_eq!(snap.completed, 6);
+        assert_eq!(snap.docs_returned, 6);
+        assert_eq!(snap.errors, 0);
+    }
+
+    #[tokio::test]
+    async fn stream_with_progress_records_per_query_errors() {
+        struct FailOnQ {
+            bad: String,
+        }
+        #[async_trait::async_trait]
+        impl Retriever for FailOnQ {
+            async fn retrieve(
+                &self,
+                query: &str,
+                _k: usize,
+            ) -> Result<Vec<Document>> {
+                if query == self.bad {
+                    Err(Error::other("synthetic"))
+                } else {
+                    Ok(vec![Document::new(query)])
+                }
+            }
+        }
+        let r: Arc<dyn Retriever> = Arc::new(FailOnQ {
+            bad: "q2".into(),
+        });
+        let progress = Progress::new(RetrieveProgress::default());
+        let obs = progress.observer();
+        let mut s = retrieve_concurrent_stream_with_progress(
+            r, qs(5), 1, 4, progress,
+        );
+        let mut errors_in_stream = 0;
+        while let Some((_idx, res)) = s.next().await {
+            if res.is_err() {
+                errors_in_stream += 1;
+            }
+        }
+        let snap = obs.snapshot();
+        assert_eq!(snap.completed, 5);
+        assert_eq!(snap.errors, 1);
+        assert_eq!(errors_in_stream, snap.errors as usize);
+    }
+
+    #[tokio::test]
+    async fn stream_with_progress_total_set_at_start() {
+        let (r, _peak) = probe(0);
+        let progress = Progress::new(RetrieveProgress::default());
+        let obs = progress.observer();
+        let _s = retrieve_concurrent_stream_with_progress(
+            r, qs(7), 1, 2, progress,
+        );
+        assert_eq!(obs.snapshot().total, 7);
+    }
+
+    #[tokio::test]
+    async fn stream_with_progress_empty_queries_no_updates() {
+        let (r, _peak) = probe(0);
+        let progress = Progress::new(RetrieveProgress::default());
+        let obs = progress.observer();
+        let mut s = retrieve_concurrent_stream_with_progress(
+            r,
+            vec![],
+            5,
+            4,
+            progress,
+        );
+        assert!(s.next().await.is_none());
+        assert_eq!(obs.snapshot(), RetrieveProgress::default());
+    }
 
     #[tokio::test]
     async fn stream_yields_one_item_per_query() {
