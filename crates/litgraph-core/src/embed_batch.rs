@@ -37,10 +37,11 @@
 
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
-use crate::{Embeddings, Error, Result};
+use crate::{Embeddings, Error, Progress, Result};
 
 /// Default chunk size — sized for OpenAI's per-request input cap with
 /// generous headroom. Override per-call if your provider is stricter
@@ -107,6 +108,140 @@ pub async fn embed_documents_concurrent(
     if out.len() != texts.len() {
         return Err(Error::other(format!(
             "embed_documents_concurrent: expected {} embeddings, got {}",
+            texts.len(),
+            out.len(),
+        )));
+    }
+    Ok(out)
+}
+
+/// Counters maintained by [`embed_documents_concurrent_with_progress`].
+/// All fields monotonic. Snapshot from any
+/// [`Progress<EmbedProgress>`] observer to drive a progress bar over
+/// a long-running ingestion.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EmbedProgress {
+    /// Total texts submitted (set once on entry).
+    pub total_texts: u64,
+    /// Total chunks the input was split into (set once on entry).
+    pub total_chunks: u64,
+    /// Chunks whose embed call has finished, success or failure.
+    pub completed_chunks: u64,
+    /// Texts successfully embedded (sum of completed chunks' lengths).
+    pub completed_texts: u64,
+    /// Subset of `completed_chunks` that returned `Err`.
+    pub errors: u64,
+}
+
+/// Same as [`embed_documents_concurrent`] but updates `progress` as
+/// each chunk completes. Real use case: a 100k-text bulk indexing
+/// run rendering a tqdm-style counter / ETA.
+///
+/// Composition: third progress-aware sibling after iter 200's
+/// `ingest_to_stream_with_progress` and iter 205's
+/// `batch_concurrent_with_progress`. Same shape, different domain
+/// (Embeddings batch).
+///
+/// Failure semantics inherit from [`embed_documents_concurrent`]:
+/// fail-fast on any chunk error. The `errors` counter still ticks
+/// before the call returns `Err`, so observers see the bad chunk's
+/// failure even though the result is `Err(_)` overall.
+pub async fn embed_documents_concurrent_with_progress(
+    embedder: Arc<dyn Embeddings>,
+    texts: &[String],
+    chunk_size: usize,
+    max_concurrency: usize,
+    progress: Progress<EmbedProgress>,
+) -> Result<Vec<Vec<f32>>> {
+    if texts.is_empty() {
+        return Ok(Vec::new());
+    }
+    let cap = max_concurrency.max(1);
+    let chunk = if chunk_size == 0 { texts.len() } else { chunk_size };
+    let total_chunks = texts.chunks(chunk).count() as u64;
+
+    // Set totals up front so observers see run shape before any
+    // chunk completion arrives.
+    let total_texts = texts.len() as u64;
+    let _ = progress.update(|p| EmbedProgress {
+        total_texts,
+        total_chunks,
+        ..p.clone()
+    });
+
+    let sem = Arc::new(Semaphore::new(cap));
+    let mut set: JoinSet<(usize, usize, Result<Vec<Vec<f32>>>)> = JoinSet::new();
+
+    for (idx, slice) in texts.chunks(chunk).enumerate() {
+        let sem = sem.clone();
+        let embedder = embedder.clone();
+        let owned: Vec<String> = slice.to_vec();
+        let chunk_len = owned.len();
+        set.spawn(async move {
+            let _permit = match sem.acquire_owned().await {
+                Ok(p) => p,
+                Err(_) => {
+                    return (
+                        idx,
+                        chunk_len,
+                        Err(Error::other("embed semaphore closed")),
+                    )
+                }
+            };
+            let r = embedder.embed_documents(&owned).await;
+            (idx, chunk_len, r)
+        });
+    }
+
+    let n_chunks = set.len();
+    let mut chunks: Vec<Option<Vec<Vec<f32>>>> = (0..n_chunks).map(|_| None).collect();
+    let mut first_err: Option<Error> = None;
+
+    while let Some(joined) = set.join_next().await {
+        match joined {
+            Ok((idx, chunk_len, Ok(v))) => {
+                chunks[idx] = Some(v);
+                let _ = progress.update(|p| EmbedProgress {
+                    completed_chunks: p.completed_chunks + 1,
+                    completed_texts: p.completed_texts + chunk_len as u64,
+                    ..p.clone()
+                });
+            }
+            Ok((_, _chunk_len, Err(e))) => {
+                let _ = progress.update(|p| EmbedProgress {
+                    completed_chunks: p.completed_chunks + 1,
+                    errors: p.errors + 1,
+                    ..p.clone()
+                });
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+            }
+            Err(e) => {
+                let _ = progress.update(|p| EmbedProgress {
+                    completed_chunks: p.completed_chunks + 1,
+                    errors: p.errors + 1,
+                    ..p.clone()
+                });
+                if first_err.is_none() {
+                    first_err = Some(Error::other(format!("embed task join: {e}")));
+                }
+            }
+        }
+    }
+
+    if let Some(e) = first_err {
+        return Err(e);
+    }
+
+    let mut out: Vec<Vec<f32>> = Vec::with_capacity(texts.len());
+    for c in chunks.into_iter() {
+        let v = c.ok_or_else(|| Error::other("embed chunk lost"))?;
+        out.extend(v);
+    }
+    if out.len() != texts.len() {
+        return Err(Error::other(format!(
+            "embed_documents_concurrent_with_progress: expected {} embeddings, got {}",
             texts.len(),
             out.len(),
         )));
@@ -282,5 +417,100 @@ mod tests {
         embed_documents_concurrent(e, &texts, 1000, 4).await.unwrap();
         let sizes = seen.lock().unwrap().clone();
         assert_eq!(sizes, vec![3]);
+    }
+
+    // ---- embed_documents_concurrent_with_progress tests ----------------
+
+    #[tokio::test]
+    async fn progress_totals_set_at_start() {
+        let (e, _peak, _seen) = probe(0);
+        let texts = ts(11); // chunk_size=4 → 3 chunks
+        let progress = Progress::new(EmbedProgress::default());
+        let obs = progress.observer();
+        let _ = embed_documents_concurrent_with_progress(e, &texts, 4, 4, progress)
+            .await
+            .unwrap();
+        let snap = obs.snapshot();
+        assert_eq!(snap.total_texts, 11);
+        assert_eq!(snap.total_chunks, 3);
+        assert_eq!(snap.completed_chunks, 3);
+        assert_eq!(snap.completed_texts, 11);
+        assert_eq!(snap.errors, 0);
+    }
+
+    #[tokio::test]
+    async fn progress_records_chunk_failure() {
+        struct FailEmbed {
+            seen: Arc<AtomicUsize>,
+            fail_on: usize,
+        }
+        #[async_trait]
+        impl Embeddings for FailEmbed {
+            fn name(&self) -> &str {
+                "fail"
+            }
+            fn dimensions(&self) -> usize {
+                1
+            }
+            async fn embed_query(&self, _t: &str) -> Result<Vec<f32>> {
+                Ok(vec![0.0])
+            }
+            async fn embed_documents(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+                let n = self.seen.fetch_add(1, Ordering::SeqCst);
+                if n == self.fail_on {
+                    return Err(Error::other("synthetic"));
+                }
+                Ok(texts.iter().map(|_| vec![0.0]).collect())
+            }
+        }
+        let e: Arc<dyn Embeddings> = Arc::new(FailEmbed {
+            seen: Arc::new(AtomicUsize::new(0)),
+            fail_on: 1,
+        });
+        let texts = ts(15); // 3 chunks of 5
+        let progress = Progress::new(EmbedProgress::default());
+        let obs = progress.observer();
+        let r = embed_documents_concurrent_with_progress(e, &texts, 5, 1, progress).await;
+        assert!(r.is_err());
+        let snap = obs.snapshot();
+        assert_eq!(snap.total_chunks, 3);
+        // Failed chunk still increments completed_chunks; errors=1.
+        assert!(snap.errors >= 1);
+    }
+
+    #[tokio::test]
+    async fn progress_observer_polls_mid_run() {
+        let (e, _peak, _seen) = probe(15);
+        let texts = ts(20); // chunk=4 → 5 chunks; with delay we see partial.
+        let progress = Progress::new(EmbedProgress::default());
+        let mut obs = progress.observer();
+        // Spawn into an owning closure so the borrowed `&[String]`
+        // arg lives long enough for the spawned task.
+        let progress_clone = progress.clone();
+        let h = tokio::spawn(async move {
+            embed_documents_concurrent_with_progress(e, &texts, 4, 2, progress_clone)
+                .await
+        });
+        // Wait for any progress update.
+        let _ = obs.changed().await;
+        let mid = obs.snapshot();
+        assert_eq!(mid.total_texts, 20);
+        assert_eq!(mid.total_chunks, 5);
+        let _ = h.await.unwrap().unwrap();
+        let snap = obs.snapshot();
+        assert_eq!(snap.completed_chunks, 5);
+        assert_eq!(snap.completed_texts, 20);
+    }
+
+    #[tokio::test]
+    async fn progress_empty_texts_no_updates() {
+        let (e, _peak, _seen) = probe(0);
+        let progress = Progress::new(EmbedProgress::default());
+        let obs = progress.observer();
+        let out = embed_documents_concurrent_with_progress(e, &[], 4, 4, progress)
+            .await
+            .unwrap();
+        assert!(out.is_empty());
+        assert_eq!(obs.snapshot(), EmbedProgress::default());
     }
 }

@@ -92,7 +92,8 @@ pub use batch::{
     batch_concurrent, batch_concurrent_fail_fast, batch_concurrent_with_progress, BatchProgress,
 };
 pub use embed_batch::{
-    embed_documents_concurrent, DEFAULT_EMBED_CHUNK_SIZE, DEFAULT_EMBED_CONCURRENCY,
+    embed_documents_concurrent, embed_documents_concurrent_with_progress, EmbedProgress,
+    DEFAULT_EMBED_CHUNK_SIZE, DEFAULT_EMBED_CONCURRENCY,
 };
 pub use semantic_store::{SemanticHit, SemanticStore};
 pub use stream_multiplex::{multiplex_chat_streams, MultiplexEvent, MultiplexStream};
