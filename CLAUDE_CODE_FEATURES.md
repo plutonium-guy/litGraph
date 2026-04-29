@@ -53,6 +53,7 @@ long-term Store. Older (v0.3) features rolled in from prior audit.
 | Race / hedged requests | Latency-min: A and B in parallel, first wins | ✅ `litgraph_resilience::RaceChatModel` — Tokio `JoinSet` + `abort_all` cancels losers as soon as a winner emerges; aggregates errors only if every inner fails. Python: `litgraph.providers.RaceChat(models)`. (iter 184) |
 | Multiplexed live streaming | Render N model token streams side-by-side | ✅ `litgraph_core::multiplex_chat_streams` — Tokio `mpsc` channel-fan-in; per-event `model_label` tag; one slow / failing model never blocks the others. Python: `litgraph.agents.multiplex_chat_streams(models, messages)`. (iter 189) |
 | Embeddings race / hedged requests | Tail-latency cut on the embed-query critical path | ✅ `litgraph_resilience::RaceEmbeddings` — Tokio `JoinSet` + `abort_all`; first success wins, losers cancelled; dim-mismatch rejected at construction. Python: `litgraph.embeddings.RaceEmbeddings(providers)`. (iter 192) |
+| Retriever race / hedged requests | Hedge fast cache vs slow primary | ✅ `litgraph_retrieval::RaceRetriever` — Tokio `JoinSet` + `abort_all` over N retrievers; first success wins, losers cancelled. Use for **latency** (vs `EnsembleRetriever` for **quality**). Python: `litgraph.retrieval.RaceRetriever(children)`. (iter 193) |
 | Token budget guard | Stop runaway prompts | ✅ `TokenBudgetChatModel` |
 | Cost cap | Hard $ ceiling per run | ✅ `CostCappedChatModel` |
 | PII scrubber (input/output) | Compliance | ✅ `PiiScrubbingChatModel` |

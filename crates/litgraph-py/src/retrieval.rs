@@ -10,7 +10,7 @@ use litgraph_retrieval::{
     retrieve_concurrent, EmbeddingsFilterCompressor, EnsembleReranker, EnsembleRetriever,
     HybridRetriever, LlmExtractCompressor, MemoryDocStore, HydeRetriever,
     MaxMarginalRelevanceRetriever, MultiQueryRetriever, MultiVectorItem, MultiVectorRetriever,
-    ParentDocumentRetriever,
+    ParentDocumentRetriever, RaceRetriever,
     PipelineCompressor, Reranker,
     RerankingRetriever, Retriever, SelfQueryRetriever, TimeWeightedRetriever, VectorRetriever,
 };
@@ -50,6 +50,7 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyRerankingRetriever>()?;
     m.add_class::<PyHybridRetriever>()?;
     m.add_class::<PyEnsembleRetriever>()?;
+    m.add_class::<PyRaceRetriever>()?;
     m.add_class::<PyParentDocumentRetriever>()?;
     m.add_class::<PyMultiVectorRetriever>()?;
     m.add_class::<PyMemoryDocStore>()?;
@@ -2500,6 +2501,76 @@ impl PyMaxMarginalRelevanceRetriever {
     }
 }
 
+// ---------- RaceRetriever (iter 193) ----------
+
+/// Race N retrievers concurrently — first success wins, the rest
+/// are aborted. Distinct from `EnsembleRetriever`, which waits for
+/// every child and fuses results via weighted RRF.
+///
+/// Use `EnsembleRetriever` for **quality** (multiple sources
+/// fused). Use `RaceRetriever` for **latency** — hedge a fast cache
+/// retriever against a slow authoritative one and take whichever
+/// returns first. All inner retrievers are issued requests at the
+/// same instant.
+///
+/// ```python
+/// from litgraph.retrieval import (
+///     Bm25Index, MemoryVectorStore, VectorRetriever, RaceRetriever,
+/// )
+/// fast = Bm25Index()           # microseconds, in-process
+/// fast.add(docs)
+/// slow = VectorRetriever(...)  # tens of ms, remote vector DB
+/// race = RaceRetriever([fast, slow])
+/// hits = race.retrieve("query", k=5)  # whichever finishes first wins
+/// ```
+#[pyclass(name = "RaceRetriever", module = "litgraph.retrieval")]
+pub struct PyRaceRetriever {
+    pub(crate) inner: Arc<RaceRetriever>,
+}
+
+impl PyRaceRetriever {
+    pub(crate) fn as_retriever(&self) -> Arc<dyn Retriever> {
+        self.inner.clone() as Arc<dyn Retriever>
+    }
+}
+
+#[pymethods]
+impl PyRaceRetriever {
+    #[new]
+    fn new(children: Bound<'_, PyList>) -> PyResult<Self> {
+        if children.is_empty() {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "RaceRetriever needs at least one child",
+            ));
+        }
+        let mut child_arcs: Vec<Arc<dyn Retriever>> = Vec::with_capacity(children.len());
+        for item in children.iter() {
+            child_arcs.push(extract_retriever_arc(&item)?);
+        }
+        Ok(Self {
+            inner: Arc::new(RaceRetriever::new(child_arcs)),
+        })
+    }
+
+    fn retrieve<'py>(
+        &self,
+        py: Python<'py>,
+        query: String,
+        k: usize,
+    ) -> PyResult<Bound<'py, PyList>> {
+        let r = self.inner.clone();
+        let docs = py.allow_threads(move || {
+            block_on_compat(async move { r.retrieve(&query, k).await })
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })?;
+        docs_to_pylist(py, docs)
+    }
+
+    fn __repr__(&self) -> String {
+        format!("RaceRetriever(children={})", self.inner.inners.len())
+    }
+}
+
 // ---------- retrieve_concurrent (iter 190) ----------
 
 /// Extract an `Arc<dyn Retriever>` from any of the supported py
@@ -2527,9 +2598,12 @@ fn extract_retriever_arc(item: &Bound<'_, PyAny>) -> PyResult<Arc<dyn Retriever>
     if let Ok(m) = item.extract::<PyRef<PyMultiVectorRetriever>>() {
         return Ok(m.as_retriever());
     }
+    if let Ok(rc) = item.extract::<PyRef<PyRaceRetriever>>() {
+        return Ok(rc.as_retriever());
+    }
     Err(pyo3::exceptions::PyTypeError::new_err(
         "retriever must be VectorRetriever, Bm25Index, RerankingRetriever, HybridRetriever, \
-         EnsembleRetriever, ParentDocumentRetriever, or MultiVectorRetriever",
+         EnsembleRetriever, ParentDocumentRetriever, MultiVectorRetriever, or RaceRetriever",
     ))
 }
 

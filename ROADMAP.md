@@ -207,6 +207,7 @@ patterns").
 | `retrieve_concurrent` (iter 190) | Tokio `JoinSet` + `Semaphore` over `Retriever::retrieve` | Completes the parallel-batch trio (`batch_concurrent`/`embed_documents_concurrent`/this). Same retriever, N caller queries — eval / agentic batch path |
 | `tool_dispatch_concurrent` (iter 191) | Tokio `JoinSet` + `Semaphore` over heterogeneous `Tool::run` | Fourth in the parallel-batch family — different topology (HashMap router, heterogeneous tools per call). Standalone helper for Plan-and-Execute and custom orchestrators outside the React loop |
 | `RaceEmbeddings` (iter 192) | Tokio `JoinSet` + `abort_all` over `Embeddings` | Embeddings analogue of iter 184 `RaceChatModel`. Hedge OpenAI / Voyage / local fastembed for tail-latency cuts on the embed-query critical path |
+| `RaceRetriever` (iter 193) | Tokio `JoinSet` + `abort_all` over `Retriever` | Completes the race trio across the read-side traits (Chat/Embeddings/Retriever). Hedge a fast cache against a slow primary for latency-min retrieval; vs `EnsembleRetriever` which fuses for quality |
 
 ---
 
