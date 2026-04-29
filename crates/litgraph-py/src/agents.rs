@@ -44,7 +44,111 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(batch_chat, m)?)?;
     m.add_class::<PyMultiplexStream>()?;
     m.add_function(wrap_pyfunction!(multiplex_chat_streams, m)?)?;
+    m.add_function(wrap_pyfunction!(py_tool_dispatch_concurrent, m)?)?;
     Ok(())
+}
+
+/// Run N tool calls concurrently, capped at `max_concurrency` in
+/// flight. Each call routes to a tool by name and gets its own
+/// `Result` slot — a failed or unknown-tool call doesn't tank the
+/// rest by default. Pass `fail_fast=True` to raise on the first
+/// error instead.
+///
+/// `tools` is a list of any registered tool pyclass (the same set
+/// `ReactAgent` accepts). `calls` is a list of `{"name", "args"}`
+/// dicts (or `(name, args)` tuples) — one per intended invocation.
+/// Output is aligned 1:1 with `calls`: each slot is either the
+/// tool's JSON result or, on per-call failure (fail_fast=False), a
+/// dict `{"error": "..."}`.
+///
+/// Useful outside the React agent loop — Plan-and-Execute style
+/// orchestrators, custom batch-tool drivers, eval harnesses.
+///
+/// ```python
+/// from litgraph.tools import CalculatorTool, HttpRequestTool
+/// from litgraph.agents import tool_dispatch_concurrent
+/// tools = [CalculatorTool(), HttpRequestTool()]
+/// calls = [
+///     {"name": "calculator", "args": {"expr": "1+1"}},
+///     {"name": "http_request", "args": {"url": "https://api.example.com/x"}},
+/// ]
+/// results = tool_dispatch_concurrent(tools, calls, max_concurrency=4)
+/// ```
+#[pyfunction]
+#[pyo3(name = "tool_dispatch_concurrent", signature = (tools, calls, max_concurrency=8, fail_fast=false))]
+fn py_tool_dispatch_concurrent<'py>(
+    py: Python<'py>,
+    tools: Bound<'py, PyList>,
+    calls: Bound<'py, PyList>,
+    max_concurrency: usize,
+    fail_fast: bool,
+) -> PyResult<Bound<'py, PyList>> {
+    let tool_vec = extract_tools(&tools)?;
+    let mut registry: HashMap<String, Arc<dyn litgraph_core::tool::Tool>> = HashMap::new();
+    for t in tool_vec {
+        registry.insert(t.name(), t);
+    }
+
+    let mut parsed_calls: Vec<(String, serde_json::Value)> = Vec::with_capacity(calls.len());
+    for item in calls.iter() {
+        // Accept either (name, args) tuple OR {"name", "args"} dict.
+        let (name, args): (String, serde_json::Value) =
+            if let Ok(t) = item.downcast::<pyo3::types::PyTuple>() {
+                if t.len() != 2 {
+                    return Err(PyValueError::new_err(
+                        "tuple call must be (name, args)",
+                    ));
+                }
+                let name: String = t.get_item(0)?.extract()?;
+                let args = crate::graph::py_to_json(t.py(), &t.get_item(1)?)?;
+                (name, args)
+            } else if let Ok(d) = item.downcast::<PyDict>() {
+                let name: String = d
+                    .get_item("name")?
+                    .ok_or_else(|| PyValueError::new_err("missing 'name'"))?
+                    .extract()?;
+                let args = match d.get_item("args")? {
+                    Some(v) => crate::graph::py_to_json(d.py(), &v)?,
+                    None => serde_json::Value::Object(serde_json::Map::new()),
+                };
+                (name, args)
+            } else {
+                return Err(PyValueError::new_err(
+                    "each call must be a (name, args) tuple or a {name, args} dict",
+                ));
+            };
+        parsed_calls.push((name, args));
+    }
+
+    let results = py.allow_threads(|| {
+        block_on_compat(async move {
+            Ok::<_, litgraph_core::Error>(
+                litgraph_core::tool_dispatch_concurrent(
+                    registry,
+                    parsed_calls,
+                    max_concurrency,
+                )
+                .await,
+            )
+        })
+        .map_err(|e: litgraph_core::Error| PyRuntimeError::new_err(e.to_string()))
+    })?;
+
+    let out = PyList::empty_bound(py);
+    for r in results {
+        match r {
+            Ok(v) => out.append(crate::graph::json_to_py(py, &v)?)?,
+            Err(e) => {
+                if fail_fast {
+                    return Err(PyRuntimeError::new_err(e.to_string()));
+                }
+                let d = PyDict::new_bound(py);
+                d.set_item("error", e.to_string())?;
+                out.append(d)?;
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Run N chat-model streams concurrently, fan-in token deltas via a

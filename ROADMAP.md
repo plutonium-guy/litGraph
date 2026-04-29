@@ -205,6 +205,7 @@ patterns").
 | `MultiVectorRetriever` (iter 188) | composes `embed_documents_concurrent` | Indexing N perspectives per parent uses chunked Tokio fan-out from iter 183. Retrieval dedups by parent_id in linear time |
 | `multiplex_chat_streams` (iter 189) | `tokio::mpsc` channel-fan-in | Per-stream task forwards events into a shared channel; outer Stream drains in arrival order. First channel-based primitive — distinct from JoinSet/Semaphore lineage; one slow/failing stream never stalls peers |
 | `retrieve_concurrent` (iter 190) | Tokio `JoinSet` + `Semaphore` over `Retriever::retrieve` | Completes the parallel-batch trio (`batch_concurrent`/`embed_documents_concurrent`/this). Same retriever, N caller queries — eval / agentic batch path |
+| `tool_dispatch_concurrent` (iter 191) | Tokio `JoinSet` + `Semaphore` over heterogeneous `Tool::run` | Fourth in the parallel-batch family — different topology (HashMap router, heterogeneous tools per call). Standalone helper for Plan-and-Execute and custom orchestrators outside the React loop |
 
 ---
 

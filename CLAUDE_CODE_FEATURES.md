@@ -233,6 +233,7 @@ long-term Store. Older (v0.3) features rolled in from prior audit.
 | Embedding retry/fallback | Prod | ✅ |
 | Bounded-concurrency embed batch | Bulk ingestion | ✅ `litgraph_core::embed_documents_concurrent` — chunk-and-fan-out over Tokio + Semaphore, order-preserving, fail-fast. Python: `litgraph.embeddings.embed_documents_concurrent(emb, texts, chunk_size, max_concurrency)`. (iter 183) |
 | Bounded-concurrency retrieval batch | Eval / agentic many-query flows | ✅ `litgraph_retrieval::retrieve_concurrent` (+ `_fail_fast`) — Tokio Semaphore-bounded fan-out of `Retriever::retrieve` over N caller queries against ONE retriever; aligned output, per-query `Result`. Python: `litgraph.retrieval.retrieve_concurrent(retriever, queries, k, max_concurrency, fail_fast=False)`. (iter 190) |
+| Bounded-concurrency tool dispatch | Plan-and-Execute / orchestrators outside React loop | ✅ `litgraph_core::tool_dispatch_concurrent` (+ `_fail_fast`) — heterogeneous `(tool, args)` calls fan out under Semaphore; aligned output, per-call `Result`, unknown-tool errors isolated. Python: `litgraph.agents.tool_dispatch_concurrent(tools, calls, max_concurrency, fail_fast=False)`. (iter 191) |
 | Zero-copy numpy interop | Speed | ✅ rust-numpy |
 
 ## 14. Document Loaders
