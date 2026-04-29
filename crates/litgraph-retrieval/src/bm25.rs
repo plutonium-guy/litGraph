@@ -55,19 +55,56 @@ impl Bm25Index {
         Ok(idx)
     }
 
+    /// Add a batch of documents to the index. Tokenization + per-doc
+    /// term-counting runs **Rayon-parallel** across documents; the
+    /// per-doc term-count maps are then merged into the shared DF
+    /// table sequentially under the write lock.
+    ///
+    /// For small batches (<32 docs) the parallel overhead doesn't pay
+    /// off. We still go through `par_iter` because Rayon's overhead
+    /// is small (~µs) and the implementation stays single-path; for
+    /// hot-loop micro-benchmarks the caller can pre-batch.
     pub fn add(&self, docs: Vec<Document>) -> Result<()> {
+        if docs.is_empty() {
+            return Ok(());
+        }
+
+        // Stage 1: parallel CPU work — tokenize + count per doc.
+        // Each closure runs independently with no shared state, so
+        // this scales linearly with cores up to the docs.len() ceiling.
+        let prepped: Vec<(Document, HashMap<String, u32>, u32)> = docs
+            .into_par_iter()
+            .map(|d| {
+                let tokens = tokenize(&d.content);
+                let len = tokens.len() as u32;
+                let mut tc: HashMap<String, u32> = HashMap::new();
+                for t in &tokens {
+                    *tc.entry(t.clone()).or_insert(0) += 1;
+                }
+                (d, tc, len)
+            })
+            .collect();
+
+        // Stage 2: merge under the write lock. DF aggregation,
+        // doc-id assignment, and avg_len recompute all touch shared
+        // state, so they're sequential — but they're cheap pure-Rust
+        // hashmap ops, not the bottleneck.
         let mut g = self
             .inner
             .write()
             .map_err(|_| Error::other("bm25 rwlock poisoned"))?;
-        for mut d in docs {
-            let tokens = tokenize(&d.content);
-            let len = tokens.len() as u32;
-            let mut tc: HashMap<String, u32> = HashMap::new();
-            for t in &tokens { *tc.entry(t.clone()).or_insert(0) += 1; }
-            for term in tc.keys() { *g.df.entry(term.clone()).or_insert(0) += 1; }
-            if d.id.is_none() { d.id = Some(format!("bm25_{}", g.docs.len())); }
-            g.docs.push(Doc { doc: d, term_counts: tc, len });
+        for (mut doc, tc, len) in prepped {
+            for term in tc.keys() {
+                *g.df.entry(term.clone()).or_insert(0) += 1;
+            }
+            if doc.id.is_none() {
+                doc.id = Some(format!("bm25_{}", g.docs.len()));
+            }
+            g.docs.push(Doc {
+                doc,
+                term_counts: tc,
+                len,
+            });
         }
         let n: usize = g.docs.len();
         if n > 0 {
@@ -160,5 +197,110 @@ mod tests {
         let r = idx.search("quick fox", 2).unwrap();
         assert!(!r.is_empty());
         assert!(r[0].content.contains("quick brown fox"));
+    }
+
+    #[test]
+    fn parallel_add_assigns_distinct_ids() {
+        // Auto-id assignment uses `g.docs.len()` at the moment of
+        // insertion, so even with parallel tokenization the final
+        // ids end up unique and contiguous (0..N).
+        let docs: Vec<Document> = (0..200)
+            .map(|i| Document::new(format!("doc number {i} contains the word marker_{i}")))
+            .collect();
+        let idx = Bm25Index::from_docs(docs).unwrap();
+        let mut ids: Vec<String> = idx
+            .inner
+            .read()
+            .unwrap()
+            .docs
+            .iter()
+            .map(|d| d.doc.id.clone().unwrap())
+            .collect();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), 200, "duplicate auto-ids were assigned");
+    }
+
+    #[test]
+    fn parallel_add_df_matches_sequential() {
+        // Build the same corpus two ways — original sequential reference
+        // (computed inline below) and the parallel `add` — DF maps must
+        // match exactly.
+        let docs: Vec<Document> = vec![
+            Document::new("rust memory safety"),
+            Document::new("memory leaks in c programs"),
+            Document::new("rust async runtime"),
+            Document::new("javascript closures"),
+            Document::new("python generators"),
+        ];
+        let idx = Bm25Index::from_docs(docs.clone()).unwrap();
+        let par_df = idx.inner.read().unwrap().df.clone();
+
+        // Sequential reference DF construction.
+        let mut ref_df: HashMap<String, u32> = HashMap::new();
+        for d in &docs {
+            let tokens = tokenize(&d.content);
+            let mut seen: HashMap<String, u32> = HashMap::new();
+            for t in &tokens {
+                *seen.entry(t.clone()).or_insert(0) += 1;
+            }
+            for term in seen.keys() {
+                *ref_df.entry(term.clone()).or_insert(0) += 1;
+            }
+        }
+        assert_eq!(par_df, ref_df, "parallel DF diverges from sequential reference");
+    }
+
+    #[test]
+    fn parallel_add_avg_len_matches_sequential() {
+        let docs: Vec<Document> = (0..50)
+            .map(|i| Document::new(format!("doc {i} {}", "tok ".repeat(i % 7 + 1))))
+            .collect();
+        let idx = Bm25Index::from_docs(docs.clone()).unwrap();
+        let par_avg = idx.inner.read().unwrap().avg_len;
+
+        let total: u64 = docs.iter().map(|d| tokenize(&d.content).len() as u64).sum();
+        let ref_avg = total as f32 / docs.len() as f32;
+        assert!((par_avg - ref_avg).abs() < 1e-4, "avg_len drift: par={par_avg} ref={ref_avg}");
+    }
+
+    #[test]
+    fn parallel_add_search_quality_unchanged() {
+        // Ranking must still surface the lexical-best match first
+        // for a query — confirms the parallel pipeline didn't
+        // shuffle term-counts or DF.
+        let docs: Vec<Document> = (0..100)
+            .map(|i| {
+                if i == 42 {
+                    Document::new("this is a fox-only document marker_unique")
+                } else {
+                    Document::new(format!("filler doc {i} unrelated to the query"))
+                }
+            })
+            .collect();
+        let idx = Bm25Index::from_docs(docs).unwrap();
+        let hits = idx.search("marker_unique fox-only", 3).unwrap();
+        assert!(!hits.is_empty());
+        assert!(hits[0].content.contains("marker_unique"));
+    }
+
+    #[test]
+    fn parallel_add_empty_input_is_noop() {
+        let idx = Bm25Index::new();
+        idx.add(vec![]).unwrap();
+        assert_eq!(idx.len(), 0);
+        assert_eq!(idx.inner.read().unwrap().avg_len, 0.0);
+    }
+
+    #[test]
+    fn parallel_add_preserves_supplied_doc_ids() {
+        let docs = vec![
+            Document::new("first").with_id("custom-a"),
+            Document::new("second").with_id("custom-b"),
+        ];
+        let idx = Bm25Index::from_docs(docs).unwrap();
+        let g = idx.inner.read().unwrap();
+        assert_eq!(g.docs[0].doc.id.as_deref(), Some("custom-a"));
+        assert_eq!(g.docs[1].doc.id.as_deref(), Some("custom-b"));
     }
 }

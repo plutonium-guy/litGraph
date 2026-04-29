@@ -192,7 +192,7 @@ long-term Store. Older (v0.3) features rolled in from prior audit.
 | Feature | Why | Status |
 |---|---|---|
 | Vector retriever | Baseline RAG | ✅ |
-| BM25 retriever (lexical) | Keyword grounding | ✅ |
+| BM25 retriever (lexical) | Keyword grounding | ✅ — `Bm25Index::add` runs Rayon-parallel tokenization + per-doc term-counting (iter 198), then merges DF under the write lock. Linear-with-cores indexing throughput on large corpora; search was already Rayon-parallel. |
 | Hybrid (RRF) retriever | Best of both | ✅ |
 | Reranking retriever (Cohere/Jina/Voyage) | Quality lift | ✅ |
 | EnsembleReranker (concurrent reranker fusion) | Reduce per-model bias | ✅ `litgraph_retrieval::EnsembleReranker` — fans N rerankers over the same candidates concurrently via `tokio::join_all`, fuses orderings with weighted RRF (rank-based, scale-free across providers). Python: `litgraph.retrieval.EnsembleReranker(children, weights, rrf_k)`; composes as `RerankingRetriever(base, ensemble)`. (iter 186) |
