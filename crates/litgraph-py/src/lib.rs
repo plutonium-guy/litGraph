@@ -34,6 +34,7 @@ mod evaluators;
 mod tracing_otel;
 mod runtime;
 mod store;
+mod middleware;
 
 #[pyfunction]
 fn sum_as_string(a: usize, b: usize) -> PyResult<String> {
@@ -82,6 +83,7 @@ fn litgraph(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     add_sub(py, m, "evaluators", evaluators::register)?;
     add_sub(py, m, "tracing", tracing_otel::register)?;
     add_sub(py, m, "store", store::register)?;
+    add_sub(py, m, "middleware", middleware::register)?;
 
     Ok(())
 }

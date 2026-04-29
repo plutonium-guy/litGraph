@@ -4,6 +4,7 @@ from . import (
     embeddings as embeddings,
     graph as graph,
     loaders as loaders,
+    middleware as middleware,
     observability as observability,
     providers as providers,
     retrieval as retrieval,

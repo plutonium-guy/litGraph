@@ -342,14 +342,17 @@ compression, tool-result offload, context quarantine.
 
 | Feature | Why | Status |
 |---|---|---|
-| `before_model` hook | Mutate messages pre-call | 🟡 `on_request` covers HTTP layer |
-| `after_model` hook | Mutate response post-call | 🟡 `on_response` |
+| `before_model` hook | Mutate messages pre-call | ✅ `AgentMiddleware::before_model` |
+| `after_model` hook | Mutate response post-call | ✅ `AgentMiddleware::after_model` |
 | `before_tool` / `after_tool` | Wrap tool calls | 🟡 `RetryTool`/`TimeoutTool` cover specific cases |
-| Prompt caching middleware | Auto-mark cache breakpoints | ✅ `PromptCachingChatModel` (wrapper, not middleware chain) |
-| Conversation compression middleware | Trim long context | ✅ `SummaryBufferMemory` + `summarize_conversation` |
+| Composable middleware chain | Stack hooks declaratively | ✅ `litgraph.middleware.MiddlewareChain` (onion order: before in-order, after reversed) |
+| `MiddlewareChat` adapter | Plug chain into any `ChatModel` | ✅ accepted by `ReactAgent`/`SupervisorAgent`/etc. |
+| Prompt caching middleware | Auto-mark cache breakpoints | ✅ `PromptCachingChatModel` (wrapper, not yet ported to chain) |
+| Conversation compression middleware | Trim long context | ✅ `SummaryBufferMemory` + `MessageWindowMiddleware` |
+| `SystemPromptMiddleware` | Idempotent system prompt injection | ✅ |
+| `LoggingMiddleware` | `tracing` events around every call | ✅ |
 | Tool-result offload middleware | Push large outputs to filesystem/store | ❌ |
 | Context quarantine (subagent) | Isolate sub-task context | 🟡 `SupervisorAgent` provides isolation |
-| Composable middleware chain | Stack hooks declaratively | ❌ no chain primitive — wrappers compose by hand |
 | Dynamic system prompt assembly | Per-call system-prompt builder | 🟡 `ChatPromptTemplate.compose` |
 
 ## 23. Deep Agents harness (LC 1.0)
@@ -438,7 +441,7 @@ Distinct from short-term checkpointer — JSON document store keyed by
 Top gaps to close, ranked by user-impact for a no-code-glue path:
 
 1. 🟡 **Long-term memory `Store`** — core trait + `InMemoryStore` shipped (`litgraph.store`, 17 Py tests). Postgres backend + vector-indexed semantic search on Store still pending.
-2. ❌ **Middleware chain primitive** — composable `before/after_model`, `before/after_tool` hooks. Today resilience is wrapper-stacking; LC 1.0 reframes everything around middleware.
+2. 🟡 **Middleware chain primitive** — `before/after_model` chain shipped (`litgraph.middleware`, 7 Py + 6 Rust tests). Built-ins: Logging, MessageWindow, SystemPrompt. `before/after_tool` hooks + tool-result offload still pending.
 3. ❌ **Deep Agents harness** — `PlanningTool` + virtual filesystem + dynamic subagent spawn + `AGENTS.md`/skills loaders. The new "default agent" pattern.
 4. ❌ **Functional API** (`@entrypoint` + `@task`) — Python decorator alternative to graph DSL. Trims LOC for simple workflows.
 5. ❌ **Pydantic-coerced state in Python** — type-safe stream chunks, IDE-narrow types. (Rust side already typed.)

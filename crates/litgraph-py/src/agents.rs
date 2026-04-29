@@ -22,6 +22,7 @@ use crate::providers::{
     PyFallbackChat, PyGeminiChat, PyOpenAIChat, PyOpenAIResponses, PyPiiScrubbingChat,
     PyPromptCachingChat, PySelfConsistencyChat, PyStructuredChatModel, PyTokenBudgetChat,
 };
+use crate::middleware::PyMiddlewareChat;
 use crate::runtime::{block_on_compat, rt};
 use crate::tools::{
     PyBraveSearchTool, PyCachedTool, PyCalculatorTool, PyDalleImageTool, PyDuckDuckGoSearchTool,
@@ -133,9 +134,11 @@ pub(crate) fn extract_chat_model(bound: &Bound<'_, PyAny>) -> PyResult<Arc<dyn C
         Ok(cc.chat_model())
     } else if let Ok(sc) = bound.extract::<PyRef<PySelfConsistencyChat>>() {
         Ok(sc.chat_model())
+    } else if let Ok(mw) = bound.extract::<PyRef<PyMiddlewareChat>>() {
+        Ok(mw.chat_model())
     } else {
         Err(PyValueError::new_err(
-            "model must be OpenAIChat, OpenAIResponses, AnthropicChat, GeminiChat, BedrockChat, CohereChat, StructuredChatModel, FallbackChat, TokenBudgetChat, PiiScrubbingChat, PromptCachingChat, CostCappedChat, or SelfConsistencyChat",
+            "model must be OpenAIChat, OpenAIResponses, AnthropicChat, GeminiChat, BedrockChat, CohereChat, StructuredChatModel, FallbackChat, TokenBudgetChat, PiiScrubbingChat, PromptCachingChat, CostCappedChat, SelfConsistencyChat, or MiddlewareChat",
         ))
     }
 }

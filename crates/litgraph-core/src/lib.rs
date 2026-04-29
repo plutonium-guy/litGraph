@@ -24,6 +24,7 @@ pub mod eval_harness;
 pub mod markdown_table_parser;
 pub mod vector_store_memory;
 pub mod store;
+pub mod middleware;
 
 pub use error::{Error, Result};
 pub use structured::StructuredChatModel;
@@ -49,6 +50,10 @@ pub use example_selector::{LengthBasedExampleSelector, SemanticSimilarityExample
 pub use markdown_table_parser::{parse_markdown_tables, MarkdownTable};
 pub use vector_store_memory::{RetrievedMessage, VectorStoreMemory};
 pub use store::{InMemoryStore, Namespace, SearchFilter, Store, StoreItem};
+pub use middleware::{
+    AgentMiddleware, LoggingMiddleware, MessageWindowMiddleware, MiddlewareChain,
+    MiddlewareChatModel, SystemPromptMiddleware,
+};
 pub use eval_harness::{
     run_eval, AggregateScores, ContainsAllScorer, EvalCase, EvalCaseResult, EvalDataset,
     EvalReport, ExactMatchScorer, JaccardScorer, LevenshteinScorer, LlmJudgeScorer, RegexScorer,
