@@ -7,8 +7,8 @@ use litgraph_retrieval::store::VectorStore;
 use litgraph_retrieval::{
     embedding_redundant_filter, long_context_reorder, mmr_select, AttributeInfo, Bm25Index,
     ChildSplitter, Compressor, ContextualCompressionRetriever, DocStore,
-    retrieve_concurrent, EmbeddingsFilterCompressor, EnsembleReranker, EnsembleRetriever,
-    HybridRetriever, LlmExtractCompressor, MemoryDocStore, HydeRetriever,
+    rerank_concurrent, retrieve_concurrent, EmbeddingsFilterCompressor, EnsembleReranker,
+    EnsembleRetriever, HybridRetriever, LlmExtractCompressor, MemoryDocStore, HydeRetriever,
     MaxMarginalRelevanceRetriever, MultiQueryRetriever, MultiVectorItem, MultiVectorRetriever,
     ParentDocumentRetriever, RaceRetriever,
     PipelineCompressor, Reranker,
@@ -66,6 +66,7 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(pyo3::wrap_pyfunction!(evaluate_retrieval, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(evaluate_generation, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(py_retrieve_concurrent, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(py_rerank_concurrent, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(mmr_select_py, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(embedding_redundant_filter_py, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(long_context_reorder_py, m)?)?;
@@ -2643,6 +2644,118 @@ fn py_retrieve_concurrent<'py>(
         block_on_compat(async move {
             Ok::<_, litgraph_core::Error>(
                 retrieve_concurrent(r_arc, queries, k, max_concurrency).await,
+            )
+        })
+        .map_err(|e: litgraph_core::Error| PyRuntimeError::new_err(e.to_string()))
+    })?;
+
+    let out = PyList::empty_bound(py);
+    for r in results {
+        match r {
+            Ok(docs) => out.append(docs_to_pylist(py, docs)?)?,
+            Err(e) => {
+                if fail_fast {
+                    return Err(PyRuntimeError::new_err(e.to_string()));
+                }
+                let d = PyDict::new_bound(py);
+                d.set_item("error", e.to_string())?;
+                out.append(d)?;
+            }
+        }
+    }
+    Ok(out)
+}
+
+// ---------- rerank_concurrent (iter 197) ----------
+
+/// Extract `Arc<dyn Reranker>` from any registered reranker pyclass.
+fn extract_reranker_arc(item: &Bound<'_, PyAny>) -> PyResult<Arc<dyn Reranker>> {
+    if let Ok(c) = item.extract::<PyRef<PyCohereReranker>>() {
+        return Ok(c.as_reranker());
+    }
+    if let Ok(v) = item.extract::<PyRef<PyVoyageReranker>>() {
+        return Ok(v.as_reranker());
+    }
+    if let Ok(j) = item.extract::<PyRef<PyJinaReranker>>() {
+        return Ok(j.as_reranker());
+    }
+    if let Ok(e) = item.extract::<PyRef<PyEnsembleReranker>>() {
+        return Ok(e.as_reranker());
+    }
+    Err(pyo3::exceptions::PyTypeError::new_err(
+        "reranker must be CohereReranker, VoyageReranker, JinaReranker, or EnsembleReranker",
+    ))
+}
+
+/// Run a single reranker against N `(query, candidates)` pairs in
+/// parallel, capped at `max_concurrency` in flight. Output is
+/// aligned 1:1 with `pairs`. Per-pair failures isolate by default
+/// (slot becomes `{"error": "..."}`); pass `fail_fast=True` to raise
+/// on the first error.
+///
+/// Distinct from `EnsembleReranker` (N rerankers fused on ONE pair).
+/// This is the eval / batch-rerank path: one reranker, many
+/// independent inputs.
+///
+/// `pairs` is a list of `{"query": str, "candidates": [doc-dict]}`
+/// dicts (or `(query, candidates)` tuples).
+///
+/// ```python
+/// from litgraph.retrieval import rerank_concurrent
+/// pairs = [
+///     {"query": q, "candidates": cands}
+///     for q, cands in eval_set
+/// ]
+/// results = rerank_concurrent(reranker, pairs, top_k=10, max_concurrency=8)
+/// ```
+#[pyfunction]
+#[pyo3(name = "rerank_concurrent", signature = (reranker, pairs, top_k=10, max_concurrency=8, fail_fast=false))]
+fn py_rerank_concurrent<'py>(
+    py: Python<'py>,
+    reranker: Bound<'py, PyAny>,
+    pairs: Bound<'py, PyList>,
+    top_k: usize,
+    max_concurrency: usize,
+    fail_fast: bool,
+) -> PyResult<Bound<'py, PyList>> {
+    let r_arc = extract_reranker_arc(&reranker)?;
+    let mut parsed: Vec<(String, Vec<Document>)> = Vec::with_capacity(pairs.len());
+    for item in pairs.iter() {
+        let (query, candidates_obj): (String, Bound<'_, PyAny>) =
+            if let Ok(t) = item.downcast::<pyo3::types::PyTuple>() {
+                if t.len() != 2 {
+                    return Err(pyo3::exceptions::PyValueError::new_err(
+                        "tuple pair must be (query, candidates)",
+                    ));
+                }
+                (t.get_item(0)?.extract()?, t.get_item(1)?)
+            } else if let Ok(d) = item.downcast::<PyDict>() {
+                let q: String = d
+                    .get_item("query")?
+                    .ok_or_else(|| {
+                        pyo3::exceptions::PyValueError::new_err("missing 'query'")
+                    })?
+                    .extract()?;
+                let c = d.get_item("candidates")?.ok_or_else(|| {
+                    pyo3::exceptions::PyValueError::new_err("missing 'candidates'")
+                })?;
+                (q, c)
+            } else {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "each pair must be a dict {query, candidates} or a tuple",
+                ));
+            };
+        let cand_list: Bound<PyList> = candidates_obj.downcast_into().map_err(|_| {
+            pyo3::exceptions::PyValueError::new_err("'candidates' must be a list of doc dicts")
+        })?;
+        let docs = parse_docs(&cand_list)?;
+        parsed.push((query, docs));
+    }
+
+    let results = py.allow_threads(|| {
+        block_on_compat(async move {
+            Ok::<_, litgraph_core::Error>(
+                rerank_concurrent(r_arc, parsed, top_k, max_concurrency).await,
             )
         })
         .map_err(|e: litgraph_core::Error| PyRuntimeError::new_err(e.to_string()))

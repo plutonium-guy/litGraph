@@ -10,6 +10,7 @@ pub mod ensemble_rerank;
 pub mod multi_vector;
 pub mod concurrent;
 pub mod race;
+pub mod rerank_concurrent;
 pub mod rerank;
 pub mod eval;
 pub mod eval_gen;
@@ -31,6 +32,7 @@ pub use ensemble_rerank::{EnsembleReranker, weighted_rrf_fuse_rerank};
 pub use multi_vector::{MultiVectorItem, MultiVectorRetriever};
 pub use concurrent::{retrieve_concurrent, retrieve_concurrent_fail_fast};
 pub use race::RaceRetriever;
+pub use rerank_concurrent::{rerank_concurrent, rerank_concurrent_fail_fast};
 pub use rerank::{Reranker, RerankingRetriever};
 pub use parent::{
     ChildSplitter, DocStore, MemoryDocStore, ParentDocumentRetriever, PARENT_ID_META_KEY,
