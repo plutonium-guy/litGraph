@@ -453,6 +453,7 @@ Distinct from short-term checkpointer — JSON document store keyed by
 | LangGraph Studio (visual debugger) | Step-debug graph | 🟡 `litgraph-serve --features studio` ships REST debug endpoints over any `Checkpointer` — `/threads/:id/state`, `/history`, `/checkpoints/:step` (base64 state), `/rewind`, `DELETE /threads/:id`. Drop-in for any UI; bring-your-own front-end. |
 | Assistants API (LangGraph) | Per-graph config snapshots | ✅ `litgraph_core::{AssistantManager, Assistant, AssistantPatch}` — CRUD + monotonic version bumping, immutable `<id>@v<n>` archives for audit history, `get_version` lookup, scoped per `graph_id`, backed by any `Store` impl (InMemory / PostgresStore) |
 | Webhook resume after interrupt | External system → resume | ✅ `litgraph_core::ResumeRegistry` (iter 201) + `litgraph_serve::resume::resume_router` (iter 202) — `tokio::sync::oneshot` coordination underneath, axum router on top. `POST /threads/:id/resume {value}` delivers, `DELETE /threads/:id/resume` cancels, `GET /resumes/pending` lists. Python: `litgraph.observability.ResumeRegistry`. |
+| Graceful shutdown coordination | Wake N worker tasks on Ctrl+C / drain | ✅ `litgraph_core::ShutdownSignal` (iter 225) — `tokio::sync::Notify`-backed N-waiter edge signal with a "fired" flag so late waiters resolve instantly after signal. Distinct from `oneshot` (one waiter, one value) and `broadcast` (queued events). Python: `litgraph.observability.ShutdownSignal`. |
 
 ---
 

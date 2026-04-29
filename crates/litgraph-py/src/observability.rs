@@ -22,7 +22,80 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyProgress>()?;
     m.add_class::<PyProgressObserver>()?;
     m.add_class::<PyResumeRegistry>()?;
+    m.add_class::<PyShutdownSignal>()?;
     Ok(())
+}
+
+/// Coordination primitive for graceful shutdown — backed by
+/// `tokio::sync::Notify` plus a "fired" flag so late waiters
+/// resolve instantly after the signal has already gone off.
+///
+/// Distinct from `ResumeRegistry` (one waiter, one resume value).
+/// `ShutdownSignal` is one-fire-many-waiters with no payload.
+///
+/// Real prod use: a graph executor's worker tasks each clone the
+/// signal; the orchestrator flips it on Ctrl+C and every worker
+/// wakes to drain in-flight work and exit.
+///
+/// ```python
+/// from litgraph.observability import ShutdownSignal
+/// shutdown = ShutdownSignal()
+///
+/// # In each worker task:
+/// shutdown.wait()  # blocks until signal() is called
+///
+/// # In a signal handler / main loop:
+/// shutdown.signal()  # wakes every waiter; idempotent
+/// ```
+#[pyclass(name = "ShutdownSignal", module = "litgraph.observability")]
+pub struct PyShutdownSignal {
+    inner: litgraph_core::ShutdownSignal,
+}
+
+#[pymethods]
+impl PyShutdownSignal {
+    #[new]
+    fn new() -> Self {
+        Self {
+            inner: litgraph_core::ShutdownSignal::new(),
+        }
+    }
+
+    /// Fire the signal — every current and future `wait()` resolves.
+    /// Idempotent; safe to call from any thread.
+    fn signal(&self) {
+        self.inner.signal();
+    }
+
+    /// Block until the signal fires. Returns immediately if it has
+    /// already been signalled.
+    fn wait(&self, py: Python<'_>) -> PyResult<()> {
+        let inner = self.inner.clone();
+        py.allow_threads(|| {
+            crate::runtime::block_on_compat(async {
+                inner.wait().await;
+                Ok::<(), litgraph_core::Error>(())
+            })
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+        })
+    }
+
+    /// Non-blocking check — `True` once `signal()` has been called.
+    fn is_signaled(&self) -> bool {
+        self.inner.is_signaled()
+    }
+
+    fn __repr__(&self) -> String {
+        format!("ShutdownSignal(signaled={})", self.inner.is_signaled())
+    }
+}
+
+impl Clone for PyShutdownSignal {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+        }
+    }
 }
 
 /// Pairs paused work with externally-signalable resume values via
