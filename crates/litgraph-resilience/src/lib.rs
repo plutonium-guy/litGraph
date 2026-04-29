@@ -1369,6 +1369,37 @@ fn default_version() -> u32 {
     1
 }
 
+impl Cassette {
+    /// Load a cassette from a JSON file. Convenience wrapper around
+    /// `std::fs::read_to_string` + `serde_json::from_str`. Errors
+    /// surface as `Error::Other(...)`.
+    pub fn load_from_file(path: impl AsRef<std::path::Path>) -> Result<Self> {
+        let path = path.as_ref();
+        let s = std::fs::read_to_string(path)
+            .map_err(|e| Error::other(format!("read cassette {path:?}: {e}")))?;
+        serde_json::from_str(&s)
+            .map_err(|e| Error::other(format!("parse cassette {path:?}: {e}")))
+    }
+
+    /// Save a cassette as pretty JSON. Creates parent directory if
+    /// needed.
+    pub fn save_to_file(&self, path: impl AsRef<std::path::Path>) -> Result<()> {
+        let path = path.as_ref();
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    Error::other(format!("mkdir {parent:?}: {e}"))
+                })?;
+            }
+        }
+        let s = serde_json::to_string_pretty(self)
+            .map_err(|e| Error::other(format!("serialize cassette: {e}")))?;
+        std::fs::write(path, s)
+            .map_err(|e| Error::other(format!("write cassette {path:?}: {e}")))?;
+        Ok(())
+    }
+}
+
 /// Compute a deterministic hash of a `(messages, opts)` request.
 /// Uses canonical JSON (no field ordering, no whitespace) over
 /// blake3 → hex string.
@@ -1508,6 +1539,213 @@ impl ChatModel for ReplayingChatModel {
         Err(Error::Provider(
             "ReplayingChatModel does not support stream() without passthrough".into(),
         ))
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Embeddings record/replay — VCR-style for the embed axis
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// One captured embed call. The two variants correspond to the
+/// two `Embeddings` trait methods.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum EmbedExchange {
+    Query {
+        request_hash: String,
+        text: String,
+        response: Vec<f32>,
+    },
+    Documents {
+        request_hash: String,
+        texts: Vec<String>,
+        response: Vec<Vec<f32>>,
+    },
+}
+
+/// Persistable record of `embed_query` / `embed_documents` calls.
+/// Same load/save shape as [`Cassette`].
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct EmbedCassette {
+    #[serde(default = "default_version")]
+    pub version: u32,
+    pub exchanges: Vec<EmbedExchange>,
+}
+
+impl EmbedCassette {
+    pub fn load_from_file(path: impl AsRef<std::path::Path>) -> Result<Self> {
+        let path = path.as_ref();
+        let s = std::fs::read_to_string(path)
+            .map_err(|e| Error::other(format!("read embed cassette {path:?}: {e}")))?;
+        serde_json::from_str(&s)
+            .map_err(|e| Error::other(format!("parse embed cassette {path:?}: {e}")))
+    }
+
+    pub fn save_to_file(&self, path: impl AsRef<std::path::Path>) -> Result<()> {
+        let path = path.as_ref();
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    Error::other(format!("mkdir {parent:?}: {e}"))
+                })?;
+            }
+        }
+        let s = serde_json::to_string_pretty(self)
+            .map_err(|e| Error::other(format!("serialize embed cassette: {e}")))?;
+        std::fs::write(path, s)
+            .map_err(|e| Error::other(format!("write embed cassette {path:?}: {e}")))?;
+        Ok(())
+    }
+}
+
+/// blake3 over `text` for `embed_query` exchange keys.
+pub fn embed_query_hash(text: &str) -> String {
+    blake3::hash(text.as_bytes()).to_hex().to_string()
+}
+
+/// blake3 over canonical JSON of `texts` for `embed_documents`
+/// exchange keys.
+pub fn embed_documents_hash(texts: &[String]) -> String {
+    let s = serde_json::to_string(texts).unwrap_or_default();
+    blake3::hash(s.as_bytes()).to_hex().to_string()
+}
+
+/// Wrap any [`Embeddings`] to record every `embed_query` /
+/// `embed_documents` call into a shared [`EmbedCassette`].
+pub struct RecordingEmbeddings {
+    pub inner: Arc<dyn Embeddings>,
+    cassette: Arc<parking_lot::Mutex<EmbedCassette>>,
+}
+
+impl RecordingEmbeddings {
+    pub fn new(
+        inner: Arc<dyn Embeddings>,
+        cassette: Arc<parking_lot::Mutex<EmbedCassette>>,
+    ) -> Self {
+        Self { inner, cassette }
+    }
+}
+
+#[async_trait]
+impl Embeddings for RecordingEmbeddings {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+    fn dimensions(&self) -> usize {
+        self.inner.dimensions()
+    }
+
+    async fn embed_query(&self, text: &str) -> Result<Vec<f32>> {
+        let response = self.inner.embed_query(text).await?;
+        let exchange = EmbedExchange::Query {
+            request_hash: embed_query_hash(text),
+            text: text.to_owned(),
+            response: response.clone(),
+        };
+        self.cassette.lock().exchanges.push(exchange);
+        Ok(response)
+    }
+
+    async fn embed_documents(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        let response = self.inner.embed_documents(texts).await?;
+        let exchange = EmbedExchange::Documents {
+            request_hash: embed_documents_hash(texts),
+            texts: texts.to_vec(),
+            response: response.clone(),
+        };
+        self.cassette.lock().exchanges.push(exchange);
+        Ok(response)
+    }
+}
+
+/// Replay recorded embedding interactions. Like
+/// [`ReplayingChatModel`]: hash lookup, optional passthrough on
+/// miss. `dimensions()` defaults to whatever the first
+/// `Documents` / `Query` exchange returns; if the cassette is
+/// empty it returns 0 (caller should pass through to a live
+/// embedder if dimensions matter pre-recording).
+pub struct ReplayingEmbeddings {
+    pub cassette: EmbedCassette,
+    pub passthrough: Option<Arc<dyn Embeddings>>,
+    pub name: String,
+}
+
+impl ReplayingEmbeddings {
+    pub fn new(
+        cassette: EmbedCassette,
+        passthrough: Option<Arc<dyn Embeddings>>,
+    ) -> Self {
+        Self {
+            cassette,
+            passthrough,
+            name: "replaying-embed".into(),
+        }
+    }
+
+    fn first_dim(&self) -> usize {
+        self.cassette.exchanges.iter().find_map(|e| match e {
+            EmbedExchange::Query { response, .. } => Some(response.len()),
+            EmbedExchange::Documents { response, .. } => {
+                response.first().map(|v| v.len())
+            }
+        }).unwrap_or(0)
+    }
+}
+
+#[async_trait]
+impl Embeddings for ReplayingEmbeddings {
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn dimensions(&self) -> usize {
+        if let Some(pt) = &self.passthrough {
+            return pt.dimensions();
+        }
+        self.first_dim()
+    }
+
+    async fn embed_query(&self, text: &str) -> Result<Vec<f32>> {
+        let hash = embed_query_hash(text);
+        for ex in &self.cassette.exchanges {
+            if let EmbedExchange::Query {
+                request_hash,
+                response,
+                ..
+            } = ex
+            {
+                if request_hash == &hash {
+                    return Ok(response.clone());
+                }
+            }
+        }
+        if let Some(pt) = &self.passthrough {
+            return pt.embed_query(text).await;
+        }
+        Err(Error::Provider(format!(
+            "no recorded embed_query response for hash {hash}",
+        )))
+    }
+
+    async fn embed_documents(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        let hash = embed_documents_hash(texts);
+        for ex in &self.cassette.exchanges {
+            if let EmbedExchange::Documents {
+                request_hash,
+                response,
+                ..
+            } = ex
+            {
+                if request_hash == &hash {
+                    return Ok(response.clone());
+                }
+            }
+        }
+        if let Some(pt) = &self.passthrough {
+            return pt.embed_documents(texts).await;
+        }
+        Err(Error::Provider(format!(
+            "no recorded embed_documents response for hash {hash}",
+        )))
     }
 }
 
@@ -5072,6 +5310,151 @@ mod tests {
         let sf = SingleflightEmbeddings::new(inner as Arc<dyn Embeddings>);
         assert_eq!(sf.name(), "sf-counting-embed");
         assert_eq!(sf.dimensions(), 7);
+    }
+
+    // ---- Cassette file IO + Embeddings record/replay tests --------------
+
+    #[tokio::test]
+    async fn cassette_save_and_load_round_trip_through_disk() {
+        let inner: Arc<dyn ChatModel> = Arc::new(AlwaysOkModel);
+        let cass = Arc::new(parking_lot::Mutex::new(Cassette::default()));
+        let recorder = RecordingChatModel::new(inner, cass.clone());
+        recorder
+            .invoke(vec![Message::user("disk-test")], &ChatOptions::default())
+            .await
+            .unwrap();
+        let snap = cass.lock().clone();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        snap.save_to_file(&path).unwrap();
+        let restored = Cassette::load_from_file(&path).unwrap();
+        assert_eq!(restored.exchanges.len(), 1);
+        let player = ReplayingChatModel::new(restored, None);
+        let r = player
+            .invoke(vec![Message::user("disk-test")], &ChatOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(r.message.text_content(), "hi");
+    }
+
+    #[tokio::test]
+    async fn cassette_save_creates_parent_directory() {
+        let cass = Cassette::default();
+        let tmp = tempfile::tempdir().unwrap();
+        let nested = tmp.path().join("a").join("b").join("c.json");
+        cass.save_to_file(&nested).unwrap();
+        assert!(nested.exists());
+    }
+
+    #[tokio::test]
+    async fn embed_record_then_replay_round_trip() {
+        let inner = flaky_embed(0, EmbedFlakyKind::Provider5xx, 4);
+        let cass = Arc::new(parking_lot::Mutex::new(EmbedCassette::default()));
+        let recorder =
+            RecordingEmbeddings::new(inner.clone() as Arc<dyn Embeddings>, cass.clone());
+        // Record both embed_query and embed_documents.
+        recorder.embed_query("hello").await.unwrap();
+        recorder
+            .embed_documents(&["a".into(), "b".into()])
+            .await
+            .unwrap();
+        recorder.embed_query("world").await.unwrap();
+        let snap = cass.lock().clone();
+        assert_eq!(snap.exchanges.len(), 3);
+        // Replay via the cassette.
+        let player = ReplayingEmbeddings::new(snap, None);
+        let v1 = player.embed_query("hello").await.unwrap();
+        assert_eq!(v1.len(), 4); // FlakyEmbed dim
+        let v2 = player.embed_query("world").await.unwrap();
+        assert_eq!(v2.len(), 4);
+        let docs = player
+            .embed_documents(&["a".into(), "b".into()])
+            .await
+            .unwrap();
+        assert_eq!(docs.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn embed_replay_miss_returns_error_when_no_passthrough() {
+        let cass = EmbedCassette::default();
+        let player = ReplayingEmbeddings::new(cass, None);
+        let r = player.embed_query("nope").await;
+        match r {
+            Err(Error::Provider(msg)) => {
+                assert!(msg.contains("no recorded embed_query"));
+            }
+            other => panic!("expected Provider error, got {other:?}"),
+        }
+        let r2 = player.embed_documents(&["x".into()]).await;
+        match r2 {
+            Err(Error::Provider(msg)) => {
+                assert!(msg.contains("no recorded embed_documents"));
+            }
+            other => panic!("expected Provider error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn embed_replay_miss_falls_through_to_passthrough() {
+        let cass = EmbedCassette::default();
+        let live = flaky_embed(0, EmbedFlakyKind::Provider5xx, 5);
+        let player =
+            ReplayingEmbeddings::new(cass, Some(live as Arc<dyn Embeddings>));
+        let v = player.embed_query("anything").await.unwrap();
+        assert_eq!(v.len(), 5);
+    }
+
+    #[tokio::test]
+    async fn embed_replay_dimensions_proxy_or_first_exchange() {
+        // Without passthrough: dimensions from the first exchange.
+        let mut cass = EmbedCassette::default();
+        cass.exchanges.push(EmbedExchange::Query {
+            request_hash: embed_query_hash("x"),
+            text: "x".into(),
+            response: vec![0.0; 11],
+        });
+        let player = ReplayingEmbeddings::new(cass, None);
+        assert_eq!(player.dimensions(), 11);
+
+        // With passthrough: dimensions delegated.
+        let live = flaky_embed(0, EmbedFlakyKind::Provider5xx, 13);
+        let player2 = ReplayingEmbeddings::new(
+            EmbedCassette::default(),
+            Some(live as Arc<dyn Embeddings>),
+        );
+        assert_eq!(player2.dimensions(), 13);
+    }
+
+    #[tokio::test]
+    async fn embed_cassette_save_and_load_through_disk() {
+        let inner = flaky_embed(0, EmbedFlakyKind::Provider5xx, 3);
+        let cass = Arc::new(parking_lot::Mutex::new(EmbedCassette::default()));
+        let recorder =
+            RecordingEmbeddings::new(inner as Arc<dyn Embeddings>, cass.clone());
+        recorder.embed_query("disk-text").await.unwrap();
+        let snap = cass.lock().clone();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        snap.save_to_file(tmp.path()).unwrap();
+        let restored = EmbedCassette::load_from_file(tmp.path()).unwrap();
+        let player = ReplayingEmbeddings::new(restored, None);
+        let v = player.embed_query("disk-text").await.unwrap();
+        assert_eq!(v.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn embed_query_hash_is_deterministic() {
+        assert_eq!(embed_query_hash("a"), embed_query_hash("a"));
+        assert_ne!(embed_query_hash("a"), embed_query_hash("b"));
+    }
+
+    #[tokio::test]
+    async fn embed_documents_hash_distinguishes_order() {
+        // Order matters: ["a","b"] != ["b","a"]. This is intentional —
+        // embed_documents returns aligned vectors so order is part of
+        // the request semantically.
+        let h1 = embed_documents_hash(&["a".into(), "b".into()]);
+        let h2 = embed_documents_hash(&["b".into(), "a".into()]);
+        assert_ne!(h1, h2);
     }
 }
 
