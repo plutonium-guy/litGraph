@@ -33,12 +33,15 @@
 //!    Use [`rerank_concurrent_fail_fast`] for all-or-nothing.
 //! 3. `max_concurrency` enforced via [`tokio::sync::Semaphore`].
 
+use std::pin::Pin;
 use std::sync::Arc;
 
+use futures::Stream;
 use litgraph_core::{Document, Error, Progress, Result};
 use serde::{Deserialize, Serialize};
-use tokio::sync::Semaphore;
+use tokio::sync::{mpsc, Semaphore};
 use tokio::task::JoinSet;
+use tokio_stream::wrappers::ReceiverStream;
 
 use crate::rerank::Reranker;
 
@@ -194,6 +197,66 @@ pub async fn rerank_concurrent_with_progress(
         .into_iter()
         .map(|s| s.unwrap_or_else(|| Err(Error::other("rerank slot lost"))))
         .collect()
+}
+
+/// One item from [`rerank_concurrent_stream`] — the input pair
+/// index plus that pair's outcome, emitted in completion order.
+pub type RerankStreamItem = (usize, Result<Vec<Document>>);
+
+/// Streaming variant of [`rerank_concurrent`]. Yields
+/// `(pair_idx, Result)` pairs as each rerank call completes —
+/// caller drains in completion order, can render eval-row results
+/// live, and dropping the stream aborts the rest.
+///
+/// Streaming-variant pattern extended to the rerank axis (after
+/// chat 210, embed 211, retriever 212, tool 213).
+///
+/// `max_concurrency = 0` is normalised to 1 (sequential).
+pub fn rerank_concurrent_stream(
+    reranker: Arc<dyn Reranker>,
+    pairs: Vec<(String, Vec<Document>)>,
+    top_k: usize,
+    max_concurrency: usize,
+) -> Pin<Box<dyn Stream<Item = RerankStreamItem> + Send>> {
+    if pairs.is_empty() {
+        return Box::pin(futures::stream::empty());
+    }
+    let cap = max_concurrency.max(1);
+    let n = pairs.len();
+    let buf = n.min(cap.max(8));
+    let (tx, rx) = mpsc::channel::<RerankStreamItem>(buf);
+
+    tokio::spawn(async move {
+        let sem = Arc::new(Semaphore::new(cap));
+        let mut set: JoinSet<RerankStreamItem> = JoinSet::new();
+        for (idx, (query, candidates)) in pairs.into_iter().enumerate() {
+            let sem = sem.clone();
+            let reranker = reranker.clone();
+            set.spawn(async move {
+                let _permit = match sem.acquire_owned().await {
+                    Ok(p) => p,
+                    Err(_) => return (idx, Err(Error::other("rerank semaphore closed"))),
+                };
+                let r = reranker.rerank(&query, candidates, top_k).await;
+                (idx, r)
+            });
+        }
+        while let Some(joined) = set.join_next().await {
+            let item = match joined {
+                Ok(it) => it,
+                Err(e) => (
+                    usize::MAX,
+                    Err(Error::other(format!("rerank task join: {e}"))),
+                ),
+            };
+            if tx.send(item).await.is_err() {
+                set.abort_all();
+                break;
+            }
+        }
+    });
+
+    Box::pin(ReceiverStream::new(rx))
 }
 
 /// Fail-fast variant: returns `Err` on the first failed pair, drops
@@ -484,6 +547,123 @@ mod tests {
         let _ = h.await.unwrap();
         let snap = obs.snapshot();
         assert_eq!(snap.completed, 6);
+    }
+
+    // ---- rerank_concurrent_stream tests -------------------------------
+
+    use futures::StreamExt;
+
+    #[tokio::test]
+    async fn stream_yields_one_item_per_pair() {
+        let (r, _peak) = probe(0);
+        let pairs: Vec<_> = vec![
+            ("q0".into(), vec![doc("a"), doc("b")]),
+            ("q1".into(), vec![doc("c")]),
+            ("q2".into(), vec![doc("d"), doc("e")]),
+        ];
+        let mut s = rerank_concurrent_stream(r, pairs, 5, 4);
+        let mut indices: Vec<usize> = Vec::new();
+        while let Some((idx, res)) = s.next().await {
+            assert!(res.is_ok());
+            indices.push(idx);
+        }
+        indices.sort();
+        assert_eq!(indices, vec![0, 1, 2]);
+    }
+
+    #[tokio::test]
+    async fn stream_idx_aligns_with_input_pair() {
+        let (r, _peak) = probe(0);
+        // Per-pair candidates marked with the pair index as the id
+        // prefix; ProbeReverser reverses then truncates so the first
+        // returned doc's id is the pair's last candidate.
+        let pairs: Vec<_> = (0..5)
+            .map(|i| {
+                (
+                    format!("q{i}"),
+                    vec![
+                        doc(&format!("p{i}-a")),
+                        doc(&format!("p{i}-b")),
+                    ],
+                )
+            })
+            .collect();
+        let mut s = rerank_concurrent_stream(r, pairs, 5, 2);
+        while let Some((idx, res)) = s.next().await {
+            let docs = res.unwrap();
+            // Reverser flips → first doc id starts with `p{idx}-b`.
+            assert!(docs[0]
+                .id
+                .as_deref()
+                .unwrap()
+                .starts_with(&format!("p{idx}-")));
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_per_pair_failure_arrives_as_err_item() {
+        struct FailOnQ {
+            bad: String,
+        }
+        #[async_trait]
+        impl Reranker for FailOnQ {
+            async fn rerank(
+                &self,
+                query: &str,
+                docs: Vec<Document>,
+                top_k: usize,
+            ) -> Result<Vec<Document>> {
+                if query == self.bad {
+                    Err(Error::other("synthetic"))
+                } else {
+                    Ok(docs.into_iter().take(top_k).collect())
+                }
+            }
+        }
+        let r: Arc<dyn Reranker> = Arc::new(FailOnQ {
+            bad: "q2".into(),
+        });
+        let pairs: Vec<_> = (0..5)
+            .map(|i| (format!("q{i}"), vec![doc("x")]))
+            .collect();
+        let mut s = rerank_concurrent_stream(r, pairs, 1, 4);
+        let mut count = 0;
+        let mut errors = 0;
+        while let Some((_idx, res)) = s.next().await {
+            count += 1;
+            if res.is_err() {
+                errors += 1;
+            }
+        }
+        assert_eq!(count, 5);
+        assert_eq!(errors, 1);
+    }
+
+    #[tokio::test]
+    async fn stream_empty_pairs_yields_empty() {
+        let (r, _peak) = probe(0);
+        let mut s = rerank_concurrent_stream(r, vec![], 5, 4);
+        assert!(s.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn stream_caller_drop_aborts_in_flight_pairs() {
+        // 30 pairs × 50ms / cap=2 — full sequential ~750ms. Drop
+        // after 1 item; total wall-clock should be far less.
+        let (r, _peak) = probe(50);
+        let pairs: Vec<_> = (0..30)
+            .map(|i| (format!("q{i}"), vec![doc("x")]))
+            .collect();
+        let started = std::time::Instant::now();
+        {
+            let mut s = rerank_concurrent_stream(r, pairs, 1, 2);
+            let _first = s.next().await.unwrap();
+        }
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        assert!(
+            elapsed_ms < 400,
+            "elapsed {elapsed_ms}ms — caller-drop didn't abort remaining pairs",
+        );
     }
 
     #[tokio::test]

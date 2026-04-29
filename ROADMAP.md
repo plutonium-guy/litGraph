@@ -229,6 +229,7 @@ patterns").
 | `embed_documents_concurrent_stream` (iter 211) | mpsc-backed streaming variant of iter 183 | Streaming-variant pattern extended to the embeddings axis. Yields `(chunk_idx, Result<Vec<Vec<f32>>>)` as each chunk's embed call returns; bulk indexers upsert chunks into a vector store on early completers without waiting for the slowest. Same abort-on-drop semantics as iter 210 |
 | `retrieve_concurrent_stream` (iter 212) | mpsc-backed streaming variant of iter 190 | Streaming-variant pattern extended to the retriever axis. Yields `(query_idx, Result<Vec<Document>>)` as each query completes — eval harnesses can render rows live; drop the stream to abort the rest |
 | `tool_dispatch_concurrent_stream` (iter 213) | mpsc-backed streaming variant of iter 191 | Streaming-variant pattern extended to the tool dispatch axis. Yields `(call_idx, Result<Value>)` as each tool call completes — orchestrators can chain follow-ups on fast tools without waiting for the slowest |
+| `rerank_concurrent_stream` (iter 214) | mpsc-backed streaming variant of iter 197 | Streaming-variant pattern extended to the rerank axis. Yields `(pair_idx, Result<Vec<Document>>)` as each rerank call completes; closes 5 of 6 streaming-variant axes |
 
 ---
 
