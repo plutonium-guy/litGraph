@@ -2671,8 +2671,10 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "axum",
+ "base64 0.22.1",
  "futures",
  "litgraph-core",
+ "litgraph-graph",
  "reqwest",
  "serde",
  "serde_json",

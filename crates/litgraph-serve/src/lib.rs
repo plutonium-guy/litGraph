@@ -61,6 +61,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tracing::{debug, error};
 
+#[cfg(feature = "studio")]
+pub mod studio;
+
 /// Wraps the model + any per-instance config the handlers need. Cheap
 /// to clone (Arc inside).
 #[derive(Clone)]

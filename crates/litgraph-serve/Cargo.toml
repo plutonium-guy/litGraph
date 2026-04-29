@@ -17,8 +17,21 @@ serde.workspace = true
 serde_json.workspace = true
 async-trait.workspace = true
 tracing.workspace = true
+# Optional — only pulled in when the `studio` feature is enabled.
+# Adds the LangGraph Studio-style debug endpoints over a `Checkpointer`.
+litgraph-graph = { workspace = true, optional = true }
+base64 = { workspace = true, optional = true }
+
+[features]
+default = []
+# Mounts /threads, /threads/:id/state, /history, /rewind, etc. on top
+# of any `Arc<dyn Checkpointer>`. Off by default so the serve crate
+# stays light when only /invoke + /stream are needed.
+studio = ["dep:litgraph-graph", "dep:base64"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "time"] }
 reqwest = { workspace = true, features = ["json", "stream"] }
 tower = { version = "0.5", features = ["util"] }
+litgraph-graph = { workspace = true }
+base64 = { workspace = true }

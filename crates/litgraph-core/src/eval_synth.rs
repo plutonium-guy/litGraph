@@ -169,10 +169,8 @@ pub fn parse_synth_response(raw: Value, seeds: &[EvalCase], cap: usize) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::message::{Message, Role};
-    use crate::model::{
-        ChatOptions, ChatResponse, ChatStream, FinishReason, TokenUsage,
-    };
+    use crate::message::Message;
+    use crate::model::{ChatOptions, ChatResponse, ChatStream, FinishReason, TokenUsage};
     use async_trait::async_trait;
 
     /// Returns a fixed JSON blob whenever invoked — fine for verifying the
