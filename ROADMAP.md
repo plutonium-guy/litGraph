@@ -223,6 +223,7 @@ patterns").
 | `batch_concurrent_with_progress` (iter 205) | Composes iter 182 + iter 199 | Second progress-aware composition (after iter 200's progress-aware ingestion). `BatchProgress { total, completed, errors }` watcher updated as each `ChatModel.invoke` completes — drop-in replacement for `batch_concurrent` when the caller wants live eval-harness counters |
 | `embed_documents_concurrent_with_progress` (iter 206) | Composes iter 183 + iter 199 | Third progress-aware composition. `EmbedProgress { total_texts, total_chunks, completed_chunks, completed_texts, errors }` watcher updated as each chunk's embed call returns — drop-in replacement for bulk-indexing flows that want a tqdm-style counter / ETA |
 | `retrieve_concurrent_with_progress` (iter 207) | Composes iter 190 + iter 199 | Fourth progress-aware composition. `RetrieveProgress { total, completed, docs_returned, errors }` watcher updated as each query completes — eval-harness pattern with a live counter |
+| `tool_dispatch_concurrent_with_progress` (iter 208) | Composes iter 191 + iter 199 | Fifth progress-aware composition. `ToolDispatchProgress { total, completed, errors, unknown_tool_errors }` — unknown-tool errors bucketed separately so dashboards distinguish a routing-bug regression (LLM emitted a name your registry doesn't know) from a runtime tool failure |
 
 ---
 

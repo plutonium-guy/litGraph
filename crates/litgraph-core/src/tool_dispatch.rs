@@ -41,12 +41,13 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
 use crate::tool::Tool;
-use crate::{Error, Result};
+use crate::{Error, Progress, Result};
 
 /// Run `tools[name].run(args)` for every `(name, args)` in `calls`,
 /// capped at `max_concurrency` in flight. Output is aligned 1:1 with
@@ -97,6 +98,116 @@ pub async fn tool_dispatch_concurrent(
                 if let Some(slot) = results.iter_mut().find(|s| s.is_none()) {
                     *slot = Some(Err(Error::other(format!("tool task join: {e}"))));
                 }
+            }
+        }
+    }
+
+    results
+        .into_iter()
+        .map(|s| s.unwrap_or_else(|| Err(Error::other("tool slot lost"))))
+        .collect()
+}
+
+/// Counters maintained by [`tool_dispatch_concurrent_with_progress`].
+/// `unknown_tool_errors` is broken out from the generic `errors` count
+/// because unknown-tool failures usually indicate a routing /
+/// registry-mismatch bug rather than a transient runtime error —
+/// callers may want to alert on it differently.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ToolDispatchProgress {
+    /// Total calls submitted (set once on entry).
+    pub total: u64,
+    /// Calls whose `run` (or unknown-tool resolution) has finished.
+    pub completed: u64,
+    /// Subset of `completed` that returned `Err`. Includes the
+    /// `unknown_tool_errors` count.
+    pub errors: u64,
+    /// Subset of `errors` whose failure was an "unknown tool name"
+    /// — exposed separately so dashboards can distinguish a routing
+    /// bug from a tool-execution failure.
+    pub unknown_tool_errors: u64,
+}
+
+/// Same as [`tool_dispatch_concurrent`] but updates `progress` as
+/// each call completes. Real prod use: a Plan-and-Execute agent
+/// dispatching dozens of tool calls for a single plan, with a
+/// dashboard rendering live progress.
+///
+/// Composition: fifth progress-aware sibling after iters 200, 205,
+/// 206, 207. Unknown-tool errors get their own counter so a routing
+/// regression (the LLM emitted a tool name your registry doesn't
+/// know) shows up distinctly from a tool-runtime failure.
+pub async fn tool_dispatch_concurrent_with_progress(
+    tools: HashMap<String, Arc<dyn Tool>>,
+    calls: Vec<(String, Value)>,
+    max_concurrency: usize,
+    progress: Progress<ToolDispatchProgress>,
+) -> Vec<Result<Value>> {
+    if calls.is_empty() {
+        return Vec::new();
+    }
+    let total = calls.len() as u64;
+    let _ = progress.update(|p| ToolDispatchProgress {
+        total,
+        ..p.clone()
+    });
+
+    let cap = max_concurrency.max(1);
+    let sem = Arc::new(Semaphore::new(cap));
+    let tools = Arc::new(tools);
+    // Each task carries an `is_unknown` flag so the receiver can
+    // attribute errors precisely without re-parsing error messages.
+    let mut set: JoinSet<(usize, Result<Value>, bool)> = JoinSet::new();
+
+    for (idx, (name, args)) in calls.into_iter().enumerate() {
+        let sem = sem.clone();
+        let tools = tools.clone();
+        set.spawn(async move {
+            let _permit = match sem.acquire_owned().await {
+                Ok(p) => p,
+                Err(_) => {
+                    return (
+                        idx,
+                        Err(Error::other("tool dispatch semaphore closed")),
+                        false,
+                    )
+                }
+            };
+            match tools.get(&name) {
+                Some(tool) => (idx, tool.run(args).await, false),
+                None => (
+                    idx,
+                    Err(Error::other(format!("unknown tool `{name}`"))),
+                    true,
+                ),
+            }
+        });
+    }
+
+    let n = set.len();
+    let mut results: Vec<Option<Result<Value>>> = (0..n).map(|_| None).collect();
+    while let Some(joined) = set.join_next().await {
+        match joined {
+            Ok((idx, r, is_unknown)) => {
+                let is_err = r.is_err();
+                results[idx] = Some(r);
+                let _ = progress.update(|p| ToolDispatchProgress {
+                    completed: p.completed + 1,
+                    errors: p.errors + if is_err { 1 } else { 0 },
+                    unknown_tool_errors: p.unknown_tool_errors
+                        + if is_unknown { 1 } else { 0 },
+                    ..p.clone()
+                });
+            }
+            Err(e) => {
+                if let Some(slot) = results.iter_mut().find(|s| s.is_none()) {
+                    *slot = Some(Err(Error::other(format!("tool task join: {e}"))));
+                }
+                let _ = progress.update(|p| ToolDispatchProgress {
+                    completed: p.completed + 1,
+                    errors: p.errors + 1,
+                    ..p.clone()
+                });
             }
         }
     }
@@ -320,5 +431,112 @@ mod tests {
             .map(|r| r.as_ref().unwrap()["tool"].as_str().unwrap().into())
             .collect();
         assert_eq!(names, vec!["alpha", "beta", "gamma", "alpha"]);
+    }
+
+    // ---- tool_dispatch_concurrent_with_progress tests ------------------
+
+    #[tokio::test]
+    async fn progress_total_set_and_completed_counts_advance() {
+        let (tools, _peak) = build_registry(&["a", "b"], 0);
+        let calls: Vec<_> = vec![
+            ("a".into(), json!({"i": 0})),
+            ("b".into(), json!({"i": 1})),
+            ("a".into(), json!({"i": 2})),
+        ];
+        let progress = Progress::new(ToolDispatchProgress::default());
+        let obs = progress.observer();
+        let _ = tool_dispatch_concurrent_with_progress(tools, calls, 4, progress).await;
+        let snap = obs.snapshot();
+        assert_eq!(snap.total, 3);
+        assert_eq!(snap.completed, 3);
+        assert_eq!(snap.errors, 0);
+        assert_eq!(snap.unknown_tool_errors, 0);
+    }
+
+    #[tokio::test]
+    async fn progress_records_unknown_tool_distinctly() {
+        let (tools, _peak) = build_registry(&["a"], 0);
+        // 1 known + 2 unknown + 1 known.
+        let calls: Vec<_> = vec![
+            ("a".into(), json!({})),
+            ("missing-1".into(), json!({})),
+            ("missing-2".into(), json!({})),
+            ("a".into(), json!({})),
+        ];
+        let progress = Progress::new(ToolDispatchProgress::default());
+        let obs = progress.observer();
+        let _ = tool_dispatch_concurrent_with_progress(tools, calls, 4, progress).await;
+        let snap = obs.snapshot();
+        assert_eq!(snap.total, 4);
+        assert_eq!(snap.completed, 4);
+        assert_eq!(snap.errors, 2);
+        assert_eq!(snap.unknown_tool_errors, 2);
+    }
+
+    #[tokio::test]
+    async fn progress_records_runtime_failure_without_unknown_flag() {
+        // A tool that always errors at runtime — counts as `errors`
+        // but NOT `unknown_tool_errors`.
+        struct Failer;
+        #[async_trait]
+        impl Tool for Failer {
+            fn schema(&self) -> ToolSchema {
+                ToolSchema {
+                    name: "fail".into(),
+                    description: "always errors".into(),
+                    parameters: json!({"type": "object"}),
+                }
+            }
+            async fn run(&self, _args: Value) -> Result<Value> {
+                Err(Error::other("synthetic"))
+            }
+        }
+        let (mut tools, _peak) = build_registry(&["good"], 0);
+        tools.insert("fail".into(), Arc::new(Failer) as Arc<dyn Tool>);
+        let calls: Vec<_> = vec![
+            ("good".into(), json!({})),
+            ("fail".into(), json!({})),
+            ("good".into(), json!({})),
+        ];
+        let progress = Progress::new(ToolDispatchProgress::default());
+        let obs = progress.observer();
+        let _ = tool_dispatch_concurrent_with_progress(tools, calls, 4, progress).await;
+        let snap = obs.snapshot();
+        assert_eq!(snap.total, 3);
+        assert_eq!(snap.completed, 3);
+        assert_eq!(snap.errors, 1);
+        // Runtime error, NOT unknown-tool.
+        assert_eq!(snap.unknown_tool_errors, 0);
+    }
+
+    #[tokio::test]
+    async fn progress_observer_polls_mid_run() {
+        let (tools, _peak) = build_registry(&["a"], 15);
+        let calls: Vec<_> = (0..6)
+            .map(|i| ("a".into(), json!({"i": i})))
+            .collect();
+        let progress = Progress::new(ToolDispatchProgress::default());
+        let mut obs = progress.observer();
+        let progress_clone = progress.clone();
+        let h = tokio::spawn(async move {
+            tool_dispatch_concurrent_with_progress(tools, calls, 2, progress_clone).await
+        });
+        let _ = obs.changed().await;
+        let mid = obs.snapshot();
+        assert_eq!(mid.total, 6);
+        let _ = h.await.unwrap();
+        let snap = obs.snapshot();
+        assert_eq!(snap.completed, 6);
+    }
+
+    #[tokio::test]
+    async fn progress_empty_calls_no_updates() {
+        let (tools, _peak) = build_registry(&["a"], 0);
+        let progress = Progress::new(ToolDispatchProgress::default());
+        let obs = progress.observer();
+        let out =
+            tool_dispatch_concurrent_with_progress(tools, vec![], 4, progress).await;
+        assert!(out.is_empty());
+        assert_eq!(obs.snapshot(), ToolDispatchProgress::default());
     }
 }
