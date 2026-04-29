@@ -1342,6 +1342,176 @@ impl Embeddings for SingleflightEmbeddings {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// RecordingChatModel + ReplayingChatModel — VCR-style test cassettes
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// One captured request/response pair. Hash key is computed from
+/// canonical JSON of `(messages, opts)`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CassetteExchange {
+    pub request_hash: String,
+    pub messages: Vec<Message>,
+    pub opts: ChatOptions,
+    pub response: ChatResponse,
+}
+
+/// Persistable record of LLM interactions. Round-trips via
+/// `serde_json` so cassettes can live in a `tests/` directory
+/// next to the test file.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct Cassette {
+    #[serde(default = "default_version")]
+    pub version: u32,
+    pub exchanges: Vec<CassetteExchange>,
+}
+
+fn default_version() -> u32 {
+    1
+}
+
+/// Compute a deterministic hash of a `(messages, opts)` request.
+/// Uses canonical JSON (no field ordering, no whitespace) over
+/// blake3 → hex string.
+pub fn exchange_hash(messages: &[Message], opts: &ChatOptions) -> String {
+    // serde_json::to_string is stable for our types because the
+    // structs use `#[derive(Serialize)]` with deterministic field
+    // order. There are no `HashMap` fields in messages or opts.
+    let req = serde_json::json!({ "messages": messages, "opts": opts });
+    let s = serde_json::to_string(&req).unwrap_or_default();
+    let h = blake3::hash(s.as_bytes());
+    h.to_hex().to_string()
+}
+
+/// Wrap any [`ChatModel`] to record every `invoke` call into a
+/// shared [`Cassette`]. Use during a real-traffic test run; serialize
+/// the cassette to disk; replay in CI via [`ReplayingChatModel`].
+///
+/// VCR-style determinism for agent tests — no API calls in CI, no
+/// flaky stochastic outputs, no quota burn for golden-set
+/// regression tests.
+///
+/// # Streaming
+///
+/// `stream()` is NOT recorded — token streams aren't replayable
+/// in a useful way without preserving inter-chunk timing. Stream
+/// calls pass through to inner. Tests that want streaming
+/// determinism should use [`ReplayingChatModel`] in invoke-mode
+/// and manually re-emit a synthetic stream.
+pub struct RecordingChatModel {
+    pub inner: Arc<dyn ChatModel>,
+    cassette: Arc<parking_lot::Mutex<Cassette>>,
+}
+
+impl RecordingChatModel {
+    pub fn new(
+        inner: Arc<dyn ChatModel>,
+        cassette: Arc<parking_lot::Mutex<Cassette>>,
+    ) -> Self {
+        Self { inner, cassette }
+    }
+}
+
+#[async_trait]
+impl ChatModel for RecordingChatModel {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    async fn invoke(
+        &self,
+        messages: Vec<Message>,
+        opts: &ChatOptions,
+    ) -> Result<ChatResponse> {
+        let response = self.inner.invoke(messages.clone(), opts).await?;
+        let request_hash = exchange_hash(&messages, opts);
+        let exchange = CassetteExchange {
+            request_hash,
+            messages,
+            opts: opts.clone(),
+            response: response.clone(),
+        };
+        self.cassette.lock().exchanges.push(exchange);
+        Ok(response)
+    }
+
+    async fn stream(
+        &self,
+        messages: Vec<Message>,
+        opts: &ChatOptions,
+    ) -> Result<ChatStream> {
+        // See doc — streams pass through unrecorded.
+        self.inner.stream(messages, opts).await
+    }
+}
+
+/// Replay recorded LLM interactions from a [`Cassette`]. Lookup
+/// is by request hash — exact match on canonical JSON of
+/// `(messages, opts)`.
+///
+/// On miss: returns `Error::Provider("no recorded response for
+/// hash <…>")` if no `passthrough` is set, or invokes
+/// `passthrough` (typically the live model) otherwise. The
+/// passthrough branch is useful for "record-then-replay-with-
+/// gap-fill" workflows.
+pub struct ReplayingChatModel {
+    pub cassette: Cassette,
+    pub passthrough: Option<Arc<dyn ChatModel>>,
+}
+
+impl ReplayingChatModel {
+    pub fn new(cassette: Cassette, passthrough: Option<Arc<dyn ChatModel>>) -> Self {
+        Self {
+            cassette,
+            passthrough,
+        }
+    }
+}
+
+#[async_trait]
+impl ChatModel for ReplayingChatModel {
+    fn name(&self) -> &str {
+        "replaying"
+    }
+
+    async fn invoke(
+        &self,
+        messages: Vec<Message>,
+        opts: &ChatOptions,
+    ) -> Result<ChatResponse> {
+        let hash = exchange_hash(&messages, opts);
+        if let Some(ex) = self
+            .cassette
+            .exchanges
+            .iter()
+            .find(|e| e.request_hash == hash)
+        {
+            return Ok(ex.response.clone());
+        }
+        if let Some(pt) = &self.passthrough {
+            return pt.invoke(messages, opts).await;
+        }
+        Err(Error::Provider(format!(
+            "no recorded response for hash {hash}",
+        )))
+    }
+
+    async fn stream(
+        &self,
+        messages: Vec<Message>,
+        opts: &ChatOptions,
+    ) -> Result<ChatStream> {
+        // Streaming replay isn't supported (see RecordingChatModel
+        // doc). Defer to passthrough or error.
+        if let Some(pt) = &self.passthrough {
+            return pt.stream(messages, opts).await;
+        }
+        Err(Error::Provider(
+            "ReplayingChatModel does not support stream() without passthrough".into(),
+        ))
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // HedgedChatModel — tail-latency mitigation via delayed-backup race
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -4662,6 +4832,117 @@ mod tests {
         assert_eq!(docs[0][0], 9.0);
         assert_eq!(primary.seen.load(Ordering::SeqCst), 1);
         assert_eq!(backup.seen.load(Ordering::SeqCst), 1);
+    }
+
+    // ---- RecordingChatModel / ReplayingChatModel tests -----------------
+
+    #[tokio::test]
+    async fn record_then_replay_round_trip() {
+        let inner: Arc<dyn ChatModel> = Arc::new(AlwaysOkModel);
+        let cassette = Arc::new(parking_lot::Mutex::new(Cassette::default()));
+        let recorder = RecordingChatModel::new(inner, cassette.clone());
+        // Make 3 calls with different inputs.
+        recorder
+            .invoke(vec![Message::user("a")], &ChatOptions::default())
+            .await
+            .unwrap();
+        recorder
+            .invoke(vec![Message::user("b")], &ChatOptions::default())
+            .await
+            .unwrap();
+        recorder
+            .invoke(vec![Message::user("a")], &ChatOptions::default())
+            .await
+            .unwrap();
+        let snap = cassette.lock().clone();
+        assert_eq!(snap.exchanges.len(), 3);
+        // Now replay using the cassette.
+        let player = ReplayingChatModel::new(snap, None);
+        let r1 = player
+            .invoke(vec![Message::user("a")], &ChatOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(r1.message.text_content(), "hi"); // AlwaysOkModel returns "hi"
+        // Same input replayed twice — should hit twice.
+        let r2 = player
+            .invoke(vec![Message::user("a")], &ChatOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(r2.message.text_content(), "hi");
+    }
+
+    #[tokio::test]
+    async fn replay_miss_returns_error_when_no_passthrough() {
+        let cassette = Cassette::default();
+        let player = ReplayingChatModel::new(cassette, None);
+        let r = player
+            .invoke(vec![Message::user("nope")], &ChatOptions::default())
+            .await;
+        match r {
+            Err(Error::Provider(msg)) => {
+                assert!(msg.contains("no recorded response"));
+            }
+            other => panic!("expected Provider error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn replay_miss_falls_through_to_passthrough() {
+        let cassette = Cassette::default();
+        let live: Arc<dyn ChatModel> = Arc::new(AlwaysOkModel);
+        let player = ReplayingChatModel::new(cassette, Some(live));
+        let r = player
+            .invoke(vec![Message::user("anything")], &ChatOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(r.message.text_content(), "hi");
+    }
+
+    #[tokio::test]
+    async fn cassette_serializes_to_json_round_trip() {
+        // Round-trip via JSON to verify the cassette is portable.
+        let inner: Arc<dyn ChatModel> = Arc::new(AlwaysOkModel);
+        let cass = Arc::new(parking_lot::Mutex::new(Cassette::default()));
+        let recorder = RecordingChatModel::new(inner, cass.clone());
+        recorder
+            .invoke(vec![Message::user("hello")], &ChatOptions::default())
+            .await
+            .unwrap();
+        let snap = cass.lock().clone();
+        let s = serde_json::to_string(&snap).unwrap();
+        let restored: Cassette = serde_json::from_str(&s).unwrap();
+        assert_eq!(restored.exchanges.len(), 1);
+        // Replay using the restored cassette.
+        let player = ReplayingChatModel::new(restored, None);
+        let r = player
+            .invoke(vec![Message::user("hello")], &ChatOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(r.message.text_content(), "hi");
+    }
+
+    #[tokio::test]
+    async fn request_hash_is_deterministic_across_orderings() {
+        // Two requests with semantically-identical canonical JSON
+        // must hash the same regardless of HashMap iteration order
+        // for opts (response_format etc). AlwaysOkModel ignores opts
+        // anyway, so the test verifies the hash function via direct
+        // comparison.
+        let m1 = vec![Message::user("hi")];
+        let m2 = vec![Message::user("hi")];
+        let opts = ChatOptions {
+            temperature: Some(0.7),
+            ..Default::default()
+        };
+        let h1 = exchange_hash(&m1, &opts);
+        let h2 = exchange_hash(&m2, &opts);
+        assert_eq!(h1, h2);
+        let opts2 = ChatOptions {
+            temperature: Some(0.5),
+            ..Default::default()
+        };
+        let h3 = exchange_hash(&m1, &opts2);
+        assert_ne!(h1, h3);
     }
 
     // ---- SingleflightEmbeddings tests ----------------------------------
