@@ -194,6 +194,7 @@ long-term Store. Older (v0.3) features rolled in from prior audit.
 | Local ONNX reranker (no API key) | Air-gap quality lift | ✅ `litgraph-rerankers-fastembed::FastembedReranker` — ONNX cross-encoder via fastembed; `BGERerankerBase` default (English), `BGERerankerV2M3`/`JINARerankerV2BaseMultilingual` for multilingual; CPU-bound calls in `spawn_blocking`; live-verified rerank picks correct top-1 |
 | MaxMarginalRelevance | Diversity | ✅ |
 | ParentDocumentRetriever | Small-chunk match, big-chunk return | ✅ |
+| MultiVectorRetriever | N caller-supplied perspectives per parent | ✅ `litgraph_retrieval::MultiVectorRetriever` — caller supplies summaries / hypothetical Qs / chunks per parent; indexing fans out via `embed_documents_concurrent` (iter 183), retrieval dedups by parent_id and returns the parent. Python: `litgraph.retrieval.MultiVectorRetriever(vector_store, embeddings, parent_store)`. (iter 188) |
 | MultiQueryRetriever | Query rewriting | ✅ |
 | ContextualCompressionRetriever | Chunk filtering | ✅ |
 | SelfQueryRetriever | LLM extracts metadata filter | ✅ |

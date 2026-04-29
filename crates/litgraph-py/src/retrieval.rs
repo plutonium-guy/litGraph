@@ -8,7 +8,7 @@ use litgraph_retrieval::{
     embedding_redundant_filter, long_context_reorder, mmr_select, AttributeInfo, Bm25Index,
     ChildSplitter, Compressor, ContextualCompressionRetriever, DocStore,
     EmbeddingsFilterCompressor, EnsembleReranker, EnsembleRetriever, HybridRetriever, LlmExtractCompressor, MemoryDocStore,
-    HydeRetriever, MaxMarginalRelevanceRetriever, MultiQueryRetriever, ParentDocumentRetriever,
+    HydeRetriever, MaxMarginalRelevanceRetriever, MultiQueryRetriever, MultiVectorItem, MultiVectorRetriever, ParentDocumentRetriever,
     PipelineCompressor, Reranker,
     RerankingRetriever, Retriever, SelfQueryRetriever, TimeWeightedRetriever, VectorRetriever,
 };
@@ -49,6 +49,7 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyHybridRetriever>()?;
     m.add_class::<PyEnsembleRetriever>()?;
     m.add_class::<PyParentDocumentRetriever>()?;
+    m.add_class::<PyMultiVectorRetriever>()?;
     m.add_class::<PyMemoryDocStore>()?;
     m.add_class::<PyMultiQueryRetriever>()?;
     m.add_class::<PyHydeRetriever>()?;
@@ -1617,6 +1618,165 @@ impl PyParentDocumentRetriever {
 impl PyParentDocumentRetriever {
     pub(crate) fn as_retriever(&self) -> Arc<dyn Retriever> {
         self.inner.clone() as Arc<dyn Retriever>
+    }
+}
+
+// ---------- MultiVectorRetriever (iter 188) ----------
+
+/// Index N caller-supplied "perspectives" per parent doc (summary,
+/// hypothetical questions, raw chunks, key-entities), retrieve the
+/// parent on a hit against any perspective. Distinct from
+/// `ParentDocumentRetriever`, which derives perspectives via a
+/// `ChildSplitter`. Caller supplies the perspective generation —
+/// typical pipelines produce them via a structured-output LLM call.
+///
+/// Indexing fans out the embedding work across Tokio chunks via the
+/// `embed_documents_concurrent` primitive (iter 183) — a 10k-perspective
+/// index finishes in O(chunks/concurrency) wall-clock.
+///
+/// ```python
+/// from litgraph.retrieval import (
+///     MultiVectorRetriever, MemoryDocStore, MemoryVectorStore,
+/// )
+/// from litgraph.embeddings import OpenAIEmbeddings
+/// emb = OpenAIEmbeddings(api_key="sk-...")
+/// store = MemoryVectorStore(dim=1536)
+/// docs = MemoryDocStore()
+/// mv = MultiVectorRetriever(store, emb, docs)
+/// mv.index([
+///     {
+///         "parent": {"id": "p1", "content": "Long source doc..."},
+///         "perspectives": [
+///             "summary: this doc covers ...",
+///             "Q: what is X?",
+///             "Q: why does Y matter?",
+///         ],
+///     },
+/// ])
+/// hits = mv.retrieve("what is X?", k=2)
+/// ```
+#[pyclass(name = "MultiVectorRetriever", module = "litgraph.retrieval")]
+pub struct PyMultiVectorRetriever {
+    pub(crate) inner: Arc<MultiVectorRetriever>,
+}
+
+impl PyMultiVectorRetriever {
+    pub(crate) fn as_retriever(&self) -> Arc<dyn Retriever> {
+        self.inner.clone() as Arc<dyn Retriever>
+    }
+}
+
+#[pymethods]
+impl PyMultiVectorRetriever {
+    #[new]
+    #[pyo3(signature = (vector_store, embeddings, parent_store, child_k_factor=4, embed_chunk_size=1024, embed_concurrency=4))]
+    fn new(
+        vector_store: Bound<'_, PyAny>,
+        embeddings: Bound<'_, PyAny>,
+        parent_store: PyRef<'_, PyMemoryDocStore>,
+        child_k_factor: usize,
+        embed_chunk_size: usize,
+        embed_concurrency: usize,
+    ) -> PyResult<Self> {
+        // Same vector-store polymorphism as PyVectorRetriever / PyParentDocumentRetriever.
+        let vs: Arc<dyn VectorStore> = if let Ok(mem) = vector_store.extract::<PyRef<PyMemoryVectorStore>>() {
+            mem.as_store()
+        } else if let Ok(hn) = vector_store.extract::<PyRef<PyHnswVectorStore>>() {
+            hn.as_store()
+        } else if let Ok(qd) = vector_store.extract::<PyRef<PyQdrantVectorStore>>() {
+            qd.as_store()
+        } else if let Ok(pg) = vector_store.extract::<PyRef<PyPgVectorStore>>() {
+            pg.as_store()
+        } else if let Ok(ch) = vector_store.extract::<PyRef<PyChromaVectorStore>>() {
+            ch.as_store()
+        } else if let Ok(wv) = vector_store.extract::<PyRef<PyWeaviateVectorStore>>() {
+            wv.as_store()
+        } else {
+            return Err(pyo3::exceptions::PyTypeError::new_err(
+                "vector_store must be MemoryVectorStore / HnswVectorStore / QdrantVectorStore / PgVectorStore / ChromaVectorStore / WeaviateVectorStore",
+            ));
+        };
+        let e = crate::embeddings::extract_embeddings(&embeddings)?;
+        let ps: Arc<dyn DocStore> = parent_store.inner.clone() as Arc<dyn DocStore>;
+        let mvr = MultiVectorRetriever::new(vs, e, ps)
+            .with_child_k_factor(child_k_factor)
+            .with_embed_chunk_size(embed_chunk_size)
+            .with_embed_concurrency(embed_concurrency);
+        Ok(Self { inner: Arc::new(mvr) })
+    }
+
+    /// Index a list of dicts `{"parent": <doc-or-dict>, "perspectives": [str,...]}`.
+    /// Returns the parent ids in input order. The embedding work runs in
+    /// concurrent chunks via `embed_documents_concurrent`.
+    fn index<'py>(
+        &self,
+        py: Python<'py>,
+        items: Bound<'py, PyList>,
+    ) -> PyResult<Vec<String>> {
+        let mut parsed: Vec<MultiVectorItem> = Vec::with_capacity(items.len());
+        for item in items.iter() {
+            let d: Bound<PyDict> = item.downcast_into().map_err(|_| {
+                pyo3::exceptions::PyValueError::new_err(
+                    "each item must be a dict {parent, perspectives}",
+                )
+            })?;
+            let parent_obj = d.get_item("parent")?.ok_or_else(|| {
+                pyo3::exceptions::PyValueError::new_err("missing 'parent' key")
+            })?;
+            let parent_doc = if let Ok(s) = parent_obj.extract::<String>() {
+                Document::new(s)
+            } else if let Ok(pd) = parent_obj.downcast::<PyDict>() {
+                let mut docs = parse_docs(
+                    &PyList::new_bound(py, &[pd.clone()]),
+                )?;
+                docs.pop().ok_or_else(|| {
+                    pyo3::exceptions::PyValueError::new_err("parent doc parse failed")
+                })?
+            } else {
+                return Err(pyo3::exceptions::PyTypeError::new_err(
+                    "parent must be a str or doc dict",
+                ));
+            };
+            let perspectives_obj = d.get_item("perspectives")?.ok_or_else(|| {
+                pyo3::exceptions::PyValueError::new_err("missing 'perspectives' key")
+            })?;
+            let perspectives_list: Bound<PyList> = perspectives_obj.downcast_into().map_err(|_| {
+                pyo3::exceptions::PyValueError::new_err("'perspectives' must be a list of str")
+            })?;
+            let mut texts: Vec<String> = Vec::with_capacity(perspectives_list.len());
+            for p in perspectives_list.iter() {
+                texts.push(p.extract::<String>()?);
+            }
+            parsed.push(MultiVectorItem::new(parent_doc, texts));
+        }
+
+        let r = self.inner.clone();
+        py.allow_threads(|| {
+            block_on_compat(async move { r.index(parsed).await })
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })
+    }
+
+    #[pyo3(signature = (query, k=4))]
+    fn retrieve<'py>(
+        &self,
+        py: Python<'py>,
+        query: String,
+        k: usize,
+    ) -> PyResult<Bound<'py, PyList>> {
+        let r = self.inner.clone();
+        let docs = py.allow_threads(move || {
+            block_on_compat(async move { r.retrieve(&query, k).await })
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })?;
+        docs_to_pylist(py, docs)
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "MultiVectorRetriever(child_k_factor={})",
+            self.inner.child_k_factor
+        )
     }
 }
 
