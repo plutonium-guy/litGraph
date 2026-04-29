@@ -3,9 +3,9 @@
 Production-grade, slim alternative to LangChain + LangGraph.
 Rust core, Python bindings via PyO3 0.28 + maturin.
 
-## Status — 2026-04-29 (iter 142)
+## Status — 2026-04-29 (iter 153)
 
-38 crates · ~866 Rust tests · ~773 Python tests · all passing.
+38 crates · ~983 Rust tests · ~872 Python tests · all passing.
 
 **Legend:** ✅ done · ⏳ in flight · ❌ not started · 🚫 deferred indefinitely
 
@@ -17,15 +17,15 @@ Rust core, Python bindings via PyO3 0.28 + maturin.
 - ✅ Tokenizers (tiktoken-rs + HF tokenizers)
 - ✅ Resilience: RetryingChatModel + RateLimitedChatModel + FallbackChatModel + TokenBudgetChatModel + PiiScrubbingChatModel + PromptCachingChatModel + CostCappedChatModel + **SelfConsistencyChatModel** (iter 140, Wang et al 2022)
 - ✅ on_request hook
-- ✅ ChatPromptTemplate + FewShot + MessagesPlaceholder + minijinja strict-undefined
+- ✅ ChatPromptTemplate + FewShot + MessagesPlaceholder + minijinja strict-undefined + SemanticSimilarityExampleSelector (iter 143) + LengthBasedExampleSelector (iter 144) + from_json/to_json/from_dict/to_dict (iter 150) + **extend/+/concat composition** (iter 152, layer base + role + task templates)
 - ✅ Structured output via StructuredChatModel + schemars
 - ✅ Tool trait + #[tool] proc-macro + JSON schema
-- ✅ Built-in tools (~17): Calculator, HttpRequest, ReadFile/WriteFile/ListDirectory, Shell, SqliteQuery, BraveSearch/Tavily/DuckDuckGo, **TavilyExtract** (iter 141), Mcp, Whisper, Dalle, Tts, CachedTool, PythonRepl
+- ✅ Built-in tools (~19): Calculator, HttpRequest, ReadFile/WriteFile/ListDirectory, Shell, SqliteQuery, BraveSearch/Tavily/DuckDuckGo, TavilyExtract (iter 141), Mcp, Whisper, Dalle, Tts, CachedTool, PythonRepl, Webhook, GmailSend (iter 148), **WebFetch** (iter 151, free URL→clean-text)
 - ✅ Agents: ReactAgent (tool-calling, parallel) + SupervisorAgent + TextReActAgent (text-mode for non-tool-calling models, with streaming)
 - ✅ Vector stores: memory, hnsw, pgvector, chroma, qdrant, weaviate
 - ✅ Retrievers: Vector, BM25, Hybrid (RRF), Reranking, ParentDocument, MultiQuery, ContextualCompression, SelfQuery, TimeWeighted
 - ✅ Document transformers: MMR, EmbeddingRedundantFilter, LongContextReorder
-- ✅ Loaders (15): text, markdown, json, jsonl, csv, html, pdf, docx, directory, web, notion, slack, confluence, github-issues, github-files, gmail, gdrive
+- ✅ Loaders (22): text, markdown, json, jsonl, csv, html, pdf, docx, directory, web, notion, slack, confluence, github-issues, github-files, gmail, gdrive, linear, jira, s3, jupyter (iter 146), **gitlab** (iter 149)
 - ✅ Splitters: recursive char (with language separators), markdown header, html header, json, semantic (embedding-based), **CodeSplitter** (definition-boundary, iter 142)
 - ✅ Parallel ingestion (Rayon)
 - ✅ StateGraph + reducers macro + Send fan-out + Kahn scheduler
@@ -35,9 +35,10 @@ Rust core, Python bindings via PyO3 0.28 + maturin.
 - ✅ Caching: memory, sqlite, embedding, semantic
 - ✅ Observability: CostTracker + GraphEvent + AgentEvent + tracing spans
 - ✅ PyO3 abi3 wheels (cp39+) via maturin
-- ✅ Output parsers: JSON (StructuredChatModel), XML (flat + nested), comma-list, numbered-list, markdown-list, boolean, ReAct text-mode
+- ✅ Output parsers: JSON (StructuredChatModel), XML (flat + nested), comma-list, numbered-list, markdown-list, boolean, ReAct text-mode, **markdown-table** (iter 153)
 - ✅ format_instructions helpers (paired with each parser)
 - ✅ String evaluators (10): exact_match, levenshtein_ratio, jaccard_similarity, regex_match, json_validity, embedding_cosine, contains_all/any
+- ✅ **Eval harness** (iter 145) — `run_eval(cases, target, scorers, max_parallel)` golden-dataset runner with bounded concurrency, per-case + aggregate report, pluggable scorers (exact_match/jaccard/levenshtein/contains_all/regex/**llm_judge** iter 147)
 - ✅ MCP support (client + server; server spec-complete with **resources + prompts** iter 139)
 - ✅ Modality matrix complete: text in/out, image in/out, audio in/out
 - ✅ Human-in-the-loop: interrupt + Command(resume/goto)
@@ -65,7 +66,7 @@ Rust core, Python bindings via PyO3 0.28 + maturin.
 - 🚫 Streaming tool execution — requires Tool trait extension; deferred
 
 ### Iteration log (recent — last 30)
-- 107 ReAct parser · 108 format_instructions · 109 TextReActAgent · 110 TextReActAgent.stream() · 111 string evaluators · 112 doc transformers · 113 FallbackChatModel · 114 Whisper · 115 Dalle · 116 Tts · 117 CachedTool · 118 PythonReplTool · 119 OutputFixingParser · 120 time travel + state history · 121 litgraph-tracing-otel · 122 partial JSON · 123 WebhookTool · 124 LinearIssuesLoader · 125 JiraIssuesLoader + ADF walker · 126 S3Loader · 127 LangSmith OTel shim · 128 LlmJudge · 129 PII scrubber · 130 TokenBudgetChatModel · 131 MCP server · 132 HydeRetriever · 133 FallbackEmbeddings · 134 Retrying + RateLimited Embeddings · 135 PiiScrubbingChatModel · 136 PromptCachingChatModel · 137 SummaryBufferMemory · 138 CostCappedChatModel · 139 MCP resources + prompts · 140 SelfConsistencyChatModel · 141 TavilyExtract tool · 142 CodeSplitter
+- 107 ReAct parser · 108 format_instructions · 109 TextReActAgent · 110 TextReActAgent.stream() · 111 string evaluators · 112 doc transformers · 113 FallbackChatModel · 114 Whisper · 115 Dalle · 116 Tts · 117 CachedTool · 118 PythonReplTool · 119 OutputFixingParser · 120 time travel + state history · 121 litgraph-tracing-otel · 122 partial JSON · 123 WebhookTool · 124 LinearIssuesLoader · 125 JiraIssuesLoader + ADF walker · 126 S3Loader · 127 LangSmith OTel shim · 128 LlmJudge · 129 PII scrubber · 130 TokenBudgetChatModel · 131 MCP server · 132 HydeRetriever · 133 FallbackEmbeddings · 134 Retrying + RateLimited Embeddings · 135 PiiScrubbingChatModel · 136 PromptCachingChatModel · 137 SummaryBufferMemory · 138 CostCappedChatModel · 139 MCP resources + prompts · 140 SelfConsistencyChatModel · 141 TavilyExtract tool · 142 CodeSplitter · 143 SemanticSimilarityExampleSelector · 144 LengthBasedExampleSelector · 145 EvalHarness · 146 JupyterNotebookLoader · 147 LlmJudgeScorer · 148 GmailSendTool · 149 GitLabIssuesLoader · 150 ChatPromptTemplate file-loading · 151 WebFetchTool · 152 prompt composition · 153 MarkdownTableParser
 
 ---
 

@@ -2,9 +2,9 @@
 //! rayon-parallel directory traversal on Rust threads.
 
 use litgraph_loaders::{
-    ConfluenceLoader, CsvLoader, DirectoryLoader, DocxLoader, GithubFilesLoader,
-    GithubIssuesLoader, GmailLoader, GoogleDriveLoader, HtmlLoader, JiraIssuesLoader,
-    JsonLinesLoader, JsonLoader, LinearIssuesLoader,
+    ConfluenceLoader, CsvLoader, DirectoryLoader, DocxLoader, GitLabIssuesLoader,
+    GithubFilesLoader, GithubIssuesLoader, GmailLoader, GoogleDriveLoader, HtmlLoader,
+    JiraIssuesLoader, JsonLinesLoader, JsonLoader, JupyterNotebookLoader, LinearIssuesLoader,
     Loader, MarkdownLoader, NotionLoader, PdfLoader, S3Loader, SlackLoader, TextLoader, WebLoader,
     default_dispatcher,
 };
@@ -36,6 +36,8 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyLinearIssuesLoader>()?;
     m.add_class::<PyJiraIssuesLoader>()?;
     m.add_class::<PyS3Loader>()?;
+    m.add_class::<PyJupyterNotebookLoader>()?;
+    m.add_class::<PyGitLabIssuesLoader>()?;
     Ok(())
 }
 
@@ -859,6 +861,112 @@ impl PyS3Loader {
         if let Some(e) = extensions { inner = inner.with_extensions(e); }
         if let Some(ex) = exclude_paths { inner = inner.with_exclude_paths(ex); }
         if let Some(url) = base_url { inner = inner.with_base_url(url); }
+        Self { inner }
+    }
+
+    fn load<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        let docs = py.allow_threads(|| self.inner.load()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string())))?;
+        docs_to_pylist(py, docs)
+    }
+}
+
+/// Jupyter notebook (`.ipynb`) loader. Per-cell by default — each cell
+/// becomes a Document with `cell_index`, `cell_type`, `language` metadata.
+/// Set `concat_into_one_doc=True` to emit a single Document per file.
+///
+/// `include_outputs=True` appends each code cell's text outputs (stream,
+/// execute_result text/plain, error markers) — off by default to keep
+/// content lean (outputs are noisy: warnings, repr).
+///
+/// `cell_types` filters which cell types to emit (default ["code", "markdown"];
+/// "raw" cells are skipped).
+///
+/// ```python
+/// from litgraph.loaders import JupyterNotebookLoader
+/// docs = JupyterNotebookLoader("analysis.ipynb").load()
+/// # docs[0].metadata["cell_type"] == "markdown"
+/// # docs[1].metadata["cell_index"] == 1
+/// ```
+#[pyclass(name = "JupyterNotebookLoader", module = "litgraph.loaders")]
+pub struct PyJupyterNotebookLoader { inner: JupyterNotebookLoader }
+
+#[pymethods]
+impl PyJupyterNotebookLoader {
+    #[new]
+    #[pyo3(signature = (path, include_outputs=false, cell_types=None, concat_into_one_doc=false))]
+    fn new(
+        path: String,
+        include_outputs: bool,
+        cell_types: Option<Vec<String>>,
+        concat_into_one_doc: bool,
+    ) -> Self {
+        let mut inner = JupyterNotebookLoader::new(path).with_outputs(include_outputs);
+        if let Some(types) = cell_types {
+            inner = inner.with_cell_types(types);
+        }
+        if concat_into_one_doc {
+            inner = inner.concat_into_one_doc(true);
+        }
+        Self { inner }
+    }
+
+    fn load<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        let docs = py.allow_threads(|| self.inner.load()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string())))?;
+        docs_to_pylist(py, docs)
+    }
+}
+
+/// GitLab issues loader. Parallel to GithubIssuesLoader for the 4th
+/// major dev platform (after GitHub, Linear, Jira).
+///
+/// `project` is either a numeric ID (`"12345"`) or a URL-encoded
+/// path (`"group%2Fsubgroup%2Fmyproject"`).
+///
+/// Auth: PRIVATE-TOKEN header (PAT) by default; pass `oauth=True` to
+/// use Authorization: Bearer (OAuth tokens). Self-hosted GitLab via
+/// `base_url="https://gitlab.your-corp.com/api/v4"`.
+///
+/// ```python
+/// from litgraph.loaders import GitLabIssuesLoader
+/// loader = GitLabIssuesLoader(
+///     token="glpat-xxxx", project="12345",
+///     state="opened", include_notes=True,
+/// )
+/// docs = loader.load()
+/// ```
+#[pyclass(name = "GitLabIssuesLoader", module = "litgraph.loaders")]
+pub struct PyGitLabIssuesLoader { inner: GitLabIssuesLoader }
+
+#[pymethods]
+impl PyGitLabIssuesLoader {
+    #[new]
+    #[pyo3(signature = (
+        token, project, base_url=None, state="all",
+        include_notes=false, labels=None, max_issues=Some(1000), oauth=false,
+    ))]
+    fn new(
+        token: String,
+        project: String,
+        base_url: Option<String>,
+        state: &str,
+        include_notes: bool,
+        labels: Option<Vec<String>>,
+        max_issues: Option<usize>,
+        oauth: bool,
+    ) -> Self {
+        let mut inner = GitLabIssuesLoader::from_project(token, project)
+            .with_state(state)
+            .with_include_notes(include_notes)
+            .with_max_issues(max_issues)
+            .with_oauth(oauth);
+        if let Some(url) = base_url {
+            inner = inner.with_base_url(url);
+        }
+        if let Some(l) = labels {
+            inner = inner.with_labels(l);
+        }
         Self { inner }
     }
 

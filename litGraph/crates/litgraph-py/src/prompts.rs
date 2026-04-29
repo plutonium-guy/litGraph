@@ -11,7 +11,7 @@ use std::sync::Mutex;
 use std::sync::Arc;
 
 use litgraph_core::{
-    ChatPromptTemplate, FewShotChatPromptTemplate, Message, Role,
+    ChatPromptTemplate, FewShotChatPromptTemplate, LengthBasedExampleSelector, Message, Role,
     SemanticSimilarityExampleSelector,
 };
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
@@ -25,6 +25,7 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyPromptValue>()?;
     m.add_class::<PyFewShotChatPromptTemplate>()?;
     m.add_class::<PySemanticSimilarityExampleSelector>()?;
+    m.add_class::<PyLengthBasedExampleSelector>()?;
     Ok(())
 }
 
@@ -170,6 +171,75 @@ impl PyChatPromptTemplate {
             self.inner.placeholder_names()
         )
     }
+
+    /// Parse a template from a JSON string. Schema:
+    /// ```json
+    /// {
+    ///   "messages": [
+    ///     {"role": "system", "template": "You are {{ persona }}."},
+    ///     {"role": "user", "template": "{{ question }}"},
+    ///     {"role": "placeholder", "name": "history", "optional": true}
+    ///   ],
+    ///   "partials": {"persona": "terse"}
+    /// }
+    /// ```
+    /// Roles: `system`, `user`, `assistant`, `placeholder`.
+    #[staticmethod]
+    fn from_json(text: &str) -> PyResult<Self> {
+        let inner = ChatPromptTemplate::from_json(text)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        Ok(Self { inner })
+    }
+
+    /// Parse from a Python dict (e.g. loaded from a YAML file via PyYAML).
+    /// Avoids forcing litgraph to depend on a YAML parser — callers stay
+    /// free to use whatever YAML library they prefer.
+    ///
+    /// ```python
+    /// import yaml
+    /// from litgraph.prompts import ChatPromptTemplate
+    /// with open("my_prompt.yaml") as f:
+    ///     tmpl = ChatPromptTemplate.from_dict(yaml.safe_load(f))
+    /// ```
+    #[staticmethod]
+    fn from_dict(spec: Bound<'_, PyDict>) -> PyResult<Self> {
+        let v = py_dict_to_json(&spec)?;
+        let inner = ChatPromptTemplate::from_value(&v)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        Ok(Self { inner })
+    }
+
+    /// Serialize the template to a pretty-printed JSON string. Round-trips
+    /// with `from_json`.
+    fn to_json(&self) -> PyResult<String> {
+        self.inner
+            .to_json()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// As `to_json` but returns a Python dict (useful for then dumping
+    /// to YAML via PyYAML).
+    fn to_dict<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let v = self.inner.to_value();
+        crate::graph::json_to_py(py, &v)
+    }
+
+    /// Append `other`'s parts onto this template; returns a new template.
+    /// Partials merge with `other` overriding `self` on key collision.
+    /// Common pattern: layer prompts loaded from separate files —
+    /// `base + role_specific + task_specific`.
+    fn extend(&self, other: PyRef<'_, PyChatPromptTemplate>) -> Self {
+        Self { inner: self.inner.clone().extend(other.inner.clone()) }
+    }
+
+    /// Same as `extend` but mirrors Python's `+` operator semantics
+    /// (returns a new combined template; doesn't mutate either input).
+    fn __add__(&self, other: PyRef<'_, PyChatPromptTemplate>) -> Self {
+        Self { inner: self.inner.concat(&other.inner) }
+    }
+
+    /// Number of parts (templated messages + placeholders).
+    fn __len__(&self) -> usize { self.inner.len() }
 }
 
 /// A formatted prompt — has its templated parts rendered, but placeholder
@@ -465,4 +535,102 @@ fn json_to_pyobj<'py>(py: Python<'py>, v: &serde_json::Value) -> PyResult<Py<PyA
         }
         J::Object(_) => json_to_py_dict(py, v)?.into_py(py),
     })
+}
+
+/// `LengthBasedExampleSelector` — token-budget-greedy example picker.
+/// Walks the pool in order and includes each example IFF the running
+/// total stays under `max_tokens`. Stops at the first overflow (does NOT
+/// skip-and-continue — preserves ordering).
+///
+/// ```python
+/// from litgraph.prompts import LengthBasedExampleSelector
+///
+/// pool = [{"input": "...", "output": "..."}, ...]  # ordered by priority
+/// # Counter is any callable: text -> int. For OpenAI, wrap tiktoken.
+/// def count(text):
+///     return len(text) // 4   # rough estimate
+///
+/// sel = LengthBasedExampleSelector(
+///     pool, max_tokens=2048,
+///     fields=["input", "output"], counter=count,
+/// )
+/// picked = sel.select()                         # default budget
+/// picked = sel.select_with_budget(max_tokens=512)  # override per call
+/// ```
+#[pyclass(name = "LengthBasedExampleSelector", module = "litgraph.prompts")]
+pub struct PyLengthBasedExampleSelector {
+    inner: LengthBasedExampleSelector,
+}
+
+#[pymethods]
+impl PyLengthBasedExampleSelector {
+    #[new]
+    #[pyo3(signature = (pool, max_tokens, fields=None, counter=None))]
+    fn new(
+        pool: Bound<'_, PyList>,
+        max_tokens: usize,
+        fields: Option<Vec<String>>,
+        counter: Option<Py<PyAny>>,
+    ) -> PyResult<Self> {
+        let mut pool_vec = Vec::with_capacity(pool.len());
+        for item in pool.iter() {
+            let d: Bound<'_, PyDict> = item.downcast_into().map_err(|_| {
+                PyValueError::new_err("each pool entry must be a dict")
+            })?;
+            pool_vec.push(py_dict_to_json(&d)?);
+        }
+        let fields = fields.unwrap_or_else(|| vec!["input".into(), "output".into()]);
+        let count_fn: Arc<dyn Fn(&str) -> usize + Send + Sync> = match counter {
+            Some(cb) => {
+                let cb = Arc::new(cb);
+                Arc::new(move |text: &str| {
+                    Python::with_gil(|py| {
+                        match cb.call1(py, (text,)) {
+                            Ok(v) => v.extract::<i64>(py).map(|n| n.max(0) as usize).unwrap_or(0),
+                            // Fall back to char/4 estimate if callback errors.
+                            Err(_) => text.len() / 4,
+                        }
+                    })
+                })
+            }
+            None => Arc::new(|t: &str| t.len() / 4),
+        };
+        Ok(Self {
+            inner: LengthBasedExampleSelector::new(pool_vec, max_tokens, fields, count_fn),
+        })
+    }
+
+    fn select<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        let picked = self.inner.select();
+        let out = PyList::empty_bound(py);
+        for v in picked {
+            out.append(json_to_py_dict(py, &v)?)?;
+        }
+        Ok(out)
+    }
+
+    fn select_with_budget<'py>(
+        &self,
+        py: Python<'py>,
+        max_tokens: usize,
+    ) -> PyResult<Bound<'py, PyList>> {
+        let picked = self.inner.select_with_budget(max_tokens);
+        let out = PyList::empty_bound(py);
+        for v in picked {
+            out.append(json_to_py_dict(py, &v)?)?;
+        }
+        Ok(out)
+    }
+
+    fn pool_size(&self) -> usize {
+        self.inner.pool_size()
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "LengthBasedExampleSelector(pool_size={}, max_tokens={})",
+            self.inner.pool_size(),
+            self.inner.max_tokens
+        )
+    }
 }

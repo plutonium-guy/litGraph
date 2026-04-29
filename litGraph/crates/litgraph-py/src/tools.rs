@@ -14,10 +14,10 @@ use litgraph_tools_search::{
     TavilySearch,
 };
 use litgraph_tools_utils::{
-    CachedTool, CalculatorTool, DalleConfig, DalleImageTool, FsRoot, HttpRequestConfig,
-    HttpRequestTool, ListDirectoryTool, PythonReplConfig, PythonReplTool, ReadFileTool, ShellTool,
-    SqliteQueryTool, TtsAudioTool, TtsConfig, WebhookConfig, WebhookTool, WhisperConfig,
-    WhisperTranscribeTool, WriteFileTool,
+    CachedTool, CalculatorTool, DalleConfig, DalleImageTool, FsRoot, GmailSendConfig, GmailSendTool,
+    HttpRequestConfig, HttpRequestTool, ListDirectoryTool, PythonReplConfig, PythonReplTool,
+    ReadFileTool, ShellTool, SqliteQueryTool, TtsAudioTool, TtsConfig, WebFetchConfig, WebFetchTool,
+    WebhookConfig, WebhookTool, WhisperConfig, WhisperTranscribeTool, WriteFileTool,
 };
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
@@ -44,6 +44,8 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyCachedTool>()?;
     m.add_class::<PyPythonReplTool>()?;
     m.add_class::<PyWebhookTool>()?;
+    m.add_class::<PyGmailSendTool>()?;
+    m.add_class::<PyWebFetchTool>()?;
     m.add_function(pyo3::wrap_pyfunction!(tool, m)?)?;
     Ok(())
 }
@@ -101,6 +103,12 @@ pub(crate) fn extract_tool_arc(bound: &Bound<'_, PyAny>) -> PyResult<Arc<dyn Too
         return Ok(t.as_tool());
     }
     if let Ok(t) = bound.extract::<PyRef<PyPythonReplTool>>() {
+        return Ok(t.as_tool());
+    }
+    if let Ok(t) = bound.extract::<PyRef<PyGmailSendTool>>() {
+        return Ok(t.as_tool());
+    }
+    if let Ok(t) = bound.extract::<PyRef<PyWebFetchTool>>() {
         return Ok(t.as_tool());
     }
     if let Ok(t) = bound.extract::<PyRef<PyWebhookTool>>() {
@@ -1048,6 +1056,113 @@ impl PyTavilyExtractTool {
 }
 
 impl PyTavilyExtractTool {
+    pub(crate) fn as_tool(&self) -> Arc<dyn Tool> {
+        self.inner.clone() as Arc<dyn Tool>
+    }
+}
+
+/// Send email via the Gmail REST API. Bearer-token auth (Google OAuth2,
+/// `gmail.send` scope). Pairs with `GmailLoader` (read-only) to close
+/// the read/write loop.
+///
+/// ```python
+/// from litgraph.tools import GmailSendTool
+/// tool = GmailSendTool(
+///     access_token="ya29...",
+///     from_addr="agent@my-domain.com",  # optional pin; else Gmail picks
+/// )
+/// # Agent invokes via tool-calling:
+/// #   {"to": "alice@x.com", "subject": "Update", "body": "..."}
+/// ```
+///
+/// Plain-text only (no HTML, no attachments). For multipart MIME, build
+/// the message yourself and POST via `HttpRequestTool`.
+#[pyclass(name = "GmailSendTool", module = "litgraph.tools")]
+#[derive(Clone)]
+pub struct PyGmailSendTool {
+    pub(crate) inner: Arc<GmailSendTool>,
+}
+
+#[pymethods]
+impl PyGmailSendTool {
+    #[new]
+    #[pyo3(signature = (access_token, base_url=None, timeout_s=30, from_addr=None))]
+    fn new(
+        access_token: String,
+        base_url: Option<String>,
+        timeout_s: u64,
+        from_addr: Option<String>,
+    ) -> PyResult<Self> {
+        let mut cfg = GmailSendConfig::new(access_token);
+        cfg.timeout = std::time::Duration::from_secs(timeout_s);
+        if let Some(url) = base_url {
+            cfg = cfg.with_base_url(url);
+        }
+        if let Some(f) = from_addr {
+            cfg = cfg.with_from(f);
+        }
+        let t = GmailSendTool::new(cfg)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        Ok(Self { inner: Arc::new(t) })
+    }
+
+    #[getter]
+    fn name(&self) -> &'static str { "gmail_send" }
+    fn __repr__(&self) -> String { "GmailSendTool()".into() }
+}
+
+impl PyGmailSendTool {
+    pub(crate) fn as_tool(&self) -> Arc<dyn Tool> {
+        self.inner.clone() as Arc<dyn Tool>
+    }
+}
+
+/// Free URL→clean-text Tool. Pure-Rust HTML strip — no API key, no
+/// third-party service. Fetches a URL via reqwest, strips tags / scripts /
+/// styles / nav-boilerplate. Cheaper alternative to TavilyExtractTool for
+/// known-good static pages (docs, README, Wikipedia).
+///
+/// ```python
+/// from litgraph.tools import WebFetchTool
+/// fetch = WebFetchTool(default_max_chars=8192)
+/// # Agent invokes:  {"url": "https://docs.rs/tokio", "max_chars": 4096}
+/// ```
+#[pyclass(name = "WebFetchTool", module = "litgraph.tools")]
+#[derive(Clone)]
+pub struct PyWebFetchTool {
+    pub(crate) inner: Arc<WebFetchTool>,
+}
+
+#[pymethods]
+impl PyWebFetchTool {
+    #[new]
+    #[pyo3(signature = (timeout_s=30, default_max_chars=16384, user_agent=None, strip_boilerplate=true))]
+    fn new(
+        timeout_s: u64,
+        default_max_chars: usize,
+        user_agent: Option<String>,
+        strip_boilerplate: bool,
+    ) -> PyResult<Self> {
+        let mut cfg = WebFetchConfig::default()
+            .with_timeout(std::time::Duration::from_secs(timeout_s))
+            .with_default_max_chars(default_max_chars);
+        if let Some(ua) = user_agent {
+            cfg = cfg.with_user_agent(ua);
+        }
+        if !strip_boilerplate {
+            cfg = cfg.keep_boilerplate();
+        }
+        let t = WebFetchTool::new(cfg)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        Ok(Self { inner: Arc::new(t) })
+    }
+
+    #[getter]
+    fn name(&self) -> &'static str { "web_fetch" }
+    fn __repr__(&self) -> String { "WebFetchTool()".into() }
+}
+
+impl PyWebFetchTool {
     pub(crate) fn as_tool(&self) -> Arc<dyn Tool> {
         self.inner.clone() as Arc<dyn Tool>
     }

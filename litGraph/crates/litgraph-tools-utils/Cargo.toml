@@ -9,6 +9,7 @@ description = "Built-in utility tools for litGraph agents — Calculator (evalex
 
 [dependencies]
 litgraph-core.workspace = true
+litgraph-loaders = { path = "../litgraph-loaders" }
 async-trait.workspace = true
 tokio = { workspace = true, features = ["process", "io-util"] }
 reqwest.workspace = true
@@ -20,6 +21,7 @@ evalexpr.workspace = true
 rusqlite.workspace = true
 regex.workspace = true
 once_cell = "1"
+base64.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }

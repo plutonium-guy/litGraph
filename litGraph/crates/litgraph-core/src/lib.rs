@@ -20,6 +20,8 @@ pub mod partial_json;
 pub mod llm_judge;
 pub mod pii;
 pub mod example_selector;
+pub mod eval_harness;
+pub mod markdown_table_parser;
 
 pub use error::{Error, Result};
 pub use structured::StructuredChatModel;
@@ -41,7 +43,13 @@ pub use output_fixer::{fix_with_llm, parse_with_retry};
 pub use partial_json::{parse_partial_json, repair_partial_json};
 pub use llm_judge::{JudgeScore, LlmJudge};
 pub use pii::{luhn_valid, PiiScrubber, Replacement, ScrubResult};
-pub use example_selector::SemanticSimilarityExampleSelector;
+pub use example_selector::{LengthBasedExampleSelector, SemanticSimilarityExampleSelector};
+pub use markdown_table_parser::{parse_markdown_tables, MarkdownTable};
+pub use eval_harness::{
+    run_eval, AggregateScores, ContainsAllScorer, EvalCase, EvalCaseResult, EvalDataset,
+    EvalReport, ExactMatchScorer, JaccardScorer, LevenshteinScorer, LlmJudgeScorer, RegexScorer,
+    ScoreResult, Scorer,
+};
 pub use memory::{
     BufferMemory, ConversationMemory, MemorySnapshot, SummaryBufferMemory, TokenBufferMemory,
     TokenCounter, summarize_conversation,

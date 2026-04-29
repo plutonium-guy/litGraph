@@ -25,8 +25,8 @@ use crate::runtime::{block_on_compat, rt};
 use crate::tools::{
     PyBraveSearchTool, PyCachedTool, PyCalculatorTool, PyDalleImageTool, PyDuckDuckGoSearchTool,
     PyFunctionTool, PyHttpRequestTool, PyListDirectoryTool, PyPythonReplTool, PyReadFileTool,
-    PyShellTool, PySqliteQueryTool, PyTavilyExtractTool, PyTavilySearchTool, PyTtsAudioTool,
-    PyWebhookTool, PyWhisperTranscribeTool, PyWriteFileTool,
+    PyGmailSendTool, PyShellTool, PySqliteQueryTool, PyTavilyExtractTool, PyTavilySearchTool,
+    PyTtsAudioTool, PyWebFetchTool, PyWebhookTool, PyWhisperTranscribeTool, PyWriteFileTool,
 };
 use crate::mcp::PyMcpTool;
 
@@ -80,6 +80,10 @@ fn extract_tools(tools: &Bound<'_, PyList>) -> PyResult<Vec<Arc<dyn litgraph_cor
             tool_vec.push(wh.as_tool());
         } else if let Ok(te) = item.extract::<PyRef<PyTavilyExtractTool>>() {
             tool_vec.push(te.as_tool());
+        } else if let Ok(gs) = item.extract::<PyRef<PyGmailSendTool>>() {
+            tool_vec.push(gs.as_tool());
+        } else if let Ok(wf) = item.extract::<PyRef<PyWebFetchTool>>() {
+            tool_vec.push(wf.as_tool());
         } else {
             return Err(PyValueError::new_err(
                 "tools must be FunctionTool, BraveSearchTool, TavilySearchTool, \
@@ -189,6 +193,10 @@ impl PyReactAgent {
                 tool_vec.push(wh.as_tool());
             } else if let Ok(te) = item.extract::<PyRef<PyTavilyExtractTool>>() {
                 tool_vec.push(te.as_tool());
+            } else if let Ok(gs) = item.extract::<PyRef<PyGmailSendTool>>() {
+                tool_vec.push(gs.as_tool());
+            } else if let Ok(wf) = item.extract::<PyRef<PyWebFetchTool>>() {
+                tool_vec.push(wf.as_tool());
             } else {
                 return Err(PyValueError::new_err(
                     "tools must be FunctionTool, BraveSearchTool, TavilySearchTool, \

@@ -175,6 +175,45 @@ impl ChatPromptTemplate {
         self
     }
 
+    /// Append another template's parts onto this one. Produces a single
+    /// template that renders `self`'s messages followed by `other`'s.
+    /// Partials merge, with `other` overriding `self` on key collisions
+    /// (caller-supplied later wins, matching dict-merge semantics).
+    ///
+    /// Common pattern: layer prompts from separate files —
+    /// `base + role_specific + task_specific`. Each file owns its own
+    /// system message + maybe a placeholder; composition stitches them
+    /// in render order.
+    ///
+    /// ```ignore
+    /// let base = ChatPromptTemplate::from_json(&base_yaml)?;
+    /// let role = ChatPromptTemplate::from_json(&role_yaml)?;
+    /// let final_tmpl = base.extend(role);
+    /// ```
+    pub fn extend(mut self, other: Self) -> Self {
+        self.parts.extend(other.parts);
+        for (k, v) in other.partials {
+            self.partials.insert(k, v);
+        }
+        self
+    }
+
+    /// Concatenate two templates without mutating either. Same semantics
+    /// as `extend` but returns a fresh value (cheap — `parts` are clones).
+    pub fn concat(&self, other: &Self) -> Self {
+        let mut parts = self.parts.clone();
+        parts.extend(other.parts.clone());
+        let mut partials = self.partials.clone();
+        for (k, v) in &other.partials {
+            partials.insert(k.clone(), v.clone());
+        }
+        Self { parts, partials }
+    }
+
+    /// Number of parts (templated messages + placeholders) in render order.
+    pub fn len(&self) -> usize { self.parts.len() }
+    pub fn is_empty(&self) -> bool { self.parts.is_empty() }
+
     /// Names of declared placeholder slots, in order.
     pub fn placeholder_names(&self) -> Vec<String> {
         self.parts
@@ -184,6 +223,138 @@ impl ChatPromptTemplate {
                 _ => None,
             })
             .collect()
+    }
+
+    /// Parse a `ChatPromptTemplate` from a JSON string. Schema:
+    /// ```json
+    /// {
+    ///   "messages": [
+    ///     {"role": "system", "template": "You are {{ persona }}."},
+    ///     {"role": "user", "template": "{{ question }}"},
+    ///     {"role": "placeholder", "name": "history", "optional": true}
+    ///   ],
+    ///   "partials": {"persona": "terse"}
+    /// }
+    /// ```
+    /// `partials` and the `optional` flag on placeholders are optional.
+    /// Roles supported: "system", "user", "assistant", "placeholder".
+    /// Pair with `serde_json::to_string_pretty(&yaml::from_str(yml)?)?`
+    /// upstream when loading YAML — keeps litgraph-core dep-free of YAML.
+    pub fn from_json(text: &str) -> Result<Self> {
+        let v: Value = serde_json::from_str(text)
+            .map_err(|e| Error::other(format!("ChatPromptTemplate::from_json: {e}")))?;
+        Self::from_value(&v)
+    }
+
+    /// Parse from an already-deserialized JSON `Value` — useful for callers
+    /// that load YAML/TOML/etc upstream and convert to `serde_json::Value`.
+    pub fn from_value(v: &Value) -> Result<Self> {
+        let messages = v
+            .get("messages")
+            .and_then(|m| m.as_array())
+            .ok_or_else(|| Error::other("ChatPromptTemplate: missing `messages` array"))?;
+
+        let mut tmpl = Self::new();
+        for (i, msg) in messages.iter().enumerate() {
+            let role = msg
+                .get("role")
+                .and_then(|r| r.as_str())
+                .ok_or_else(|| Error::other(format!("messages[{i}]: missing `role`")))?;
+
+            match role {
+                "placeholder" => {
+                    let name = msg
+                        .get("name")
+                        .and_then(|n| n.as_str())
+                        .ok_or_else(|| {
+                            Error::other(format!("messages[{i}]: placeholder needs `name`"))
+                        })?;
+                    let optional = msg
+                        .get("optional")
+                        .and_then(|o| o.as_bool())
+                        .unwrap_or(false);
+                    tmpl.parts.push(ChatPromptPart::Placeholder {
+                        name: name.to_string(),
+                        optional,
+                    });
+                }
+                role_str => {
+                    let parsed_role = match role_str {
+                        "system" => Role::System,
+                        "user" => Role::User,
+                        "assistant" => Role::Assistant,
+                        other => {
+                            return Err(Error::other(format!(
+                                "messages[{i}]: unknown role `{other}` \
+                                 (valid: system, user, assistant, placeholder)"
+                            )));
+                        }
+                    };
+                    let template = msg
+                        .get("template")
+                        .and_then(|t| t.as_str())
+                        .ok_or_else(|| {
+                            Error::other(format!("messages[{i}]: missing `template`"))
+                        })?;
+                    tmpl.parts.push(ChatPromptPart::Templated {
+                        role: parsed_role,
+                        template: template.to_string(),
+                    });
+                }
+            }
+        }
+
+        if let Some(partials) = v.get("partials").and_then(|p| p.as_object()) {
+            for (k, val) in partials {
+                tmpl.partials.insert(k.clone(), val.clone());
+            }
+        }
+
+        Ok(tmpl)
+    }
+
+    /// Serialize back to JSON. Round-trips with `from_json`. Useful for
+    /// dumping a programmatically-built template to disk for later review
+    /// or for migrating from code-defined to file-defined prompts.
+    pub fn to_json(&self) -> Result<String> {
+        serde_json::to_string_pretty(&self.to_value())
+            .map_err(|e| Error::other(format!("ChatPromptTemplate::to_json: {e}")))
+    }
+
+    /// As `to_json` but returns a `serde_json::Value` (no string serialization).
+    pub fn to_value(&self) -> Value {
+        let messages: Vec<Value> = self
+            .parts
+            .iter()
+            .map(|p| match p {
+                ChatPromptPart::Templated { role, template } => {
+                    let role_str = match role {
+                        Role::System => "system",
+                        Role::User => "user",
+                        Role::Assistant => "assistant",
+                        Role::Tool => "tool",
+                    };
+                    serde_json::json!({"role": role_str, "template": template})
+                }
+                ChatPromptPart::Placeholder { name, optional } => {
+                    let mut obj = serde_json::Map::new();
+                    obj.insert("role".into(), Value::String("placeholder".into()));
+                    obj.insert("name".into(), Value::String(name.clone()));
+                    if *optional {
+                        obj.insert("optional".into(), Value::Bool(true));
+                    }
+                    Value::Object(obj)
+                }
+            })
+            .collect();
+        let mut out = serde_json::Map::new();
+        out.insert("messages".into(), Value::Array(messages));
+        if !self.partials.is_empty() {
+            let p: serde_json::Map<String, Value> =
+                self.partials.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+            out.insert("partials".into(), Value::Object(p));
+        }
+        Value::Object(out)
     }
 
     pub fn format(&self, vars: &Value) -> Result<PromptValue> {
@@ -525,5 +696,283 @@ mod tests {
         assert!(res.is_err());
         let msg = format!("{}", res.unwrap_err());
         assert!(msg.contains("placeholder"));
+    }
+
+    // ---------- ChatPromptTemplate::from_json (iter 150) ----------
+
+    #[test]
+    fn from_json_loads_minimal_template() {
+        let json = r#"{
+            "messages": [
+                {"role": "system", "template": "You are {{ persona }}."},
+                {"role": "user", "template": "{{ question }}"}
+            ]
+        }"#;
+        let tmpl = ChatPromptTemplate::from_json(json).unwrap();
+        let pv = tmpl
+            .format(&json!({"persona": "terse", "question": "Why?"}))
+            .unwrap();
+        let msgs = pv.into_messages().unwrap();
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].text_content(), "You are terse.");
+        assert_eq!(msgs[1].text_content(), "Why?");
+    }
+
+    #[test]
+    fn from_json_supports_placeholder_with_optional_flag() {
+        let json = r#"{
+            "messages": [
+                {"role": "system", "template": "sys"},
+                {"role": "placeholder", "name": "history", "optional": true},
+                {"role": "user", "template": "{{ q }}"}
+            ]
+        }"#;
+        let tmpl = ChatPromptTemplate::from_json(json).unwrap();
+        // Optional placeholder unfilled — should still render.
+        let msgs = tmpl
+            .format(&json!({"q": "hi"}))
+            .unwrap()
+            .into_messages()
+            .unwrap();
+        // sys + user (placeholder absent because unfilled + optional).
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].text_content(), "sys");
+        assert_eq!(msgs[1].text_content(), "hi");
+    }
+
+    #[test]
+    fn from_json_required_placeholder_unfilled_errors() {
+        let json = r#"{
+            "messages": [
+                {"role": "system", "template": "sys"},
+                {"role": "placeholder", "name": "history"}
+            ]
+        }"#;
+        let tmpl = ChatPromptTemplate::from_json(json).unwrap();
+        let res = tmpl.format(&json!({})).unwrap().into_messages();
+        assert!(res.is_err(), "required placeholder should error if unfilled");
+    }
+
+    #[test]
+    fn from_json_partials_pre_bind_vars() {
+        let json = r#"{
+            "messages": [
+                {"role": "user", "template": "{{ a }}+{{ b }}"}
+            ],
+            "partials": {"a": "hello"}
+        }"#;
+        let tmpl = ChatPromptTemplate::from_json(json).unwrap();
+        let msgs = tmpl
+            .format(&json!({"b": "world"}))
+            .unwrap()
+            .into_messages()
+            .unwrap();
+        assert_eq!(msgs[0].text_content(), "hello+world");
+    }
+
+    #[test]
+    fn from_json_unknown_role_errors_with_index() {
+        let json = r#"{
+            "messages": [
+                {"role": "system", "template": "ok"},
+                {"role": "robot", "template": "bad"}
+            ]
+        }"#;
+        let err = ChatPromptTemplate::from_json(json).unwrap_err();
+        let s = err.to_string();
+        assert!(s.contains("messages[1]"));
+        assert!(s.contains("robot"));
+    }
+
+    #[test]
+    fn from_json_missing_template_errors_with_index() {
+        let json = r#"{"messages": [{"role": "user"}]}"#;
+        let err = ChatPromptTemplate::from_json(json).unwrap_err();
+        assert!(err.to_string().contains("template"));
+    }
+
+    #[test]
+    fn from_json_missing_messages_array_errors() {
+        let err = ChatPromptTemplate::from_json("{}").unwrap_err();
+        assert!(err.to_string().contains("messages"));
+    }
+
+    #[test]
+    fn from_json_invalid_json_errors() {
+        let err = ChatPromptTemplate::from_json("not json").unwrap_err();
+        assert!(err.to_string().contains("from_json"));
+    }
+
+    #[test]
+    fn to_json_roundtrips_through_from_json() {
+        let original = ChatPromptTemplate::new()
+            .system("You are {{ persona }}.")
+            .placeholder("history")
+            .user("{{ question }}")
+            .partial("persona", json!("terse"));
+        let serialized = original.to_json().unwrap();
+        let restored = ChatPromptTemplate::from_json(&serialized).unwrap();
+
+        // Render both, compare outputs.
+        let vars = json!({"question": "Why?"});
+        let pv1 = restored
+            .format(&vars)
+            .unwrap()
+            .with_placeholder("history", vec![Message::user("prior")])
+            .unwrap();
+        let msgs1 = pv1.into_messages().unwrap();
+        assert_eq!(msgs1[0].text_content(), "You are terse.");
+        assert_eq!(msgs1[1].text_content(), "prior");
+        assert_eq!(msgs1[2].text_content(), "Why?");
+    }
+
+    #[test]
+    fn to_value_emits_optional_flag_only_when_set() {
+        let t1 = ChatPromptTemplate::new().placeholder("h");
+        let v1 = t1.to_value();
+        let msg = &v1["messages"][0];
+        assert_eq!(msg["role"], "placeholder");
+        assert_eq!(msg["name"], "h");
+        // `optional: false` is default → omitted from JSON for cleanliness.
+        assert!(msg.get("optional").is_none());
+
+        let t2 = ChatPromptTemplate::new().optional_placeholder("h");
+        let v2 = t2.to_value();
+        assert_eq!(v2["messages"][0]["optional"], true);
+    }
+
+    // ---------- Composition (iter 152) ----------
+
+    #[test]
+    fn extend_appends_parts_from_other() {
+        let base = ChatPromptTemplate::new().system("You are {{ persona }}.");
+        let task = ChatPromptTemplate::new().user("{{ question }}");
+        let combined = base.extend(task);
+        let msgs = combined
+            .format(&json!({"persona": "terse", "question": "Why?"}))
+            .unwrap()
+            .into_messages()
+            .unwrap();
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].text_content(), "You are terse.");
+        assert_eq!(msgs[1].text_content(), "Why?");
+    }
+
+    #[test]
+    fn concat_does_not_mutate_originals() {
+        let a = ChatPromptTemplate::new().system("A").user("{{ x }}");
+        let b = ChatPromptTemplate::new().assistant("B");
+        let c = a.concat(&b);
+        // Originals untouched.
+        assert_eq!(a.len(), 2);
+        assert_eq!(b.len(), 1);
+        assert_eq!(c.len(), 3);
+        let msgs = c
+            .format(&json!({"x": "x-val"}))
+            .unwrap()
+            .into_messages()
+            .unwrap();
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[0].text_content(), "A");
+        assert_eq!(msgs[1].text_content(), "x-val");
+        assert_eq!(msgs[2].text_content(), "B");
+    }
+
+    #[test]
+    fn extend_merges_partials_other_wins_on_conflict() {
+        let a = ChatPromptTemplate::new()
+            .user("{{ k1 }} {{ k2 }}")
+            .partial("k1", json!("from-a"))
+            .partial("k2", json!("a-only"));
+        let b = ChatPromptTemplate::new()
+            .partial("k1", json!("from-b"));  // overrides a's k1
+        let combined = a.extend(b);
+        let msgs = combined
+            .format(&json!({}))
+            .unwrap()
+            .into_messages()
+            .unwrap();
+        assert_eq!(msgs[0].text_content(), "from-b a-only");
+    }
+
+    #[test]
+    fn extend_preserves_placeholder_position() {
+        let pre = ChatPromptTemplate::new().system("sys").placeholder("hist");
+        let post = ChatPromptTemplate::new().user("{{ q }}");
+        let combined = pre.extend(post);
+        let pv = combined
+            .format(&json!({"q": "current"}))
+            .unwrap()
+            .with_placeholder("hist", vec![Message::user("prior")])
+            .unwrap();
+        let msgs = pv.into_messages().unwrap();
+        // Layout: sys, history-message, user.
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[0].text_content(), "sys");
+        assert_eq!(msgs[1].text_content(), "prior");
+        assert_eq!(msgs[2].text_content(), "current");
+    }
+
+    #[test]
+    fn extend_with_empty_template_is_noop() {
+        let a = ChatPromptTemplate::new().system("only").user("{{ x }}");
+        let combined = a.clone().extend(ChatPromptTemplate::new());
+        assert_eq!(combined.len(), a.len());
+    }
+
+    #[test]
+    fn empty_extend_with_populated_yields_populated() {
+        let b = ChatPromptTemplate::new().user("{{ x }}");
+        let combined = ChatPromptTemplate::new().extend(b.clone());
+        assert_eq!(combined.len(), b.len());
+        let msgs = combined.format(&json!({"x": "ok"})).unwrap().into_messages().unwrap();
+        assert_eq!(msgs[0].text_content(), "ok");
+    }
+
+    #[test]
+    fn three_way_extend_layers_base_role_task() {
+        // Real ops pattern: base persona + role-specific + task-specific.
+        let base = ChatPromptTemplate::new().system("You are a {{ persona }}.");
+        let role = ChatPromptTemplate::new().system("Specialty: {{ role }}.");
+        let task = ChatPromptTemplate::new().user("{{ task }}");
+        let layered = base.extend(role).extend(task);
+        let msgs = layered
+            .format(&json!({
+                "persona": "polite assistant",
+                "role": "code reviewer",
+                "task": "review this PR",
+            }))
+            .unwrap()
+            .into_messages()
+            .unwrap();
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[0].text_content(), "You are a polite assistant.");
+        assert_eq!(msgs[1].text_content(), "Specialty: code reviewer.");
+        assert_eq!(msgs[2].text_content(), "review this PR");
+    }
+
+    #[test]
+    fn len_and_is_empty_track_parts() {
+        let t = ChatPromptTemplate::new();
+        assert_eq!(t.len(), 0);
+        assert!(t.is_empty());
+        let t = t.system("a").placeholder("h").user("{{ x }}");
+        assert_eq!(t.len(), 3);
+        assert!(!t.is_empty());
+    }
+
+    #[test]
+    fn from_value_accepts_pre_parsed_json_for_yaml_callers() {
+        // Caller path: load YAML with `serde_yml` upstream, convert to
+        // `serde_json::Value`, pass to `from_value`. Keeps litgraph-core
+        // dep-free of YAML.
+        let v = json!({
+            "messages": [
+                {"role": "user", "template": "from yaml: {{ x }}"}
+            ]
+        });
+        let tmpl = ChatPromptTemplate::from_value(&v).unwrap();
+        let msgs = tmpl.format(&json!({"x": "ok"})).unwrap().into_messages().unwrap();
+        assert_eq!(msgs[0].text_content(), "from yaml: ok");
     }
 }

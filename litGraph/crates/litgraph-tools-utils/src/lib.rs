@@ -17,6 +17,8 @@ mod tts;
 mod cached;
 mod python_repl;
 mod webhook;
+mod gmail_send;
+mod web_fetch;
 
 pub use calculator::CalculatorTool;
 pub use http_request::{HttpRequestTool, HttpRequestConfig};
@@ -29,3 +31,5 @@ pub use tts::{TtsAudioTool, TtsConfig};
 pub use cached::CachedTool;
 pub use python_repl::{PythonReplConfig, PythonReplTool};
 pub use webhook::{WebhookConfig, WebhookPreset, WebhookTool};
+pub use gmail_send::{GmailSendConfig, GmailSendTool};
+pub use web_fetch::{WebFetchConfig, WebFetchTool};

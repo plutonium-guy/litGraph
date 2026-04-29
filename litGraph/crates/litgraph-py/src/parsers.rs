@@ -7,12 +7,13 @@ use std::sync::Arc;
 use litgraph_core::{
     boolean_format_instructions, comma_list_format_instructions, fix_with_llm as core_fix,
     markdown_list_format_instructions, numbered_list_format_instructions, parse_boolean,
-    parse_comma_list, parse_markdown_list, parse_nested_xml, parse_numbered_list,
-    parse_partial_json as core_parse_partial, parse_react_step,
-    parse_with_retry as core_parse_retry, parse_xml_tags, react_format_instructions,
-    repair_partial_json as core_repair_partial, xml_format_instructions, ChatModel, ChatOptions,
-    Error, ReactStep,
+    parse_comma_list, parse_markdown_list, parse_markdown_tables as core_parse_md_tables,
+    parse_nested_xml, parse_numbered_list, parse_partial_json as core_parse_partial,
+    parse_react_step, parse_with_retry as core_parse_retry, parse_xml_tags,
+    react_format_instructions, repair_partial_json as core_repair_partial,
+    xml_format_instructions, ChatModel, ChatOptions, Error, ReactStep,
 };
+use pyo3::types::PyList;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
@@ -38,7 +39,62 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(parse_json_with_retry_py, m)?)?;
     m.add_function(wrap_pyfunction!(parse_partial_json_py, m)?)?;
     m.add_function(wrap_pyfunction!(repair_partial_json_py, m)?)?;
+    m.add_function(wrap_pyfunction!(parse_markdown_tables_py, m)?)?;
     Ok(())
+}
+
+/// Parse all markdown tables in `text` into a list of dicts.
+/// Each table → `{"headers": [str, ...], "rows": [{header: cell, ...}, ...]}`.
+/// Returns `[]` if no tables found.
+///
+/// ```python
+/// from litgraph.parsers import parse_markdown_tables
+/// text = '''
+/// | name | score |
+/// |------|-------|
+/// | alice | 95 |
+/// | bob   | 80 |
+/// '''
+/// tables = parse_markdown_tables(text)
+/// # [{"headers": ["name", "score"],
+/// #   "rows": [{"name": "alice", "score": "95"},
+/// #            {"name": "bob",   "score": "80"}]}]
+/// ```
+///
+/// Tolerates: tables with/without outer pipes, alignment markers
+/// (`|:---:|`), pipes inside backtick code spans (`\`a|b\``), ragged
+/// rows (extras dropped, missing cells become empty strings), and
+/// multiple tables in one text. Cell values returned as strings —
+/// caller does numeric/bool coercion downstream.
+#[pyfunction(name = "parse_markdown_tables")]
+fn parse_markdown_tables_py<'py>(
+    py: Python<'py>,
+    text: &str,
+) -> PyResult<Bound<'py, PyList>> {
+    let tables = core_parse_md_tables(text);
+    let out = PyList::empty_bound(py);
+    for t in tables {
+        let d = PyDict::new_bound(py);
+        let headers_list = PyList::empty_bound(py);
+        for h in &t.headers {
+            headers_list.append(h)?;
+        }
+        d.set_item("headers", headers_list)?;
+        let rows_list = PyList::empty_bound(py);
+        for row in &t.rows {
+            let row_dict = PyDict::new_bound(py);
+            // Iterate headers (preserves column order) rather than the HashMap
+            // (which has random iteration order).
+            for h in &t.headers {
+                let v = row.get(h).cloned().unwrap_or_default();
+                row_dict.set_item(h, v)?;
+            }
+            rows_list.append(row_dict)?;
+        }
+        d.set_item("rows", rows_list)?;
+        out.append(d)?;
+    }
+    Ok(out)
 }
 
 /// Flat XML parser — extract the FIRST occurrence of each named tag's

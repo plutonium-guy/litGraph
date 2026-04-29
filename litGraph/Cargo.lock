@@ -2441,8 +2441,10 @@ name = "litgraph-tools-utils"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64 0.22.1",
  "evalexpr",
  "litgraph-core",
+ "litgraph-loaders",
  "once_cell",
  "regex",
  "reqwest",

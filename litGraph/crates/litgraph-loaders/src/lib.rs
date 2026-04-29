@@ -54,6 +54,12 @@ pub mod jira;
 pub use jira::JiraIssuesLoader;
 
 pub mod s3;
+pub mod jupyter;
+pub use jupyter::JupyterNotebookLoader;
+pub mod gitlab;
+pub use gitlab::GitLabIssuesLoader;
+pub mod gitlab_files;
+pub use gitlab_files::GitLabFilesLoader;
 pub use s3::S3Loader;
 
 #[derive(Debug, thiserror::Error)]

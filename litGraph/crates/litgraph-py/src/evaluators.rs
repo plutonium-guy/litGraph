@@ -9,8 +9,11 @@ use litgraph_core::{
     exact_match_strict as core_exact_match_strict, jaccard_similarity as core_jaccard_similarity,
     json_validity as core_json_validity, levenshtein as core_levenshtein,
     levenshtein_ratio as core_levenshtein_ratio, luhn_valid as core_luhn_valid,
-    regex_match as core_regex_match, ChatModel, LlmJudge, PiiScrubber as CorePiiScrubber,
+    regex_match as core_regex_match, run_eval as core_run_eval, ChatModel, ContainsAllScorer,
+    EvalCase, EvalDataset, ExactMatchScorer, JaccardScorer, LevenshteinScorer, LlmJudge,
+    LlmJudgeScorer, PiiScrubber as CorePiiScrubber, RegexScorer, Scorer,
 };
+use pyo3::types::PyList;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
@@ -31,6 +34,7 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyLlmJudge>()?;
     m.add_class::<PyPiiScrubber>()?;
     m.add_function(wrap_pyfunction!(luhn_valid, m)?)?;
+    m.add_function(wrap_pyfunction!(run_eval, m)?)?;
     Ok(())
 }
 
@@ -258,4 +262,160 @@ impl PyPiiScrubber {
     pub(crate) fn clone_inner(&self) -> CorePiiScrubber {
         self.inner.clone()
     }
+}
+
+/// Run a golden-dataset eval against a target callable. Returns a dict
+/// `{per_case: [...], aggregate: {n_cases, n_errors, means: {...}}}`.
+///
+/// `cases` is a list of dicts, each `{"input": str, "expected": str?, "metadata": any?}`.
+/// `target` is a Python callable: `(input_str) -> str`. Throws? → recorded
+/// as per-case error, doesn't abort the run.
+/// `scorers` is a list of dicts:
+///   - `{"name": "exact_match"}`
+///   - `{"name": "jaccard"}`
+///   - `{"name": "levenshtein"}`
+///   - `{"name": "contains_all", "required": ["foo", "bar"]}`
+///   - `{"name": "regex", "pattern": r"\d+"}`
+/// `max_parallel` (default 4) bounds in-flight target invocations.
+///
+/// ```python
+/// from litgraph.evaluators import run_eval
+/// def my_agent(question):
+///     return chat.invoke([{"role": "user", "content": question}])["text"]
+///
+/// report = run_eval(
+///     cases=[
+///         {"input": "what is 2+2?", "expected": "4"},
+///         {"input": "capital of france?", "expected": "Paris"},
+///     ],
+///     target=my_agent,
+///     scorers=[{"name": "exact_match"}, {"name": "jaccard"}],
+///     max_parallel=4,
+/// )
+/// print(report["aggregate"]["means"])
+/// ```
+#[pyfunction]
+#[pyo3(signature = (cases, target, scorers, max_parallel=4))]
+fn run_eval<'py>(
+    py: Python<'py>,
+    cases: Bound<'py, PyList>,
+    target: Py<PyAny>,
+    scorers: Bound<'py, PyList>,
+    max_parallel: usize,
+) -> PyResult<Bound<'py, PyDict>> {
+    // Parse cases into EvalCase vec.
+    let mut case_vec: Vec<EvalCase> = Vec::with_capacity(cases.len());
+    for item in cases.iter() {
+        let d: Bound<'_, PyDict> = item
+            .downcast_into()
+            .map_err(|_| PyValueError::new_err("each case must be a dict"))?;
+        let input: String = d
+            .get_item("input")?
+            .ok_or_else(|| PyValueError::new_err("case missing `input`"))?
+            .extract()?;
+        let expected: Option<String> = match d.get_item("expected")? {
+            Some(v) if !v.is_none() => Some(v.extract()?),
+            _ => None,
+        };
+        let metadata = match d.get_item("metadata")? {
+            Some(v) if !v.is_none() => crate::graph::py_to_json(py, &v)?,
+            _ => serde_json::Value::Null,
+        };
+        let mut c = EvalCase::new(input);
+        if let Some(e) = expected {
+            c = c.with_expected(e);
+        }
+        c = c.with_metadata(metadata);
+        case_vec.push(c);
+    }
+    let dataset = EvalDataset::new(case_vec);
+
+    // Parse scorers into Arc<dyn Scorer> vec.
+    let mut scorer_vec: Vec<Arc<dyn Scorer>> = Vec::new();
+    for item in scorers.iter() {
+        let d: Bound<'_, PyDict> = item
+            .downcast_into()
+            .map_err(|_| PyValueError::new_err("each scorer must be a dict"))?;
+        let name: String = d
+            .get_item("name")?
+            .ok_or_else(|| PyValueError::new_err("scorer missing `name`"))?
+            .extract()?;
+        let scorer: Arc<dyn Scorer> = match name.as_str() {
+            "exact_match" => Arc::new(ExactMatchScorer),
+            "jaccard" => Arc::new(JaccardScorer),
+            "levenshtein" => Arc::new(LevenshteinScorer),
+            "contains_all" => {
+                let required: Vec<String> = d
+                    .get_item("required")?
+                    .ok_or_else(|| PyValueError::new_err("contains_all scorer needs `required`"))?
+                    .extract()?;
+                Arc::new(ContainsAllScorer { required })
+            }
+            "regex" => {
+                let pattern: String = d
+                    .get_item("pattern")?
+                    .ok_or_else(|| PyValueError::new_err("regex scorer needs `pattern`"))?
+                    .extract()?;
+                Arc::new(RegexScorer { pattern })
+            }
+            "llm_judge" => {
+                let model_obj = d
+                    .get_item("model")?
+                    .ok_or_else(|| PyValueError::new_err("llm_judge scorer needs `model`"))?;
+                let chat = crate::agents::extract_chat_model(&model_obj)?;
+                let criteria: Option<String> = match d.get_item("criteria")? {
+                    Some(v) if !v.is_none() => Some(v.extract()?),
+                    _ => None,
+                };
+                let custom_name: Option<String> = match d.get_item("scorer_name")? {
+                    Some(v) if !v.is_none() => Some(v.extract()?),
+                    _ => None,
+                };
+                let mut scorer = LlmJudgeScorer::new(chat, criteria);
+                if let Some(n) = custom_name {
+                    scorer = scorer.with_name(n);
+                }
+                Arc::new(scorer)
+            }
+            other => {
+                return Err(PyValueError::new_err(format!(
+                    "unknown scorer `{other}` (valid: exact_match, jaccard, levenshtein, contains_all, regex, llm_judge)"
+                )));
+            }
+        };
+        scorer_vec.push(scorer);
+    }
+
+    // Wrap the Python callable as an async target (acquires GIL per call).
+    let target_arc = Arc::new(target);
+    let target_fn = move |input: String| {
+        let cb = target_arc.clone();
+        async move {
+            Python::with_gil(|py| -> Result<String, litgraph_core::Error> {
+                match cb.call1(py, (input,)) {
+                    Ok(v) => v
+                        .extract::<String>(py)
+                        .map_err(|e| litgraph_core::Error::other(format!("target return type: {e}"))),
+                    Err(e) => Err(litgraph_core::Error::other(format!("target threw: {e}"))),
+                }
+            })
+        }
+    };
+
+    let report = py.allow_threads(|| {
+        crate::runtime::block_on_compat(async move {
+            core_run_eval(&dataset, &scorer_vec, target_fn, max_parallel).await
+        })
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    })?;
+
+    // Convert report → Python dict via serde_json round-trip.
+    let json_str = serde_json::to_string(&report)
+        .map_err(|e| PyRuntimeError::new_err(format!("report serialize: {e}")))?;
+    let json_mod = py.import_bound("json")?;
+    let parsed = json_mod.call_method1("loads", (json_str,))?;
+    let dict: Bound<'_, PyDict> = parsed
+        .downcast_into()
+        .map_err(|_| PyRuntimeError::new_err("report wasn't a dict"))?;
+    Ok(dict)
 }
