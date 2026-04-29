@@ -292,6 +292,92 @@ pub fn tool_dispatch_concurrent_stream(
     Box::pin(ReceiverStream::new(rx))
 }
 
+/// Combined streaming + progress-watcher variant. Yields the same
+/// `(call_idx, Result)` items as
+/// [`tool_dispatch_concurrent_stream`] AND updates the supplied
+/// [`Progress<ToolDispatchProgress>`] watcher as each call
+/// completes (with `unknown_tool_errors` bucketed separately just
+/// like the standalone progress variant).
+///
+/// Composition: extends the combined consumer shape from iters
+/// 216/217/218 to the tool axis. Same consistency contract:
+/// `progress.update` runs before `tx.send` so observers see
+/// counter ticks at-or-before matching stream items.
+pub fn tool_dispatch_concurrent_stream_with_progress(
+    tools: HashMap<String, Arc<dyn Tool>>,
+    calls: Vec<(String, Value)>,
+    max_concurrency: usize,
+    progress: Progress<ToolDispatchProgress>,
+) -> Pin<Box<dyn Stream<Item = ToolDispatchStreamItem> + Send>> {
+    if calls.is_empty() {
+        return Box::pin(futures::stream::empty());
+    }
+    let total = calls.len() as u64;
+    let _ = progress.update(|p| ToolDispatchProgress {
+        total,
+        ..p.clone()
+    });
+
+    let cap = max_concurrency.max(1);
+    let n = calls.len();
+    let buf = n.min(cap.max(8));
+    let (tx, rx) = mpsc::channel::<ToolDispatchStreamItem>(buf);
+    let tools = Arc::new(tools);
+
+    tokio::spawn(async move {
+        let sem = Arc::new(Semaphore::new(cap));
+        let mut set: JoinSet<(usize, Result<Value>, bool)> = JoinSet::new();
+        for (idx, (name, args)) in calls.into_iter().enumerate() {
+            let sem = sem.clone();
+            let tools = tools.clone();
+            set.spawn(async move {
+                let _permit = match sem.acquire_owned().await {
+                    Ok(p) => p,
+                    Err(_) => {
+                        return (
+                            idx,
+                            Err(Error::other("tool dispatch semaphore closed")),
+                            false,
+                        )
+                    }
+                };
+                match tools.get(&name) {
+                    Some(tool) => (idx, tool.run(args).await, false),
+                    None => (
+                        idx,
+                        Err(Error::other(format!("unknown tool `{name}`"))),
+                        true,
+                    ),
+                }
+            });
+        }
+        while let Some(joined) = set.join_next().await {
+            let (idx, result, is_unknown) = match joined {
+                Ok(it) => it,
+                Err(e) => (
+                    usize::MAX,
+                    Err(Error::other(format!("tool task join: {e}"))),
+                    false,
+                ),
+            };
+            let is_err = result.is_err();
+            let _ = progress.update(|p| ToolDispatchProgress {
+                completed: p.completed + 1,
+                errors: p.errors + if is_err { 1 } else { 0 },
+                unknown_tool_errors: p.unknown_tool_errors
+                    + if is_unknown { 1 } else { 0 },
+                ..p.clone()
+            });
+            if tx.send((idx, result)).await.is_err() {
+                set.abort_all();
+                break;
+            }
+        }
+    });
+
+    Box::pin(ReceiverStream::new(rx))
+}
+
 /// Like `tool_dispatch_concurrent` but fail-fast: returns `Err` on
 /// the first failed call. Output aligned to inputs only on success.
 pub async fn tool_dispatch_concurrent_fail_fast(
@@ -606,6 +692,91 @@ mod tests {
     // ---- tool_dispatch_concurrent_stream tests ------------------------
 
     use futures::StreamExt;
+
+    // ---- tool_dispatch_concurrent_stream_with_progress tests ----------
+
+    #[tokio::test]
+    async fn stream_with_progress_yields_items_and_advances_counters() {
+        let (tools, _peak) = build_registry(&["a", "b"], 2);
+        let calls: Vec<_> = vec![
+            ("a".into(), json!({"i": 0})),
+            ("b".into(), json!({"i": 1})),
+            ("a".into(), json!({"i": 2})),
+            ("b".into(), json!({"i": 3})),
+        ];
+        let progress = Progress::new(ToolDispatchProgress::default());
+        let obs = progress.observer();
+        let mut s = tool_dispatch_concurrent_stream_with_progress(
+            tools, calls, 2, progress,
+        );
+        let mut count = 0;
+        while let Some((_idx, r)) = s.next().await {
+            assert!(r.is_ok());
+            count += 1;
+        }
+        assert_eq!(count, 4);
+        let snap = obs.snapshot();
+        assert_eq!(snap.total, 4);
+        assert_eq!(snap.completed, 4);
+        assert_eq!(snap.errors, 0);
+        assert_eq!(snap.unknown_tool_errors, 0);
+    }
+
+    #[tokio::test]
+    async fn stream_with_progress_buckets_unknown_tool_errors() {
+        let (tools, _peak) = build_registry(&["a"], 0);
+        let calls: Vec<_> = vec![
+            ("a".into(), json!({})),
+            ("missing-1".into(), json!({})),
+            ("a".into(), json!({})),
+            ("missing-2".into(), json!({})),
+        ];
+        let progress = Progress::new(ToolDispatchProgress::default());
+        let obs = progress.observer();
+        let mut s = tool_dispatch_concurrent_stream_with_progress(
+            tools, calls, 4, progress,
+        );
+        let mut errors_in_stream = 0;
+        while let Some((_idx, r)) = s.next().await {
+            if r.is_err() {
+                errors_in_stream += 1;
+            }
+        }
+        let snap = obs.snapshot();
+        assert_eq!(snap.completed, 4);
+        assert_eq!(snap.errors, 2);
+        assert_eq!(snap.unknown_tool_errors, 2);
+        assert_eq!(errors_in_stream, snap.errors as usize);
+    }
+
+    #[tokio::test]
+    async fn stream_with_progress_total_set_at_start() {
+        let (tools, _peak) = build_registry(&["a"], 0);
+        let calls: Vec<_> = (0..5)
+            .map(|i| ("a".into(), json!({"i": i})))
+            .collect();
+        let progress = Progress::new(ToolDispatchProgress::default());
+        let obs = progress.observer();
+        let _s = tool_dispatch_concurrent_stream_with_progress(
+            tools, calls, 2, progress,
+        );
+        assert_eq!(obs.snapshot().total, 5);
+    }
+
+    #[tokio::test]
+    async fn stream_with_progress_empty_calls_no_updates() {
+        let (tools, _peak) = build_registry(&["a"], 0);
+        let progress = Progress::new(ToolDispatchProgress::default());
+        let obs = progress.observer();
+        let mut s = tool_dispatch_concurrent_stream_with_progress(
+            tools,
+            vec![],
+            4,
+            progress,
+        );
+        assert!(s.next().await.is_none());
+        assert_eq!(obs.snapshot(), ToolDispatchProgress::default());
+    }
 
     #[tokio::test]
     async fn stream_yields_one_item_per_call() {

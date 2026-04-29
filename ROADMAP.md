@@ -234,6 +234,7 @@ patterns").
 | `batch_concurrent_stream_with_progress` (iter 216) | Composes iter 205 + iter 210 | First combination of two consumer shapes (stream + watcher) in one call. Per-row events drive a UI list view while `BatchProgress { total, completed, errors }` drives a summary progress bar — both backed by the same batch task. Demonstrates the four-quadrant matrix per axis: buffered Vec / progress-aware Vec / streaming / streaming-with-progress |
 | `embed_documents_concurrent_stream_with_progress` (iter 217) | Composes iter 206 + iter 211 | Combined consumer shape extended to the embed axis. Both chat-batch and embed-batch axes now ship all four quadrants. Same consistency contract as iter 216 (counter ticks before stream item) so observers and stream consumers see synchronized state |
 | `retrieve_concurrent_stream_with_progress` (iter 218) | Composes iter 207 + iter 212 | Combined consumer shape extended to the retriever axis. Three of six axes now ship the full four-quadrant matrix |
+| `tool_dispatch_concurrent_stream_with_progress` (iter 219) | Composes iter 208 + iter 213 | Combined consumer shape extended to the tool axis. Four of six axes now ship the full four-quadrant matrix. `unknown_tool_errors` bucketing carries over so observers see routing-vs-runtime breakdown live |
 
 ---
 
