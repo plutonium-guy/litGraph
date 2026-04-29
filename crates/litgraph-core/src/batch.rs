@@ -24,10 +24,11 @@
 
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
-use crate::{ChatModel, ChatOptions, ChatResponse, Error, Message, Result};
+use crate::{ChatModel, ChatOptions, ChatResponse, Error, Message, Progress, Result};
 
 /// Run N invocations of `model` concurrently, capped at `max_concurrency`
 /// in flight. Returns a `Vec` of `Result<ChatResponse>` aligned with the
@@ -80,6 +81,101 @@ pub async fn batch_concurrent(
                 if let Some(slot) = results.iter_mut().find(|s| s.is_none()) {
                     *slot = Some(Err(Error::other(format!("batch task join: {e}"))));
                 }
+            }
+        }
+    }
+
+    results
+        .into_iter()
+        .map(|s| s.unwrap_or_else(|| Err(Error::other("batch task lost"))))
+        .collect()
+}
+
+/// Counters maintained by [`batch_concurrent_with_progress`]. All
+/// fields are monotonic — they only increase as the batch advances.
+/// Snapshot from any [`Progress<BatchProgress>`] observer to drive a
+/// progress bar, log throughput, or trip a circuit breaker on stuck
+/// runs.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BatchProgress {
+    /// Total inputs submitted (set once at the start).
+    pub total: u64,
+    /// Inputs whose `invoke` has finished, success or failure.
+    pub completed: u64,
+    /// Subset of `completed` that returned `Err`.
+    pub errors: u64,
+}
+
+/// Same as [`batch_concurrent`] but updates `progress` as each input
+/// completes. Real use case: an eval harness running 1000 LLM evals
+/// rendering a live counter / ETA.
+///
+/// `progress.total` is set on entry; `completed` and `errors` are
+/// incremented as `invoke` calls finish. Observers can snapshot
+/// at any time and see the latest counters — `tokio::sync::watch`
+/// semantics (iter 199) collapse rapid updates to the latest state.
+///
+/// Composition: this is the second progress-aware composition iter
+/// after `ingest_to_stream_with_progress` (iter 200). Same pattern,
+/// different domain.
+pub async fn batch_concurrent_with_progress(
+    model: Arc<dyn ChatModel>,
+    inputs: Vec<Vec<Message>>,
+    opts: ChatOptions,
+    max_concurrency: usize,
+    progress: Progress<BatchProgress>,
+) -> Vec<Result<ChatResponse>> {
+    if inputs.is_empty() {
+        return Vec::new();
+    }
+    // Set total up front so observers see the run size before the
+    // first completion arrives.
+    let total = inputs.len() as u64;
+    let _ = progress.update(|p| BatchProgress {
+        total,
+        ..p.clone()
+    });
+
+    let cap = max_concurrency.max(1);
+    let sem = Arc::new(Semaphore::new(cap));
+    let mut set: JoinSet<(usize, Result<ChatResponse>)> = JoinSet::new();
+
+    for (idx, msgs) in inputs.into_iter().enumerate() {
+        let sem = sem.clone();
+        let model = model.clone();
+        let opts = opts.clone();
+        set.spawn(async move {
+            let _permit = match sem.acquire_owned().await {
+                Ok(p) => p,
+                Err(_) => return (idx, Err(Error::other("batch semaphore closed"))),
+            };
+            let r = model.invoke(msgs, &opts).await;
+            (idx, r)
+        });
+    }
+
+    let mut results: Vec<Option<Result<ChatResponse>>> = (0..set.len()).map(|_| None).collect();
+
+    while let Some(joined) = set.join_next().await {
+        match joined {
+            Ok((idx, r)) => {
+                let is_err = r.is_err();
+                results[idx] = Some(r);
+                let _ = progress.update(|p| BatchProgress {
+                    completed: p.completed + 1,
+                    errors: p.errors + if is_err { 1 } else { 0 },
+                    ..p.clone()
+                });
+            }
+            Err(e) => {
+                if let Some(slot) = results.iter_mut().find(|s| s.is_none()) {
+                    *slot = Some(Err(Error::other(format!("batch task join: {e}"))));
+                }
+                let _ = progress.update(|p| BatchProgress {
+                    completed: p.completed + 1,
+                    errors: p.errors + 1,
+                    ..p.clone()
+                });
             }
         }
     }
@@ -319,5 +415,128 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out.len(), 3);
+    }
+
+    // ---- batch_concurrent_with_progress tests --------------------------
+
+    #[tokio::test]
+    async fn progress_total_is_set_at_start() {
+        let model: Arc<dyn ChatModel> = Arc::new(ConcurrencyProbe {
+            in_flight: Arc::new(AtomicUsize::new(0)),
+            peak: Arc::new(AtomicUsize::new(0)),
+            delay_ms: 0,
+        });
+        let inputs: Vec<Vec<Message>> = (0..7).map(|i| input(&format!("q{i}"))).collect();
+        let progress = Progress::new(BatchProgress::default());
+        let obs = progress.observer();
+        let _ = batch_concurrent_with_progress(
+            model,
+            inputs,
+            ChatOptions::default(),
+            4,
+            progress,
+        )
+        .await;
+        let snap = obs.snapshot();
+        assert_eq!(snap.total, 7);
+    }
+
+    #[tokio::test]
+    async fn progress_counts_completions() {
+        let model: Arc<dyn ChatModel> = Arc::new(ConcurrencyProbe {
+            in_flight: Arc::new(AtomicUsize::new(0)),
+            peak: Arc::new(AtomicUsize::new(0)),
+            delay_ms: 0,
+        });
+        let inputs: Vec<Vec<Message>> = (0..5).map(|i| input(&format!("q{i}"))).collect();
+        let progress = Progress::new(BatchProgress::default());
+        let obs = progress.observer();
+        let out = batch_concurrent_with_progress(
+            model,
+            inputs,
+            ChatOptions::default(),
+            4,
+            progress,
+        )
+        .await;
+        assert_eq!(out.len(), 5);
+        let snap = obs.snapshot();
+        assert_eq!(snap.total, 5);
+        assert_eq!(snap.completed, 5);
+        assert_eq!(snap.errors, 0);
+    }
+
+    #[tokio::test]
+    async fn progress_records_errors() {
+        let model: Arc<dyn ChatModel> = Arc::new(FailOn {
+            bad_index: 2,
+            seen: Arc::new(AtomicUsize::new(0)),
+        });
+        let inputs: Vec<Vec<Message>> =
+            (0..5).map(|i| input(&format!("idx={i}"))).collect();
+        let progress = Progress::new(BatchProgress::default());
+        let obs = progress.observer();
+        let _ = batch_concurrent_with_progress(
+            model,
+            inputs,
+            ChatOptions::default(),
+            4,
+            progress,
+        )
+        .await;
+        let snap = obs.snapshot();
+        assert_eq!(snap.total, 5);
+        assert_eq!(snap.completed, 5);
+        assert_eq!(snap.errors, 1);
+    }
+
+    #[tokio::test]
+    async fn progress_observer_can_be_polled_mid_run() {
+        let model: Arc<dyn ChatModel> = Arc::new(ConcurrencyProbe {
+            in_flight: Arc::new(AtomicUsize::new(0)),
+            peak: Arc::new(AtomicUsize::new(0)),
+            delay_ms: 10,
+        });
+        let inputs: Vec<Vec<Message>> = (0..8).map(|i| input(&format!("q{i}"))).collect();
+        let progress = Progress::new(BatchProgress::default());
+        let mut obs = progress.observer();
+        let h = tokio::spawn(batch_concurrent_with_progress(
+            model,
+            inputs,
+            ChatOptions::default(),
+            2,
+            progress,
+        ));
+        // Wait for any update (total set, or first completion).
+        let _ = obs.changed().await;
+        let mid = obs.snapshot();
+        assert_eq!(mid.total, 8);
+        // Drain rest.
+        let _ = h.await.unwrap();
+        let snap = obs.snapshot();
+        assert_eq!(snap.completed, 8);
+    }
+
+    #[tokio::test]
+    async fn progress_empty_inputs_no_updates() {
+        let model: Arc<dyn ChatModel> = Arc::new(ConcurrencyProbe {
+            in_flight: Arc::new(AtomicUsize::new(0)),
+            peak: Arc::new(AtomicUsize::new(0)),
+            delay_ms: 0,
+        });
+        let progress = Progress::new(BatchProgress::default());
+        let obs = progress.observer();
+        let out = batch_concurrent_with_progress(
+            model,
+            vec![],
+            ChatOptions::default(),
+            4,
+            progress,
+        )
+        .await;
+        assert!(out.is_empty());
+        // Empty input → no progress mutations either.
+        let snap = obs.snapshot();
+        assert_eq!(snap, BatchProgress::default());
     }
 }
