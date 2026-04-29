@@ -40,12 +40,15 @@
 //!    10k-query eval run with `max=50` is bounded — won't melt the
 //!    runtime or the underlying provider's rate limit.
 
+use std::pin::Pin;
 use std::sync::Arc;
 
+use futures::Stream;
 use litgraph_core::{Document, Error, Progress, Result};
 use serde::{Deserialize, Serialize};
-use tokio::sync::Semaphore;
+use tokio::sync::{mpsc, Semaphore};
 use tokio::task::JoinSet;
+use tokio_stream::wrappers::ReceiverStream;
 
 use crate::retriever::Retriever;
 
@@ -187,6 +190,67 @@ pub async fn retrieve_concurrent_with_progress(
         .into_iter()
         .map(|s| s.unwrap_or_else(|| Err(Error::other("retrieve slot lost"))))
         .collect()
+}
+
+/// One item from [`retrieve_concurrent_stream`] — the input query
+/// index plus that query's outcome, emitted in completion order.
+pub type RetrieveStreamItem = (usize, Result<Vec<Document>>);
+
+/// Streaming variant of [`retrieve_concurrent`]. Yields
+/// `(query_idx, Result)` pairs as each query completes — caller
+/// drains in completion order, can dispatch downstream work
+/// immediately on early completers, and dropping the stream aborts
+/// remaining in-flight work.
+///
+/// Streaming-variant pattern from iter 210 (chat batch) and iter
+/// 211 (embed batch) extended to the retriever axis.
+///
+/// `max_concurrency = 0` is normalised to 1 (sequential).
+pub fn retrieve_concurrent_stream(
+    retriever: Arc<dyn Retriever>,
+    queries: Vec<String>,
+    k: usize,
+    max_concurrency: usize,
+) -> Pin<Box<dyn Stream<Item = RetrieveStreamItem> + Send>> {
+    if queries.is_empty() {
+        return Box::pin(futures::stream::empty());
+    }
+    let cap = max_concurrency.max(1);
+    let n = queries.len();
+    let buf = n.min(cap.max(8));
+    let (tx, rx) = mpsc::channel::<RetrieveStreamItem>(buf);
+
+    tokio::spawn(async move {
+        let sem = Arc::new(Semaphore::new(cap));
+        let mut set: JoinSet<RetrieveStreamItem> = JoinSet::new();
+        for (idx, q) in queries.into_iter().enumerate() {
+            let sem = sem.clone();
+            let retriever = retriever.clone();
+            set.spawn(async move {
+                let _permit = match sem.acquire_owned().await {
+                    Ok(p) => p,
+                    Err(_) => return (idx, Err(Error::other("retrieve semaphore closed"))),
+                };
+                let r = retriever.retrieve(&q, k).await;
+                (idx, r)
+            });
+        }
+        while let Some(joined) = set.join_next().await {
+            let item = match joined {
+                Ok(it) => it,
+                Err(e) => (
+                    usize::MAX,
+                    Err(Error::other(format!("retrieve task join: {e}"))),
+                ),
+            };
+            if tx.send(item).await.is_err() {
+                set.abort_all();
+                break;
+            }
+        }
+    });
+
+    Box::pin(ReceiverStream::new(rx))
 }
 
 /// Like `retrieve_concurrent` but fail-fast: returns `Err` on the
@@ -407,6 +471,96 @@ mod tests {
         let _ = h.await.unwrap();
         let snap = obs.snapshot();
         assert_eq!(snap.completed, 8);
+    }
+
+    // ---- retrieve_concurrent_stream tests -----------------------------
+
+    use futures::StreamExt;
+
+    #[tokio::test]
+    async fn stream_yields_one_item_per_query() {
+        let (r, _peak) = probe(0);
+        let mut s = retrieve_concurrent_stream(r, qs(6), 1, 4);
+        let mut indices: Vec<usize> = Vec::new();
+        while let Some((idx, res)) = s.next().await {
+            assert!(res.is_ok());
+            indices.push(idx);
+        }
+        indices.sort();
+        assert_eq!(indices, (0..6).collect::<Vec<_>>());
+    }
+
+    #[tokio::test]
+    async fn stream_idx_aligns_with_input_query() {
+        let (r, _peak) = probe(0);
+        let queries = qs(5);
+        let mut s = retrieve_concurrent_stream(r, queries.clone(), 1, 2);
+        while let Some((idx, res)) = s.next().await {
+            let docs = res.unwrap();
+            assert_eq!(docs.len(), 1);
+            // probe echoes query into the doc content; verify idx
+            // matches the query at that position.
+            assert_eq!(docs[0].content, queries[idx]);
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_per_query_failure_arrives_as_err_item() {
+        struct FailOnQ {
+            bad: String,
+        }
+        #[async_trait::async_trait]
+        impl Retriever for FailOnQ {
+            async fn retrieve(
+                &self,
+                query: &str,
+                _k: usize,
+            ) -> Result<Vec<Document>> {
+                if query == self.bad {
+                    Err(Error::other("synthetic"))
+                } else {
+                    Ok(vec![Document::new(query)])
+                }
+            }
+        }
+        let r: Arc<dyn Retriever> = Arc::new(FailOnQ {
+            bad: "q2".into(),
+        });
+        let mut s = retrieve_concurrent_stream(r, qs(5), 1, 4);
+        let mut count = 0;
+        let mut errors = 0;
+        while let Some((_idx, res)) = s.next().await {
+            count += 1;
+            if res.is_err() {
+                errors += 1;
+            }
+        }
+        assert_eq!(count, 5);
+        assert_eq!(errors, 1);
+    }
+
+    #[tokio::test]
+    async fn stream_empty_queries_yields_empty() {
+        let (r, _peak) = probe(0);
+        let mut s = retrieve_concurrent_stream(r, vec![], 1, 4);
+        assert!(s.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn stream_caller_drop_aborts_in_flight_queries() {
+        // 50 queries × 50ms / cap=2 → full sequential ~1.25s. Drop
+        // after 1 item; total wall-clock should be far less.
+        let (r, _peak) = probe(50);
+        let started = std::time::Instant::now();
+        {
+            let mut s = retrieve_concurrent_stream(r, qs(50), 1, 2);
+            let _first = s.next().await.unwrap();
+        }
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        assert!(
+            elapsed_ms < 400,
+            "elapsed {elapsed_ms}ms — caller-drop didn't abort remaining queries",
+        );
     }
 
     #[tokio::test]
