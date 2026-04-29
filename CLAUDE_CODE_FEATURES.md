@@ -282,7 +282,7 @@ long-term Store. Older (v0.3) features rolled in from prior audit.
 | Trajectory evaluators | Agent path grading | ✅ `litgraph.evaluators.evaluate_trajectory(actual, expected, policy)`; policies: `contains_all`, `exact_order`, `subsequence` (LCS), `levenshtein` |
 | Pairwise comparison | A/B model | ✅ `litgraph.evaluators.PairwiseEvaluator(model, criteria=None)` — returns `{winner, confidence, reason}`; deterministic order randomization for position-bias mitigation |
 | Synthetic data generation | Bootstrap eval set | ✅ `litgraph.evaluators.synthesize_eval_cases(seeds, model, target_count, criteria=None)` — LLM-driven structured-output expansion of seed cases; dedups against seeds, caps at `target_count`, drops empty inputs |
-| Dataset versioning | Track regressions | ❌ no built-in |
+| Dataset versioning | Track regressions | ✅ `litgraph_core::{DatasetManifest, RunRecord, RunStore, regression_check, record_and_check}` — BLAKE3 fingerprint over canonicalised cases (order-stable, metadata-ignored), `InMemoryRunStore` + `JsonlRunStore` (append-atomic JSONL, restart-survival), per-scorer regression alerts with tolerance, fingerprint-mismatch suppresses noise on dataset edits |
 
 ## 18. Observability
 

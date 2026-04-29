@@ -30,6 +30,7 @@ pub mod trajectory;
 pub mod pairwise;
 pub mod eval_synth;
 pub mod tool_offload;
+pub mod dataset_version;
 
 pub use error::{Error, Result};
 pub use structured::StructuredChatModel;
@@ -67,6 +68,10 @@ pub use tool_offload::{
     default_offload_dir, is_offloaded_marker, resolve_handle, FilesystemOffloadBackend,
     InMemoryOffloadBackend, OffloadBackend, OffloadingTool, DEFAULT_PREVIEW_BYTES,
     DEFAULT_THRESHOLD_BYTES,
+};
+pub use dataset_version::{
+    dataset_fingerprint, record_and_check, regression_check, DatasetManifest,
+    InMemoryRunStore, JsonlRunStore, RegressionAlert, RunRecord, RunStore,
 };
 pub use eval_harness::{
     run_eval, AggregateScores, ContainsAllScorer, EvalCase, EvalCaseResult, EvalDataset,
