@@ -26,6 +26,7 @@ pub mod vector_store_memory;
 pub mod store;
 pub mod middleware;
 pub mod skill_loader;
+pub mod trajectory;
 
 pub use error::{Error, Result};
 pub use structured::StructuredChatModel;
@@ -56,6 +57,7 @@ pub use middleware::{
     MiddlewareChatModel, SystemPromptMiddleware,
 };
 pub use skill_loader::{load_agents_md, load_skills_dir, Skill, SystemPromptBuilder};
+pub use trajectory::{evaluate_trajectory, TrajectoryPolicy, TrajectoryStep};
 pub use eval_harness::{
     run_eval, AggregateScores, ContainsAllScorer, EvalCase, EvalCaseResult, EvalDataset,
     EvalReport, ExactMatchScorer, JaccardScorer, LevenshteinScorer, LlmJudgeScorer, RegexScorer,

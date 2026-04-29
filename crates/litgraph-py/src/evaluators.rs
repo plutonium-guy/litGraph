@@ -5,13 +5,15 @@ use std::sync::Arc;
 
 use litgraph_core::{
     contains_all as core_contains_all, contains_any as core_contains_any,
-    embedding_cosine as core_embedding_cosine, exact_match as core_exact_match,
+    embedding_cosine as core_embedding_cosine,
+    evaluate_trajectory as core_evaluate_trajectory, exact_match as core_exact_match,
     exact_match_strict as core_exact_match_strict, jaccard_similarity as core_jaccard_similarity,
     json_validity as core_json_validity, levenshtein as core_levenshtein,
     levenshtein_ratio as core_levenshtein_ratio, luhn_valid as core_luhn_valid,
     regex_match as core_regex_match, run_eval as core_run_eval, ChatModel, ContainsAllScorer,
     EvalCase, EvalDataset, ExactMatchScorer, JaccardScorer, LevenshteinScorer, LlmJudge,
-    LlmJudgeScorer, PiiScrubber as CorePiiScrubber, RegexScorer, Scorer,
+    LlmJudgeScorer, PiiScrubber as CorePiiScrubber, RegexScorer, Scorer, TrajectoryPolicy,
+    TrajectoryStep,
 };
 use pyo3::types::PyList;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
@@ -35,7 +37,66 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyPiiScrubber>()?;
     m.add_function(wrap_pyfunction!(luhn_valid, m)?)?;
     m.add_function(wrap_pyfunction!(run_eval, m)?)?;
+    m.add_function(wrap_pyfunction!(evaluate_trajectory, m)?)?;
     Ok(())
+}
+
+/// Score an agent trajectory against an expected one. `actual` and `expected`
+/// are lists of dicts with at least a `tool` key (`input` is optional). The
+/// `policy` argument selects the scoring rule:
+/// * `"contains_all"` — fraction of expected tools that appear in actual.
+/// * `"exact_order"` — 1.0 if sequences match exactly, else 0.0.
+/// * `"subsequence"` — LCS(actual, expected) / len(expected).
+/// * `"levenshtein"` — 1 - editdistance/maxlen on tool-name strings.
+///
+/// Returns a float in `[0.0, 1.0]`.
+#[pyfunction]
+#[pyo3(signature = (actual, expected, policy="subsequence"))]
+fn evaluate_trajectory(
+    actual: Bound<'_, PyList>,
+    expected: Bound<'_, PyList>,
+    policy: &str,
+) -> PyResult<f64> {
+    let act = parse_traj_list(&actual)?;
+    let exp = parse_traj_list(&expected)?;
+    let pol = match policy {
+        "contains_all" => TrajectoryPolicy::ContainsAll,
+        "exact_order" => TrajectoryPolicy::ExactOrder,
+        "subsequence" => TrajectoryPolicy::Subsequence,
+        "levenshtein" => TrajectoryPolicy::Levenshtein,
+        other => {
+            return Err(PyValueError::new_err(format!(
+                "unknown policy `{other}`; expected one of contains_all, exact_order, \
+                 subsequence, levenshtein"
+            )));
+        }
+    };
+    Ok(core_evaluate_trajectory(&act, &exp, pol))
+}
+
+fn parse_traj_list(list: &Bound<'_, PyList>) -> PyResult<Vec<TrajectoryStep>> {
+    let mut out = Vec::with_capacity(list.len());
+    for item in list.iter() {
+        // Accept dict-style or string-style entries. String → just the tool name.
+        if let Ok(s) = item.extract::<String>() {
+            out.push(TrajectoryStep::new(s));
+            continue;
+        }
+        let dict = item.downcast::<PyDict>().map_err(|_| {
+            PyValueError::new_err("trajectory entries must be str or dict")
+        })?;
+        let tool: String = dict
+            .get_item("tool")?
+            .ok_or_else(|| PyValueError::new_err("trajectory dict missing `tool` key"))?
+            .extract()?;
+        let input = if let Some(v) = dict.get_item("input")? {
+            Some(crate::graph::py_to_json(v.py(), &v)?)
+        } else {
+            None
+        };
+        out.push(TrajectoryStep { tool, input });
+    }
+    Ok(out)
 }
 
 /// Standalone Luhn-check helper. `True` if the digit string (spaces /
