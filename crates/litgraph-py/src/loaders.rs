@@ -1,13 +1,16 @@
 //! Python bindings for loaders. All `load()` calls release the GIL and run the
 //! rayon-parallel directory traversal on Rust threads.
 
+use std::sync::Arc;
+
 use litgraph_loaders::{
-    html_to_markdown, ConfluenceLoader, CsvLoader, DirectoryLoader, DocxLoader, GitLabFilesLoader,
-    GitLabIssuesLoader, GithubFilesLoader, GithubIssuesLoader, GmailLoader, GoogleDriveLoader,
-    HtmlLoader, HtmlToMarkdownTransformer, JiraIssuesLoader, JsonLinesLoader, JsonLoader,
-    JupyterNotebookLoader, LinearIssuesLoader, Loader, MarkdownLoader, NotionLoader, PdfLoader,
-    S3Loader, SitemapLoader, SlackLoader, TextLoader, WebLoader, default_dispatcher,
+    html_to_markdown, load_concurrent, ConfluenceLoader, CsvLoader, DirectoryLoader, DocxLoader,
+    GitLabFilesLoader, GitLabIssuesLoader, GithubFilesLoader, GithubIssuesLoader, GmailLoader,
+    GoogleDriveLoader, HtmlLoader, HtmlToMarkdownTransformer, JiraIssuesLoader, JsonLinesLoader,
+    JsonLoader, JupyterNotebookLoader, LinearIssuesLoader, Loader, MarkdownLoader, NotionLoader,
+    PdfLoader, S3Loader, SitemapLoader, SlackLoader, TextLoader, WebLoader, default_dispatcher,
 };
+use crate::runtime::block_on_compat;
 use litgraph_providers_bedrock::AwsCredentials;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
@@ -42,7 +45,89 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PySitemapLoader>()?;
     m.add_class::<PyHtmlToMarkdownTransformer>()?;
     m.add_function(pyo3::wrap_pyfunction!(py_html_to_markdown, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(py_load_concurrent, m)?)?;
     Ok(())
+}
+
+/// Run N file-based loaders concurrently, capped at `max_concurrency`
+/// in flight. Each loader's `load()` runs on the Tokio
+/// blocking-thread pool so the async runtime stays free.
+///
+/// Output[i] is aligned to input[i]: a list of loaded documents on
+/// success, or a one-element list `[{"error": "..."}]` if that
+/// loader failed (the rest of the batch still completes). Pass
+/// `fail_fast=True` to raise on the first error instead.
+///
+/// Accepts the file-based loaders: TextLoader, JsonLinesLoader,
+/// MarkdownLoader, CsvLoader, HtmlLoader, JsonLoader. Network /
+/// API-key loaders aren't accepted yet — wrap your fan-out manually
+/// or use `asyncio.gather` on each one's `load()`.
+///
+/// ```python
+/// from litgraph.loaders import TextLoader, load_concurrent
+/// loaders = [TextLoader(p) for p in paths]
+/// results = load_concurrent(loaders, max_concurrency=8)
+/// for path, docs in zip(paths, results):
+///     if docs and docs[0].get("error"):
+///         print(f"failed: {path}: {docs[0]['error']}")
+///     else:
+///         print(f"{path}: {len(docs)} docs")
+/// ```
+#[pyfunction]
+#[pyo3(name = "load_concurrent", signature = (loaders, max_concurrency=4, fail_fast=false))]
+fn py_load_concurrent<'py>(
+    py: Python<'py>,
+    loaders: Bound<'py, PyList>,
+    max_concurrency: usize,
+    fail_fast: bool,
+) -> PyResult<Bound<'py, PyList>> {
+    let mut arcs: Vec<Arc<dyn Loader>> = Vec::with_capacity(loaders.len());
+    for item in loaders.iter() {
+        let l: Arc<dyn Loader> = if let Ok(t) = item.extract::<PyRef<PyTextLoader>>() {
+            Arc::new(t.inner.clone())
+        } else if let Ok(j) = item.extract::<PyRef<PyJsonLinesLoader>>() {
+            Arc::new(j.inner.clone())
+        } else if let Ok(m) = item.extract::<PyRef<PyMarkdownLoader>>() {
+            Arc::new(m.inner.clone())
+        } else if let Ok(c) = item.extract::<PyRef<PyCsvLoader>>() {
+            Arc::new(c.inner.clone())
+        } else if let Ok(h) = item.extract::<PyRef<PyHtmlLoader>>() {
+            Arc::new(h.inner.clone())
+        } else if let Ok(j) = item.extract::<PyRef<PyJsonLoader>>() {
+            Arc::new(j.inner.clone())
+        } else {
+            return Err(PyRuntimeError::new_err(
+                "load_concurrent only accepts file loaders: TextLoader, JsonLinesLoader, \
+                 MarkdownLoader, CsvLoader, HtmlLoader, JsonLoader",
+            ));
+        };
+        arcs.push(l);
+    }
+
+    let results = py.allow_threads(|| {
+        block_on_compat(async move {
+            Ok::<_, litgraph_core::Error>(load_concurrent(arcs, max_concurrency).await)
+        })
+        .map_err(|e: litgraph_core::Error| PyRuntimeError::new_err(e.to_string()))
+    })?;
+
+    let out = PyList::empty_bound(py);
+    for r in results {
+        match r {
+            Ok(docs) => out.append(docs_to_pylist(py, docs)?)?,
+            Err(e) => {
+                if fail_fast {
+                    return Err(PyRuntimeError::new_err(e.to_string()));
+                }
+                let err_list = PyList::empty_bound(py);
+                let err_dict = pyo3::types::PyDict::new_bound(py);
+                err_dict.set_item("error", e.to_string())?;
+                err_list.append(err_dict)?;
+                out.append(err_list)?;
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Convert an HTML string to clean Markdown. Pure-function counterpart to

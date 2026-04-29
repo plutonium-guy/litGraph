@@ -201,6 +201,7 @@ patterns").
 | `RaceChatModel` (iter 184) | `JoinSet` + `abort_all` | Hedged-request pattern: invoke N concurrently, first success wins, losers cancelled. Tail-latency reduction across providers/regions |
 | `SemanticStore` (iter 185) | Rayon `par_iter` cosine + `par_sort` | Brute-force semantic search on any `Store`; Rayon makes it CPU-saturating across cores. Python's `numpy` would still hit the GIL on the gather step |
 | `EnsembleReranker` (iter 186) | `tokio::join_all` over rerankers | Fans N rerankers over the SAME candidates concurrently; weighted RRF on ranks (scale-free across providers). LangChain's reranker chains run sequential |
+| `load_concurrent` (iter 187) | `spawn_blocking` + `Semaphore` | Sync `Loader::load()` calls fan out onto Tokio's blocking pool; aligned output, per-loader `Result`. LangChain's loader chains are sequential by convention |
 
 ---
 

@@ -80,6 +80,8 @@ pub mod discord;
 pub use discord::DiscordChannelLoader;
 pub mod outlook;
 pub use outlook::OutlookMessagesLoader;
+pub mod concurrent;
+pub use concurrent::{load_concurrent, load_concurrent_flat, DEFAULT_LOAD_CONCURRENCY};
 
 #[derive(Debug, thiserror::Error)]
 pub enum LoaderError {
@@ -106,6 +108,7 @@ pub trait Loader: Send + Sync {
 }
 
 /// Plain UTF-8 text file — one file → one document.
+#[derive(Clone)]
 pub struct TextLoader {
     pub path: PathBuf,
 }
@@ -125,6 +128,7 @@ impl Loader for TextLoader {
 
 /// JSONL — one line per document. `content_field` selects which JSON key becomes
 /// `Document::content`; every other field is attached as metadata.
+#[derive(Clone)]
 pub struct JsonLinesLoader {
     pub path: PathBuf,
     pub content_field: String,
@@ -185,6 +189,7 @@ impl Loader for JsonLinesLoader {
 ///        Dot-separated keys; numeric components index into arrays.
 ///
 /// Errors if the path doesn't resolve, or if a non-array sits at the pointer.
+#[derive(Clone)]
 pub struct JsonLoader {
     pub path: PathBuf,
     pub pointer: Option<String>,
@@ -300,6 +305,7 @@ impl Loader for JsonLoader {
 ///
 /// First row is treated as a header. Customize the delimiter for TSV / pipe
 /// files via `with_delimiter`.
+#[derive(Clone)]
 pub struct CsvLoader {
     pub path: PathBuf,
     pub content_column: Option<String>,
@@ -390,6 +396,7 @@ impl Loader for CsvLoader {
 
 /// Markdown file (no frontmatter parsing here — header-splitting happens in
 /// `litgraph-splitters::MarkdownHeaderSplitter`).
+#[derive(Clone)]
 pub struct MarkdownLoader {
     pub path: PathBuf,
 }
