@@ -127,6 +127,71 @@ impl SemanticStore {
         self.inner.delete(namespace, key).await
     }
 
+    /// Bulk-insert N items in one call. Embedding work is dispatched
+    /// in concurrent chunks via [`embed_documents_concurrent`] (iter
+    /// 183) — far cheaper than calling `put` N times serially since
+    /// each provider call covers many texts per HTTP round-trip and
+    /// chunks fan out across the embed-concurrency cap.
+    ///
+    /// Closes LangGraph's `BaseStore::mset` parity gap. Real prod
+    /// use: ingest pipeline upserts thousands of docs into a
+    /// per-tenant semantic memory namespace in a single call.
+    ///
+    /// `items` shape: `(key, text, value)` triples. All items go
+    /// into the same `namespace` and get the same `ttl_ms`. The
+    /// returned vec is aligned 1:1 with input — `Ok(())` for
+    /// successful puts, `Err(_)` for failures.
+    ///
+    /// `embed_chunk_size` and `embed_concurrency` tune the embed
+    /// fan-out (defaults: `DEFAULT_EMBED_CHUNK_SIZE`,
+    /// `DEFAULT_EMBED_CONCURRENCY`).
+    pub async fn bulk_put(
+        &self,
+        namespace: &Namespace,
+        items: Vec<(String, String, Value)>,
+        ttl_ms: Option<u64>,
+        embed_chunk_size: usize,
+        embed_concurrency: usize,
+    ) -> Result<Vec<Result<()>>> {
+        if items.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Phase 1: embed every text in concurrent chunks. Output
+        // is aligned 1:1 with `texts`, so we can zip back into
+        // `(key, text, value, embedding)` quads.
+        let texts: Vec<String> = items.iter().map(|(_, t, _)| t.clone()).collect();
+        let embeddings = crate::embed_documents_concurrent(
+            self.embedder.clone(),
+            &texts,
+            embed_chunk_size,
+            embed_concurrency,
+        )
+        .await?;
+        if embeddings.len() != items.len() {
+            return Err(Error::other(format!(
+                "SemanticStore::bulk_put embed length mismatch: \
+                 expected {}, got {}",
+                items.len(),
+                embeddings.len(),
+            )));
+        }
+
+        // Phase 2: per-item put against the underlying store. Each
+        // `put` is one document write — cheap for in-memory stores;
+        // for Postgres this could batch via a single SQL call (a
+        // future iter could add a `put_many` to the `Store` trait).
+        let mut results = Vec::with_capacity(items.len());
+        for ((key, text, value), emb) in items.into_iter().zip(embeddings) {
+            let wrapped = json!({
+                EMBED_KEY: emb,
+                TEXT_KEY: text,
+                VALUE_KEY: value,
+            });
+            results.push(self.inner.put(namespace, &key, &wrapped, ttl_ms).await);
+        }
+        Ok(results)
+    }
+
     /// Embed `query`, fetch all items in `namespace_prefix` (optionally
     /// pre-filtered by `filter`), score each in parallel via Rayon, and
     /// return the top-`k` by cosine similarity.
@@ -375,5 +440,89 @@ mod tests {
         assert_eq!(cosine_sim(&[0.0, 0.0], &[1.0, 1.0]), 0.0);
         let v = (cosine_sim(&[1.0, 0.0], &[1.0, 0.0]) - 1.0).abs();
         assert!(v < 1e-6);
+    }
+
+    // ---- bulk_put tests ----------------------------------------------
+
+    #[tokio::test]
+    async fn bulk_put_inserts_every_item_and_search_finds_them() {
+        let s = fixture();
+        let ns = vec!["facts".to_string()];
+        let items = vec![
+            ("k0".to_string(), "rust safety".to_string(), json!({"id": 0})),
+            ("k1".to_string(), "memory leaks".to_string(), json!({"id": 1})),
+            ("k2".to_string(), "javascript closures".to_string(), json!({"id": 2})),
+        ];
+        let results = s.bulk_put(&ns, items, None, 16, 4).await.unwrap();
+        assert_eq!(results.len(), 3);
+        assert!(results.iter().all(|r| r.is_ok()));
+        // Each key round-trips through `get`.
+        let (text, value) = s.get(&ns, "k0").await.unwrap().unwrap();
+        assert_eq!(text, "rust safety");
+        assert_eq!(value, json!({"id": 0}));
+        let (text, value) = s.get(&ns, "k2").await.unwrap().unwrap();
+        assert_eq!(text, "javascript closures");
+        assert_eq!(value, json!({"id": 2}));
+    }
+
+    #[tokio::test]
+    async fn bulk_put_empty_returns_empty() {
+        let s = fixture();
+        let ns = vec!["facts".to_string()];
+        let r = s.bulk_put(&ns, vec![], None, 16, 4).await.unwrap();
+        assert!(r.is_empty());
+    }
+
+    #[tokio::test]
+    async fn bulk_put_results_aligned_to_input_order() {
+        let s = fixture();
+        let ns = vec!["aligned".to_string()];
+        let items = (0..10)
+            .map(|i| {
+                (
+                    format!("k{i}"),
+                    format!("text-{i}"),
+                    json!({"order": i}),
+                )
+            })
+            .collect();
+        let results = s.bulk_put(&ns, items, None, 4, 2).await.unwrap();
+        assert_eq!(results.len(), 10);
+        // Each key/value should round-trip in the order we sent.
+        for i in 0..10 {
+            let (_, v) = s.get(&ns, &format!("k{i}")).await.unwrap().unwrap();
+            assert_eq!(v["order"], i);
+        }
+    }
+
+    #[tokio::test]
+    async fn bulk_put_then_semantic_search_uses_indexed_embeddings() {
+        let s = fixture();
+        let ns = vec!["search".to_string()];
+        let items = vec![
+            ("a".to_string(), "rust safety".to_string(), json!({"id": "a"})),
+            ("b".to_string(), "memory leaks".to_string(), json!({"id": "b"})),
+            ("c".to_string(), "javascript closures".to_string(), json!({"id": "c"})),
+        ];
+        s.bulk_put(&ns, items, None, 8, 4).await.unwrap();
+        // ToyEmbedder maps "rust" → [1,0]; matching query lifts "a".
+        let hits = s.semantic_search(&ns, "rust performance", 3, None).await.unwrap();
+        assert_eq!(hits.len(), 3);
+        assert_eq!(hits[0].key, "a");
+    }
+
+    #[tokio::test]
+    async fn bulk_put_chunk_size_zero_normalised() {
+        // chunk_size=0 → embed_documents_concurrent normalises to one
+        // chunk; behaviour should still produce N results.
+        let s = fixture();
+        let ns = vec!["chunk0".to_string()];
+        let items = vec![
+            ("a".to_string(), "rust".to_string(), json!(0)),
+            ("b".to_string(), "memory".to_string(), json!(1)),
+        ];
+        let r = s.bulk_put(&ns, items, None, 0, 4).await.unwrap();
+        assert_eq!(r.len(), 2);
+        assert!(r.iter().all(|x| x.is_ok()));
     }
 }
