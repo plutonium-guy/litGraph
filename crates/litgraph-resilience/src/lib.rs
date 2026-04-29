@@ -742,6 +742,153 @@ impl Embeddings for FallbackEmbeddings {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// RaceEmbeddings — concurrent N-provider race, first-success-wins
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Embeddings analogue of [`RaceChatModel`]: invokes every inner
+/// `Embeddings` provider concurrently, returns the first successful
+/// result, aborts the others.
+///
+/// # Why use this over `FallbackEmbeddings`
+///
+/// `FallbackEmbeddings` is **sequential** — try A, on failure try B
+/// (cost-min, but pays A's full latency before B even starts).
+/// `RaceEmbeddings` is **concurrent** — issue A, B, C at the same
+/// instant, take whoever returns first (latency-min, pays for all
+/// requests but cuts the p95).
+///
+/// Typical patterns:
+/// - Hedge a remote provider (OpenAI / Voyage / Cohere) against a
+///   local fastembed cross-encoder. Local usually wins on warm
+///   cache; remote wins when local hits CPU pressure.
+/// - Multi-region embedding: us-east + eu-west, race for whichever
+///   is closer to the caller's pod.
+/// - Tail-latency reduction on the embed-query critical path —
+///   `embed_query` blocks every retrieval, so shaving 50ms off p95
+///   compounds over a session.
+///
+/// # Cost
+///
+/// All N providers are *issued* — most bill for tokens generated
+/// before the connection closes. Budget `cost_floor ≈ N × p50_cost`
+/// even though latency is `p_min`.
+///
+/// # Dimensions
+///
+/// All inners must agree on `dimensions()` — checked at construction
+/// (panic). Race semantics on the result mean a 1536-dim winner this
+/// call vs a 512-dim winner next call would silently corrupt your
+/// vector index, so we forbid the configuration outright.
+pub struct RaceEmbeddings {
+    pub inners: Vec<Arc<dyn Embeddings>>,
+    dim: usize,
+    name_label: String,
+}
+
+impl RaceEmbeddings {
+    /// Build a race set. Panics if `inners` is empty or any two
+    /// inners disagree on `dimensions()`.
+    pub fn new(inners: Vec<Arc<dyn Embeddings>>) -> Self {
+        assert!(
+            !inners.is_empty(),
+            "RaceEmbeddings: need at least one inner provider",
+        );
+        let dim = inners[0].dimensions();
+        for (i, e) in inners.iter().enumerate().skip(1) {
+            assert_eq!(
+                e.dimensions(),
+                dim,
+                "RaceEmbeddings: inner #{} has dim {} but inner #0 has dim {} — \
+                 race semantics + dim mismatch would silently corrupt the vector index",
+                i,
+                e.dimensions(),
+                dim,
+            );
+        }
+        let labels: Vec<String> = inners.iter().map(|e| e.name().to_string()).collect();
+        Self {
+            inners,
+            dim,
+            name_label: format!("race({})", labels.join(", ")),
+        }
+    }
+}
+
+#[async_trait]
+impl Embeddings for RaceEmbeddings {
+    fn name(&self) -> &str {
+        &self.name_label
+    }
+    fn dimensions(&self) -> usize {
+        self.dim
+    }
+
+    async fn embed_query(&self, text: &str) -> Result<Vec<f32>> {
+        use tokio::task::JoinSet;
+
+        if self.inners.len() == 1 {
+            return self.inners[0].embed_query(text).await;
+        }
+
+        let mut set: JoinSet<Result<Vec<f32>>> = JoinSet::new();
+        for inner in self.inners.iter() {
+            let inner = inner.clone();
+            let text = text.to_string();
+            set.spawn(async move { inner.embed_query(&text).await });
+        }
+
+        let mut errors: Vec<String> = Vec::with_capacity(self.inners.len());
+        while let Some(joined) = set.join_next().await {
+            match joined {
+                Ok(Ok(v)) => {
+                    set.abort_all();
+                    return Ok(v);
+                }
+                Ok(Err(e)) => errors.push(e.to_string()),
+                Err(e) => errors.push(format!("task join: {e}")),
+            }
+        }
+        Err(Error::other(format!(
+            "RaceEmbeddings.embed_query: all {} inners failed:\n  - {}",
+            self.inners.len(),
+            errors.join("\n  - "),
+        )))
+    }
+
+    async fn embed_documents(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        use tokio::task::JoinSet;
+
+        if self.inners.len() == 1 {
+            return self.inners[0].embed_documents(texts).await;
+        }
+
+        let mut set: JoinSet<Result<Vec<Vec<f32>>>> = JoinSet::new();
+        for inner in self.inners.iter() {
+            let inner = inner.clone();
+            let owned: Vec<String> = texts.to_vec();
+            set.spawn(async move { inner.embed_documents(&owned).await });
+        }
+
+        let mut errors: Vec<String> = Vec::with_capacity(self.inners.len());
+        while let Some(joined) = set.join_next().await {
+            match joined {
+                Ok(Ok(v)) => {
+                    set.abort_all();
+                    return Ok(v);
+                }
+                Ok(Err(e)) => errors.push(e.to_string()),
+                Err(e) => errors.push(format!("task join: {e}")),
+            }
+        }
+        Err(Error::other(format!(
+            "RaceEmbeddings.embed_documents: all {} inners failed:\n  - {}",
+            self.inners.len(),
+            errors.join("\n  - "),
+        )))
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Embeddings retry + rate-limit wrappers
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -1840,6 +1987,155 @@ mod tests {
             embed("p", 1536, CannedEmbedResult::Ok) as Arc<dyn Embeddings>,
             embed("b", 768, CannedEmbedResult::Ok) as Arc<dyn Embeddings>,
         ]);
+    }
+
+    // ---- RaceEmbeddings tests ------------------------------------------
+
+    /// Embed provider that sleeps `delay_ms` then either returns a
+    /// `dim`-vector of `marker` floats or errors. Lets us pin which
+    /// inner wins a race deterministically.
+    struct DelayedEmbed {
+        label: &'static str,
+        dim: usize,
+        delay_ms: u64,
+        marker: f32,
+        succeed: bool,
+    }
+
+    #[async_trait]
+    impl Embeddings for DelayedEmbed {
+        fn name(&self) -> &str {
+            self.label
+        }
+        fn dimensions(&self) -> usize {
+            self.dim
+        }
+        async fn embed_query(&self, _text: &str) -> Result<Vec<f32>> {
+            tokio::time::sleep(Duration::from_millis(self.delay_ms)).await;
+            if self.succeed {
+                Ok(vec![self.marker; self.dim])
+            } else {
+                Err(Error::provider(format!("{} failed", self.label)))
+            }
+        }
+        async fn embed_documents(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+            tokio::time::sleep(Duration::from_millis(self.delay_ms)).await;
+            if self.succeed {
+                Ok(vec![vec![self.marker; self.dim]; texts.len()])
+            } else {
+                Err(Error::provider(format!("{} failed", self.label)))
+            }
+        }
+    }
+
+    fn delayed(
+        label: &'static str,
+        dim: usize,
+        delay_ms: u64,
+        marker: f32,
+        succeed: bool,
+    ) -> Arc<dyn Embeddings> {
+        Arc::new(DelayedEmbed {
+            label,
+            dim,
+            delay_ms,
+            marker,
+            succeed,
+        })
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "at least one inner provider")]
+    async fn race_embed_panics_on_empty() {
+        let _ = RaceEmbeddings::new(vec![]);
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "dim mismatch")]
+    async fn race_embed_panics_on_dim_mismatch() {
+        let a = delayed("a", 1536, 1, 0.1, true);
+        let b = delayed("b", 768, 1, 0.2, true);
+        let _ = RaceEmbeddings::new(vec![a, b]);
+    }
+
+    #[tokio::test]
+    async fn race_embed_query_returns_first_winner() {
+        // a finishes in 5ms, b in 50ms — a wins, marker=0.42 ↦ all 1536 dims = 0.42
+        let a = delayed("a", 4, 5, 0.42, true);
+        let b = delayed("b", 4, 50, 0.99, true);
+        let race = RaceEmbeddings::new(vec![a, b]);
+        let out = race.embed_query("hi").await.unwrap();
+        assert_eq!(out, vec![0.42; 4]);
+    }
+
+    #[tokio::test]
+    async fn race_embed_query_falls_through_failures() {
+        // a fails fast, b succeeds slowly → b's vector is the result.
+        let a = delayed("a", 4, 1, 0.0, false);
+        let b = delayed("b", 4, 10, 0.5, true);
+        let race = RaceEmbeddings::new(vec![a, b]);
+        let out = race.embed_query("q").await.unwrap();
+        assert_eq!(out, vec![0.5; 4]);
+    }
+
+    #[tokio::test]
+    async fn race_embed_query_aggregates_when_all_fail() {
+        let a = delayed("a", 4, 1, 0.0, false);
+        let b = delayed("b", 4, 2, 0.0, false);
+        let race = RaceEmbeddings::new(vec![a, b]);
+        let err = race.embed_query("q").await.unwrap_err();
+        let s = format!("{err}");
+        assert!(s.contains("all 2 inners failed"), "got: {s}");
+        assert!(s.contains("a failed"));
+        assert!(s.contains("b failed"));
+    }
+
+    #[tokio::test]
+    async fn race_embed_documents_returns_first_winner() {
+        let a = delayed("a", 4, 5, 0.42, true);
+        let b = delayed("b", 4, 50, 0.99, true);
+        let race = RaceEmbeddings::new(vec![a, b]);
+        let out = race
+            .embed_documents(&["hi".into(), "there".into()])
+            .await
+            .unwrap();
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0], vec![0.42; 4]);
+        assert_eq!(out[1], vec![0.42; 4]);
+    }
+
+    #[tokio::test]
+    async fn race_embed_single_inner_passes_through() {
+        let a = delayed("only", 4, 0, 0.7, true);
+        let race = RaceEmbeddings::new(vec![a]);
+        let out = race.embed_query("q").await.unwrap();
+        assert_eq!(out, vec![0.7; 4]);
+    }
+
+    #[tokio::test]
+    async fn race_embed_aborts_losers_after_winner() {
+        // a wins in 5ms, b sleeps 500ms — total wall-clock should be
+        // closer to 5ms than 500ms.
+        let a = delayed("a", 4, 5, 0.42, true);
+        let b = delayed("b", 4, 500, 0.99, true);
+        let race = RaceEmbeddings::new(vec![a, b]);
+        let started = std::time::Instant::now();
+        let _ = race.embed_query("q").await.unwrap();
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        assert!(
+            elapsed_ms < 200,
+            "elapsed {elapsed_ms}ms — losers were not aborted",
+        );
+    }
+
+    #[tokio::test]
+    async fn race_embed_name_includes_all_inners() {
+        let a = delayed("openai", 4, 0, 0.0, true);
+        let b = delayed("voyage", 4, 0, 0.0, true);
+        let race = RaceEmbeddings::new(vec![a, b]);
+        assert!(race.name().contains("openai"));
+        assert!(race.name().contains("voyage"));
+        assert!(race.name().starts_with("race("));
     }
 
     // ---- RetryingEmbeddings tests --------------------------------------

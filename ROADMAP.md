@@ -206,6 +206,7 @@ patterns").
 | `multiplex_chat_streams` (iter 189) | `tokio::mpsc` channel-fan-in | Per-stream task forwards events into a shared channel; outer Stream drains in arrival order. First channel-based primitive — distinct from JoinSet/Semaphore lineage; one slow/failing stream never stalls peers |
 | `retrieve_concurrent` (iter 190) | Tokio `JoinSet` + `Semaphore` over `Retriever::retrieve` | Completes the parallel-batch trio (`batch_concurrent`/`embed_documents_concurrent`/this). Same retriever, N caller queries — eval / agentic batch path |
 | `tool_dispatch_concurrent` (iter 191) | Tokio `JoinSet` + `Semaphore` over heterogeneous `Tool::run` | Fourth in the parallel-batch family — different topology (HashMap router, heterogeneous tools per call). Standalone helper for Plan-and-Execute and custom orchestrators outside the React loop |
+| `RaceEmbeddings` (iter 192) | Tokio `JoinSet` + `abort_all` over `Embeddings` | Embeddings analogue of iter 184 `RaceChatModel`. Hedge OpenAI / Voyage / local fastembed for tail-latency cuts on the embed-query critical path |
 
 ---
 

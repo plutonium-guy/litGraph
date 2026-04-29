@@ -15,7 +15,7 @@ use litgraph_providers_jina::{JinaEmbeddings, JinaEmbeddingsConfig};
 use litgraph_providers_openai::{OpenAIEmbeddings, OpenAIEmbeddingsConfig};
 use litgraph_providers_voyage::{VoyageEmbeddings, VoyageEmbeddingsConfig};
 use litgraph_resilience::{
-    FallbackEmbeddings, RateLimitConfig, RateLimitedEmbeddings, RetryConfig, RetryingEmbeddings,
+    FallbackEmbeddings, RaceEmbeddings, RateLimitConfig, RateLimitedEmbeddings, RetryConfig, RetryingEmbeddings,
 };
 use pyo3::exceptions::{PyRuntimeError, PyTypeError};
 use pyo3::prelude::*;
@@ -33,6 +33,7 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyBedrockEmbeddings>()?;
     m.add_class::<PyJinaEmbeddings>()?;
     m.add_class::<PyFallbackEmbeddings>()?;
+    m.add_class::<PyRaceEmbeddings>()?;
     m.add_class::<PyRetryingEmbeddings>()?;
     m.add_class::<PyRateLimitedEmbeddings>()?;
     m.add_function(wrap_pyfunction!(tei_embeddings, m)?)?;
@@ -101,6 +102,9 @@ pub(crate) fn extract_embeddings(bound: &Bound<'_, PyAny>) -> PyResult<Arc<dyn E
         return Ok(e.as_embeddings());
     }
     if let Ok(e) = bound.extract::<PyRef<PyFallbackEmbeddings>>() {
+        return Ok(e.as_embeddings());
+    }
+    if let Ok(e) = bound.extract::<PyRef<PyRaceEmbeddings>>() {
         return Ok(e.as_embeddings());
     }
     if let Ok(e) = bound.extract::<PyRef<PyRetryingEmbeddings>>() {
@@ -809,6 +813,99 @@ impl PyFallbackEmbeddings {
 }
 
 impl PyFallbackEmbeddings {
+    pub(crate) fn as_embeddings(&self) -> Arc<dyn Embeddings> {
+        self.inner.clone()
+    }
+}
+
+/// Race N embedding providers concurrently — first success wins,
+/// losers are aborted. Embeddings analogue of `RaceChat` (iter 184).
+///
+/// Distinct from `FallbackEmbeddings`:
+///   - `FallbackEmbeddings`: try A, on failure try B (sequential, cost-min).
+///   - `RaceEmbeddings`: try A and B at the same instant, take the
+///     winner (concurrent, latency-min).
+///
+/// All providers must agree on `dimensions()` — race semantics + dim
+/// mismatch would silently corrupt the vector index.
+///
+/// ```python
+/// from litgraph.embeddings import (
+///     OpenAIEmbeddings, VoyageEmbeddings, RaceEmbeddings,
+/// )
+/// race = RaceEmbeddings([
+///     OpenAIEmbeddings(api_key=..., model="text-embedding-3-small"),
+///     VoyageEmbeddings(api_key=..., model="voyage-3"),
+/// ])
+/// vec = race.embed_query("hi")  # whichever returns first wins
+/// ```
+#[pyclass(name = "RaceEmbeddings", module = "litgraph.embeddings")]
+pub struct PyRaceEmbeddings {
+    inner: Arc<dyn Embeddings>,
+}
+
+#[pymethods]
+impl PyRaceEmbeddings {
+    #[new]
+    fn new(providers: Bound<'_, PyList>) -> PyResult<Self> {
+        if providers.is_empty() {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "RaceEmbeddings: providers list must be non-empty",
+            ));
+        }
+        let mut inners: Vec<Arc<dyn Embeddings>> = Vec::with_capacity(providers.len());
+        for item in providers.iter() {
+            inners.push(extract_embeddings(&item)?);
+        }
+        // Pre-validate dims as a ValueError instead of letting the
+        // Rust panic surface as a generic abort.
+        let first = inners[0].dimensions();
+        for (i, e) in inners.iter().enumerate().skip(1) {
+            if e.dimensions() != first {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "RaceEmbeddings: provider #{} has dim {} but #0 has dim {}. \
+                     Mixed dimensions + race semantics would silently corrupt your vector index.",
+                    i,
+                    e.dimensions(),
+                    first,
+                )));
+            }
+        }
+        let race = RaceEmbeddings::new(inners);
+        Ok(Self { inner: Arc::new(race) })
+    }
+
+    #[getter]
+    fn dimensions(&self) -> usize {
+        self.inner.dimensions()
+    }
+
+    fn embed_query<'py>(&self, py: Python<'py>, text: String) -> PyResult<Vec<f32>> {
+        let inner = self.inner.clone();
+        py.allow_threads(|| {
+            block_on_compat(async move { inner.embed_query(&text).await })
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })
+    }
+
+    fn embed_documents<'py>(
+        &self,
+        py: Python<'py>,
+        texts: Vec<String>,
+    ) -> PyResult<Vec<Vec<f32>>> {
+        let inner = self.inner.clone();
+        py.allow_threads(|| {
+            block_on_compat(async move { inner.embed_documents(&texts).await })
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })
+    }
+
+    fn __repr__(&self) -> String {
+        format!("RaceEmbeddings(dim={})", self.inner.dimensions())
+    }
+}
+
+impl PyRaceEmbeddings {
     pub(crate) fn as_embeddings(&self) -> Arc<dyn Embeddings> {
         self.inner.clone()
     }
