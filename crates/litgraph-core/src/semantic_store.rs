@@ -127,6 +127,44 @@ impl SemanticStore {
         self.inner.delete(namespace, key).await
     }
 
+    /// Bulk-fetch N keys in one call. Closes LangGraph's
+    /// `BaseStore::mget` parity. Output aligned 1:1 with input —
+    /// each slot is `Ok(Some((text, value)))` if the key existed,
+    /// `Ok(None)` if missing, `Err(_)` if the underlying store
+    /// choked on that specific key (e.g., the value was written
+    /// outside the SemanticStore wrapper and isn't in the
+    /// `{_emb, _text, value}` shape).
+    ///
+    /// Distinct from `semantic_search` (which ranks by meaning) —
+    /// this is for known-key fetches: re-hydrating a saved
+    /// conversation, looking up by ID after a search returned a
+    /// list of keys, or batch-fetching specific memories from a
+    /// per-tenant namespace.
+    pub async fn bulk_get(
+        &self,
+        namespace: &Namespace,
+        keys: Vec<String>,
+    ) -> Result<Vec<Result<Option<(String, Value)>>>> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut results = Vec::with_capacity(keys.len());
+        for key in keys {
+            let r = match self.inner.get(namespace, &key).await {
+                Ok(None) => Ok(None),
+                Ok(Some(item)) => match unwrap(&item.value) {
+                    Some((text, value)) => Ok(Some((text, value))),
+                    None => Err(Error::other(format!(
+                        "SemanticStore: item at {namespace:?}/{key} not in semantic shape"
+                    ))),
+                },
+                Err(e) => Err(e),
+            };
+            results.push(r);
+        }
+        Ok(results)
+    }
+
     /// Bulk-delete N keys in one call. Pair to [`bulk_put`] from
     /// iter 222; closes the LangGraph `BaseStore::mdelete` parity
     /// gap. Real prod use: per-tenant namespace cleanup, retention
@@ -534,6 +572,98 @@ mod tests {
         let hits = s.semantic_search(&ns, "rust performance", 3, None).await.unwrap();
         assert_eq!(hits.len(), 3);
         assert_eq!(hits[0].key, "a");
+    }
+
+    // ---- bulk_get tests ----------------------------------------------
+
+    #[tokio::test]
+    async fn bulk_get_returns_existing_and_none_for_missing() {
+        let s = fixture();
+        let ns = vec!["bg".to_string()];
+        let items = vec![
+            ("a".to_string(), "rust".to_string(), json!({"id": "a"})),
+            ("b".to_string(), "memory".to_string(), json!({"id": "b"})),
+        ];
+        s.bulk_put(&ns, items, None, 8, 4).await.unwrap();
+        let r = s
+            .bulk_get(
+                &ns,
+                vec!["a".into(), "missing".into(), "b".into()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.len(), 3);
+        let a = r[0].as_ref().unwrap().clone().unwrap();
+        assert_eq!(a.0, "rust");
+        assert_eq!(a.1, json!({"id": "a"}));
+        assert!(r[1].as_ref().unwrap().is_none());
+        let b = r[2].as_ref().unwrap().clone().unwrap();
+        assert_eq!(b.0, "memory");
+        assert_eq!(b.1, json!({"id": "b"}));
+    }
+
+    #[tokio::test]
+    async fn bulk_get_empty_returns_empty() {
+        let s = fixture();
+        let ns = vec!["bg_empty".to_string()];
+        let r = s.bulk_get(&ns, vec![]).await.unwrap();
+        assert!(r.is_empty());
+    }
+
+    #[tokio::test]
+    async fn bulk_get_results_aligned_to_input_order() {
+        let s = fixture();
+        let ns = vec!["bg_align".to_string()];
+        let items = (0..6)
+            .map(|i| (format!("k{i}"), format!("text-{i}"), json!(i)))
+            .collect();
+        s.bulk_put(&ns, items, None, 4, 2).await.unwrap();
+        // Scrambled fetch order — each slot's value matches the
+        // requested key's `i`, not the insertion order.
+        let r = s
+            .bulk_get(
+                &ns,
+                vec![
+                    "k4".into(),
+                    "k0".into(),
+                    "missing".into(),
+                    "k5".into(),
+                    "k2".into(),
+                ],
+            )
+            .await
+            .unwrap();
+        let values: Vec<Option<i64>> = r
+            .into_iter()
+            .map(|x| {
+                x.unwrap()
+                    .map(|(_, v)| v.as_i64().unwrap())
+            })
+            .collect();
+        assert_eq!(values, vec![Some(4), Some(0), None, Some(5), Some(2)]);
+    }
+
+    #[tokio::test]
+    async fn bulk_get_surfaces_corrupt_shape_as_per_key_err() {
+        // Write a value via the underlying store directly (bypasses
+        // SemanticStore's wrapping). bulk_get should report the
+        // corrupt-shape error in that one slot only — other slots
+        // round-trip fine.
+        let store: Arc<dyn Store> = Arc::new(InMemoryStore::new());
+        let emb: Arc<dyn Embeddings> = Arc::new(ToyEmbedder);
+        let s = SemanticStore::new(store.clone(), emb);
+        let ns = vec!["bg_corrupt".to_string()];
+        s.put(&ns, "good", "rust", json!("ok"), None).await.unwrap();
+        // Bypass the wrapping for the bad key.
+        store
+            .put(&ns, "bad", &json!({"raw": "no _emb / _text"}), None)
+            .await
+            .unwrap();
+        let r = s.bulk_get(&ns, vec!["good".into(), "bad".into()]).await.unwrap();
+        assert!(r[0].is_ok());
+        assert!(r[1].is_err());
+        let msg = format!("{}", r[1].as_ref().err().unwrap());
+        assert!(msg.contains("not in semantic shape"));
     }
 
     // ---- bulk_delete tests --------------------------------------------
