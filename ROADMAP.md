@@ -213,6 +213,7 @@ patterns").
 | `ingest_to_stream` (iter 196) | Multi-stage `mpsc` pipeline | First **pipeline-parallelism** primitive: three Tokio tasks (load / split / embed) connected by bounded `mpsc` channels, each stage runs while later stages drain. Composes iter 187 (load_concurrent) + a splitter closure + iter 183 (embed_documents_concurrent) with backpressure between stages |
 | `rerank_concurrent` (iter 197) | Tokio `JoinSet` + `Semaphore` over `Reranker::rerank` | Adds a fifth axis to the parallel-batch family (chat/embed/retrieve/tool/rerank). One reranker, N independent `(query, candidates)` pairs — eval / batch-rerank path |
 | `Bm25Index::add` parallel build (iter 198) | Rayon `par_iter` on tokenize+count per doc | Pure CPU parallelism for index construction (vs the I/O-bound parallelism of the JoinSet/Semaphore family). Each doc tokenizes independently in a Rayon worker; DF merge happens sequentially under the write lock |
+| `Progress<T>` (iter 199) | `tokio::sync::watch` latest-value broadcast | Completes the channel-shape trio: mpsc fan-in (189), broadcast fan-out (195), watch latest-value (199). Multiple observers, intermediate values collapse — observers see only the latest snapshot, perfect for progress UIs |
 
 ---
 
