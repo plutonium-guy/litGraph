@@ -412,7 +412,7 @@ Distinct from short-term checkpointer — JSON document store keyed by
 | `BaseStore` namespace+key API | Multi-tenant long-term mem | ✅ `litgraph_core::store::Store` trait |
 | `InMemoryStore` (dev) | Local prototyping | ✅ `litgraph.store.InMemoryStore` |
 | `PostgresStore` (prod) | Durable distributed | ✅ `litgraph-store-postgres::PostgresStore` — `TEXT[]` namespace + GIN index, JSONB values, per-item TTL with lazy + manual `evict_expired()` sweep, SQL-side `query_text` ILIKE + JSON-path `#>` matches (up to 8 clauses, falls back to client-side beyond), shared deadpool with checkpointer |
-| Vector-indexed semantic search on Store | Memory recall by meaning | 🟡 `VectorStoreMemory` separate; not yet bolted onto Store |
+| Vector-indexed semantic search on Store | Memory recall by meaning | ✅ `litgraph_core::SemanticStore` — wraps any `Store` with an `Embeddings` provider; `put(ns, key, text, value)` embeds + stores, `semantic_search(ns, query, k)` ranks Rayon-parallel cosine. Python: `litgraph.store.SemanticStore(store, embedder)`. (iter 185) |
 | `LangMem` SDK (episodic memory) | Auto-extract memories | ✅ `litgraph_core::{EpisodicMemory, MemoryExtractor, Memory}` — LLM extraction via structured output, kind/importance/source_thread metadata, importance threshold filtering, namespaced storage on any `Store` impl, `recall(query, k)` + `recall_as_system_message` ready-to-prepend |
 | TTL on memory entries | Auto-expire stale | ✅ `ttl_ms` per put, lazy eviction on read/search |
 | Per-user namespace isolation | GDPR / multi-tenant | ✅ namespace tuple + prefix search |
@@ -446,7 +446,7 @@ Distinct from short-term checkpointer — JSON document store keyed by
 
 Top gaps to close, ranked by user-impact for a no-code-glue path:
 
-1. 🟡 **Long-term memory `Store`** — core trait + `InMemoryStore` shipped (`litgraph.store`, 17 Py tests). Postgres backend + vector-indexed semantic search on Store still pending.
+1. ✅ **Long-term memory `Store`** — core trait + `InMemoryStore` + `PostgresStore` shipped; `SemanticStore` (iter 185) adds Rayon-parallel cosine semantic-search recall on top of any `Store`.
 2. 🟡 **Middleware chain primitive** — `before/after_model` chain shipped (`litgraph.middleware`, 7 Py + 6 Rust tests). Built-ins: Logging, MessageWindow, SystemPrompt. `before/after_tool` hooks + tool-result offload still pending.
 3. ✅ **Deep Agents harness** — `PlanningTool` + `VirtualFilesystemTool` + `load_agents_md` + `load_skills_dir` + `SystemPromptBuilder` + `SubagentTool` + one-call `litgraph.deep_agent.create_deep_agent(...)` factory all shipped (43 Rust + 41 Py tests across the seven).
 4. ❌ **Functional API** (`@entrypoint` + `@task`) — Python decorator alternative to graph DSL. Trims LOC for simple workflows.

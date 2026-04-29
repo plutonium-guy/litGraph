@@ -2,15 +2,20 @@
 //! document store, LangGraph-parity). One in-process `InMemoryStore` exposed
 //! today; Postgres / Redis backends will register here when their crates land.
 
+use std::sync::Arc;
+
+use litgraph_core::semantic_store::SemanticStore;
 use litgraph_core::store::{InMemoryStore, SearchFilter, Store, StoreItem};
 use pyo3::exceptions::{PyKeyError, PyRuntimeError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
 
+use crate::embeddings::extract_embeddings;
 use crate::runtime::block_on_compat;
 
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyInMemoryStore>()?;
+    m.add_class::<PySemanticStore>()?;
     Ok(())
 }
 
@@ -223,5 +228,153 @@ impl PyInMemoryStore {
 
     fn __repr__(&self) -> String {
         format!("InMemoryStore(items={})", self.inner.len())
+    }
+}
+
+/// Long-term memory store with semantic-search recall. Wraps any
+/// `Store` (today: `InMemoryStore`) with an `Embeddings` provider so
+/// `semantic_search` can rank items by meaning, not just exact match.
+///
+/// Internal storage shape: each item's value is wrapped as
+/// `{"_emb": [...], "_text": "...", "value": <user value>}` — durable
+/// across crashes / processes for backends that persist (Postgres,
+/// Redis). `get` strips the wrapper before returning.
+///
+/// The `semantic_search` cosine pass runs in **Rayon-parallel** over
+/// every item in the namespace. Brute force, fine up to ~10k items
+/// per namespace; reach for `pgvector` / `hnsw` above that.
+///
+/// ```python
+/// from litgraph.store import InMemoryStore, SemanticStore
+/// from litgraph.embeddings import OpenAIEmbeddings
+/// emb = OpenAIEmbeddings(api_key="sk-...")
+/// store = InMemoryStore()
+/// sem = SemanticStore(store, emb)
+/// sem.put(("users", "alice"), "fact:1", "alice loves rust", {"id": 1})
+/// hits = sem.search(("users", "alice"), "preferred languages?", k=3)
+/// for h in hits:
+///     print(h["score"], h["text"], h["value"])
+/// ```
+#[pyclass(name = "SemanticStore", module = "litgraph.store")]
+pub(crate) struct PySemanticStore {
+    inner: SemanticStore,
+}
+
+#[pymethods]
+impl PySemanticStore {
+    #[new]
+    fn new(store: Bound<'_, PyAny>, embedder: Bound<'_, PyAny>) -> PyResult<Self> {
+        let inner_store: Arc<dyn Store> = if let Ok(s) = store.extract::<PyRef<PyInMemoryStore>>() {
+            Arc::new(s.inner.clone())
+        } else {
+            return Err(PyRuntimeError::new_err(
+                "store must be a litgraph InMemoryStore (more backends to come)",
+            ));
+        };
+        let emb = extract_embeddings(&embedder)?;
+        Ok(Self {
+            inner: SemanticStore::new(inner_store, emb),
+        })
+    }
+
+    /// Embed `text`, store at `(namespace, key)` alongside `value`.
+    /// Subsequent `search(namespace, query)` calls rank by cosine
+    /// similarity between `embed(query)` and stored embeddings.
+    #[pyo3(signature = (namespace, key, text, value=None, ttl_ms=None))]
+    fn put<'py>(
+        &self,
+        py: Python<'py>,
+        namespace: Bound<'py, PyAny>,
+        key: String,
+        text: String,
+        value: Option<Bound<'py, PyAny>>,
+        ttl_ms: Option<u64>,
+    ) -> PyResult<()> {
+        let ns = ns_from_py(&namespace)?;
+        let v = match value {
+            Some(v) => py_to_json(&v)?,
+            None => serde_json::Value::Null,
+        };
+        let store = self.inner.clone();
+        py.allow_threads(|| {
+            block_on_compat(async move { store.put(&ns, &key, &text, v, ttl_ms).await })
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })
+    }
+
+    /// Fetch `(namespace, key)`. Returns `{"text", "value"}` or `None`.
+    /// The internal `_emb` / `_text` wrapper is stripped before return.
+    fn get<'py>(
+        &self,
+        py: Python<'py>,
+        namespace: Bound<'py, PyAny>,
+        key: String,
+    ) -> PyResult<Option<Bound<'py, PyDict>>> {
+        let ns = ns_from_py(&namespace)?;
+        let store = self.inner.clone();
+        let got = py.allow_threads(|| {
+            block_on_compat(async move { store.get(&ns, &key).await })
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })?;
+        match got {
+            Some((text, value)) => {
+                let d = PyDict::new_bound(py);
+                d.set_item("text", text)?;
+                d.set_item("value", json_to_py(py, &value)?)?;
+                Ok(Some(d))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Delete `(namespace, key)`. True if it existed.
+    fn delete<'py>(
+        &self,
+        py: Python<'py>,
+        namespace: Bound<'py, PyAny>,
+        key: String,
+    ) -> PyResult<bool> {
+        let ns = ns_from_py(&namespace)?;
+        let store = self.inner.clone();
+        py.allow_threads(|| {
+            block_on_compat(async move { store.delete(&ns, &key).await })
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })
+    }
+
+    /// Cosine top-k under `namespace_prefix`. Returns a list of dicts
+    /// `{"namespace", "key", "text", "value", "score", "created_at_ms",
+    /// "updated_at_ms"}` sorted by score descending.
+    #[pyo3(signature = (namespace, query, k=5))]
+    fn search<'py>(
+        &self,
+        py: Python<'py>,
+        namespace: Bound<'py, PyAny>,
+        query: String,
+        k: usize,
+    ) -> PyResult<Bound<'py, PyList>> {
+        let ns = ns_from_py(&namespace)?;
+        let store = self.inner.clone();
+        let hits = py.allow_threads(|| {
+            block_on_compat(async move { store.semantic_search(&ns, &query, k, None).await })
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })?;
+        let out = PyList::empty_bound(py);
+        for h in hits {
+            let d = PyDict::new_bound(py);
+            d.set_item("namespace", h.namespace)?;
+            d.set_item("key", h.key)?;
+            d.set_item("text", h.text)?;
+            d.set_item("value", json_to_py(py, &h.value)?)?;
+            d.set_item("score", h.score)?;
+            d.set_item("created_at_ms", h.created_at_ms)?;
+            d.set_item("updated_at_ms", h.updated_at_ms)?;
+            out.append(d)?;
+        }
+        Ok(out)
+    }
+
+    fn __repr__(&self) -> String {
+        "SemanticStore()".into()
     }
 }

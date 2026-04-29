@@ -24,6 +24,7 @@ parking_lot.workspace = true
 # unconditionally, so making it optional only saved a feature flag toggle.
 tokio = { workspace = true }
 blake3.workspace = true
+rayon.workspace = true
 
 [features]
 default = []

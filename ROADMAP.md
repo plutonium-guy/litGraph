@@ -82,18 +82,13 @@ Total = sum. Anything ≥18 is fair game for the next ten iters.
   out via monomorphization).
 - **Effort:** 1–2 iters. Touches agents + middleware crates.
 
-### 3. Vector-indexed semantic search on `Store`
-- **Status:** 🟡. `Store` trait + `InMemoryStore` + `PostgresStore`
-  ship. `VectorStoreMemory` is a separate primitive that re-embeds
-  every message. Plumbing them together gives "long-term memory
-  with semantic recall" in one call.
-- **What:** `Store::semantic_search(namespace, query, k)` default
-  method backed by an injected `Embeddings` + per-namespace HNSW
-  index (or pgvector for the Postgres backend).
-- **Why:** Closes the LangGraph "memory" sales pitch.
-- **Rust win:** HNSW in `litgraph-vectorstores-hnsw` is already
-  in-process; no separate vector DB needed.
-- **Effort:** 2 iters.
+### 3. Vector-indexed semantic search on `Store` ✅ shipped iter 185
+- **Status:** ✅ in-memory tier. `litgraph_core::SemanticStore` wraps
+  any `Store` with an `Embeddings` provider; `semantic_search` runs
+  brute-force Rayon-parallel cosine over a namespace.  Python:
+  `litgraph.store.SemanticStore(store, embedder)`.
+- **Remaining:** pgvector-backed indexed search on `PostgresStore`
+  for the >10k items/namespace tier.
 
 ### 4. Postgres `Store` already shipped → wire vector index
 - **Status:** ✅ structurally, 🟡 functionally. `PostgresStore`
@@ -204,6 +199,7 @@ patterns").
 | `batch_concurrent` (iter 182) | `Semaphore` + `JoinSet`     | Bounded-concurrency batch over any `ChatModel`; order-preserving, per-call `Result` |
 | `embed_documents_concurrent` (iter 183) | chunk + `JoinSet` | Splits inputs into chunks, fans chunks across `Semaphore`; aligned output, fail-fast |
 | `RaceChatModel` (iter 184) | `JoinSet` + `abort_all` | Hedged-request pattern: invoke N concurrently, first success wins, losers cancelled. Tail-latency reduction across providers/regions |
+| `SemanticStore` (iter 185) | Rayon `par_iter` cosine + `par_sort` | Brute-force semantic search on any `Store`; Rayon makes it CPU-saturating across cores. Python's `numpy` would still hit the GIL on the gather step |
 
 ---
 
