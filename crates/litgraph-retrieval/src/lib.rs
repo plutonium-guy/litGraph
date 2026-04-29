@@ -39,8 +39,9 @@ pub use concurrent::{
 pub use race::RaceRetriever;
 pub use rerank_concurrent::{
     rerank_concurrent, rerank_concurrent_fail_fast, rerank_concurrent_stream,
-    rerank_concurrent_stream_with_progress, rerank_concurrent_with_progress,
-    rerank_concurrent_with_shutdown, RerankProgress, RerankStreamItem,
+    rerank_concurrent_stream_with_progress, rerank_concurrent_stream_with_shutdown,
+    rerank_concurrent_with_progress, rerank_concurrent_with_shutdown, RerankProgress,
+    RerankStreamItem,
 };
 pub use rerank::{Reranker, RerankingRetriever};
 pub use parent::{
