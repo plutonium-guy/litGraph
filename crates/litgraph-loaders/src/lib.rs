@@ -83,8 +83,8 @@ pub use outlook::OutlookMessagesLoader;
 pub mod concurrent;
 pub use concurrent::{
     load_concurrent, load_concurrent_flat, load_concurrent_stream,
-    load_concurrent_stream_with_progress, load_concurrent_with_progress, LoadProgress,
-    LoadStreamItem, DEFAULT_LOAD_CONCURRENCY,
+    load_concurrent_stream_with_progress, load_concurrent_with_progress,
+    load_concurrent_with_shutdown, LoadProgress, LoadStreamItem, DEFAULT_LOAD_CONCURRENCY,
 };
 pub mod ingest;
 pub use ingest::{

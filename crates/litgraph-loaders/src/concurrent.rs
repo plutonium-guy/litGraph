@@ -35,7 +35,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use futures::Stream;
-use litgraph_core::{Document, Progress};
+use litgraph_core::{Document, Progress, ShutdownSignal};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, Semaphore};
 use tokio::task::JoinSet;
@@ -374,6 +374,99 @@ pub fn load_concurrent_stream(
     Box::pin(ReceiverStream::new(rx))
 }
 
+/// `load_concurrent` plus graceful cancellation via
+/// [`ShutdownSignal`]. Output aligned 1:1 with `loaders`:
+///
+/// - `Ok(docs)` — loader completed before shutdown.
+/// - `Err(loader error)` — loader returned an error.
+/// - `Err("cancelled by shutdown")` — loader was still in flight
+///   (or its `spawn_blocking` thread was still owned) when
+///   shutdown fired.
+///
+/// Mechanical extension of the bridge pattern (iters 227-231) to
+/// the loader axis — the sixth and final parallel-batch axis.
+/// Real prod use: an ingestion job that crawls hundreds of S3
+/// keys + sitemap URLs banks completed loaders on Ctrl+C — the
+/// half-loaded corpus stays valid, so downstream embed/index
+/// stages can ship the partial result.
+///
+/// Note: `Loader::load()` runs on `spawn_blocking`, so the OS
+/// thread is held until the call returns naturally. `abort_all()`
+/// only cancels the *waiting-on-permit* phase plus the join await
+/// — already-blocking threads finish their current call. The
+/// output slot is filled with `Err("cancelled by shutdown")`
+/// regardless once the await is dropped.
+pub async fn load_concurrent_with_shutdown(
+    loaders: Vec<Arc<dyn Loader>>,
+    max_concurrency: usize,
+    shutdown: &ShutdownSignal,
+) -> Vec<LoaderResult<Vec<Document>>> {
+    if loaders.is_empty() {
+        return Vec::new();
+    }
+    if shutdown.is_signaled() {
+        return (0..loaders.len())
+            .map(|_| Err(LoaderError::Other("cancelled by shutdown".into())))
+            .collect();
+    }
+
+    let cap = max_concurrency.max(1);
+    let sem = Arc::new(Semaphore::new(cap));
+    let mut set: JoinSet<(usize, LoaderResult<Vec<Document>>)> = JoinSet::new();
+
+    for (idx, loader) in loaders.into_iter().enumerate() {
+        let sem = sem.clone();
+        set.spawn(async move {
+            let _permit = match sem.acquire_owned().await {
+                Ok(p) => p,
+                Err(_) => {
+                    return (
+                        idx,
+                        Err(LoaderError::Other("loader semaphore closed".into())),
+                    )
+                }
+            };
+            let join = tokio::task::spawn_blocking(move || loader.load()).await;
+            let r = match join {
+                Ok(r) => r,
+                Err(e) => Err(LoaderError::Other(format!(
+                    "loader task panicked: {e}",
+                ))),
+            };
+            (idx, r)
+        });
+    }
+
+    let n = set.len();
+    let mut out: Vec<Option<LoaderResult<Vec<Document>>>> = (0..n).map(|_| None).collect();
+
+    loop {
+        tokio::select! {
+            joined = set.join_next() => {
+                match joined {
+                    Some(Ok((idx, r))) => out[idx] = Some(r),
+                    Some(Err(e)) => {
+                        if let Some(slot) = out.iter_mut().find(|s| s.is_none()) {
+                            *slot = Some(Err(LoaderError::Other(format!(
+                                "loader join: {e}",
+                            ))));
+                        }
+                    }
+                    None => break,
+                }
+            }
+            _ = shutdown.wait() => {
+                set.abort_all();
+                break;
+            }
+        }
+    }
+
+    out.into_iter()
+        .map(|s| s.unwrap_or_else(|| Err(LoaderError::Other("cancelled by shutdown".into()))))
+        .collect()
+}
+
 /// Like `load_concurrent` but flattens successful results into a
 /// single `Vec<Document>` and short-circuits on the first error.
 /// Use when partial-results aren't useful (e.g. a downstream embed
@@ -695,6 +788,94 @@ mod tests {
     async fn stream_empty_loaders_yields_empty() {
         let mut s = load_concurrent_stream(vec![], 4);
         assert!(s.next().await.is_none());
+    }
+
+    // ---- load_concurrent_with_shutdown tests --------------------------
+
+    #[tokio::test]
+    async fn shutdown_no_signal_completes_normally() {
+        let (_tmp, paths) = write_files("sd_ok", 4);
+        let loaders: Vec<Arc<dyn Loader>> = paths
+            .iter()
+            .map(|p| Arc::new(TextLoader::new(p)) as Arc<dyn Loader>)
+            .collect();
+        let shutdown = ShutdownSignal::new();
+        let out = load_concurrent_with_shutdown(loaders, 4, &shutdown).await;
+        assert_eq!(out.len(), 4);
+        assert!(out.iter().all(|r| r.is_ok()));
+    }
+
+    #[tokio::test]
+    async fn shutdown_pre_fired_returns_all_cancelled() {
+        let (_tmp, paths) = write_files("sd_pre", 3);
+        let loaders: Vec<Arc<dyn Loader>> = paths
+            .iter()
+            .map(|p| Arc::new(TextLoader::new(p)) as Arc<dyn Loader>)
+            .collect();
+        let shutdown = ShutdownSignal::new();
+        shutdown.signal();
+        let out = load_concurrent_with_shutdown(loaders, 4, &shutdown).await;
+        assert_eq!(out.len(), 3);
+        for r in &out {
+            assert!(r
+                .as_ref()
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("cancelled by shutdown"));
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_mid_run_preserves_completed_loaders() {
+        // 20 loaders × 50ms × cap=2 — sequential ~500ms. Fire
+        // shutdown at 80ms; completed loaders should bank Ok,
+        // remaining should resolve as cancelled fast.
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let loaders: Vec<Arc<dyn Loader>> = (0..20)
+            .map(|i| {
+                Arc::new(DelayProbe {
+                    delay_ms: 50,
+                    in_flight: in_flight.clone(),
+                    peak: peak.clone(),
+                    label: format!("p{i}"),
+                }) as Arc<dyn Loader>
+            })
+            .collect();
+        let shutdown = ShutdownSignal::new();
+        let s2 = shutdown.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            s2.signal();
+        });
+        let started = std::time::Instant::now();
+        let out = load_concurrent_with_shutdown(loaders, 2, &shutdown).await;
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(400),
+            "elapsed {elapsed:?} — shutdown didn't abort early",
+        );
+        assert_eq!(out.len(), 20);
+        let ok = out.iter().filter(|r| r.is_ok()).count();
+        let cancelled = out
+            .iter()
+            .filter(|r| {
+                r.as_ref()
+                    .err()
+                    .map(|e| e.to_string().contains("cancelled by shutdown"))
+                    .unwrap_or(false)
+            })
+            .count();
+        assert!(ok >= 1, "no completed loaders banked");
+        assert!(cancelled >= 1, "no in-flight loaders marked cancelled");
+    }
+
+    #[tokio::test]
+    async fn shutdown_empty_loaders_returns_empty() {
+        let shutdown = ShutdownSignal::new();
+        let out = load_concurrent_with_shutdown(vec![], 4, &shutdown).await;
+        assert!(out.is_empty());
     }
 
     #[tokio::test]
