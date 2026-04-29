@@ -48,6 +48,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
+
+pub mod server;
+pub use server::{
+    serve_on, serve_stdio, McpPrompt, McpPromptArg, McpPromptMessage, McpResource, McpServer,
+    PromptRenderer, ResourceReader,
+};
 use tokio::sync::{oneshot, Mutex as AsyncMutex};
 use tracing::{debug, warn};
 

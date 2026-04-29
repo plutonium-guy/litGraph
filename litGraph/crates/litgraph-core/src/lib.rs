@@ -15,6 +15,11 @@ pub mod list_parser;
 pub mod react_parser;
 pub mod format_instructions;
 pub mod evaluators;
+pub mod output_fixer;
+pub mod partial_json;
+pub mod llm_judge;
+pub mod pii;
+pub mod example_selector;
 
 pub use error::{Error, Result};
 pub use structured::StructuredChatModel;
@@ -32,9 +37,14 @@ pub use evaluators::{
     contains_all, contains_any, embedding_cosine, exact_match, exact_match_strict,
     jaccard_similarity, json_validity, levenshtein, levenshtein_ratio, regex_match,
 };
+pub use output_fixer::{fix_with_llm, parse_with_retry};
+pub use partial_json::{parse_partial_json, repair_partial_json};
+pub use llm_judge::{JudgeScore, LlmJudge};
+pub use pii::{luhn_valid, PiiScrubber, Replacement, ScrubResult};
+pub use example_selector::SemanticSimilarityExampleSelector;
 pub use memory::{
-    BufferMemory, ConversationMemory, MemorySnapshot, TokenBufferMemory, TokenCounter,
-    summarize_conversation,
+    BufferMemory, ConversationMemory, MemorySnapshot, SummaryBufferMemory, TokenBufferMemory,
+    TokenCounter, summarize_conversation,
 };
 pub use message::{Message, Role, ContentPart, ImageSource};
 pub use model::{ChatModel, Embeddings, ChatOptions, ChatResponse, TokenUsage, FinishReason};

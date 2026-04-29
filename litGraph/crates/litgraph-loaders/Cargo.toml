@@ -21,6 +21,11 @@ regex.workspace = true
 once_cell = "1"
 reqwest = { workspace = true, features = ["blocking"] }
 base64.workspace = true
+# S3 loader — reuses hand-rolled SigV4 from litgraph-providers-bedrock
+# (public module). ListObjectsV2 XML responses parsed with regex (leaf
+# tags only — no attributes on data nodes, so regex is safe here).
+litgraph-providers-bedrock.workspace = true
+chrono.workspace = true
 # PDF text extraction is opt-in. lopdf is pure-Rust + handles font encoding so
 # we don't need cargo install poppler / wasm-bindgen / native deps.
 lopdf = { version = "0.40", optional = true }

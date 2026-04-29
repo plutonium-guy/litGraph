@@ -5,7 +5,7 @@
 use std::sync::{Arc, Mutex};
 
 use litgraph_core::{
-    BufferMemory, ConversationMemory, Message, TokenBufferMemory, TokenCounter,
+    BufferMemory, ConversationMemory, Message, SummaryBufferMemory, TokenBufferMemory, TokenCounter,
     summarize_conversation as core_summarize_conversation,
 };
 use litgraph_memory_sqlite::SqliteChatHistory;
@@ -21,6 +21,7 @@ use crate::runtime::block_on_compat;
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyBufferMemory>()?;
     m.add_class::<PyTokenBufferMemory>()?;
+    m.add_class::<PySummaryBufferMemory>()?;
     m.add_class::<PySqliteChatHistory>()?;
     m.add_function(wrap_pyfunction!(summarize_conversation, m)?)?;
     Ok(())
@@ -269,6 +270,183 @@ impl PyTokenBufferMemory {
             .map_err(|_| PyRuntimeError::new_err("memory poisoned"))?
             .restore(snap);
         Ok(())
+    }
+}
+
+/// Rolling buffer + LLM-distilled running summary of evicted turns.
+/// LangChain parity: `ConversationSummaryBufferMemory`.
+///
+/// ```python
+/// from litgraph.memory import SummaryBufferMemory
+/// mem = SummaryBufferMemory(max_recent_messages=6, summarize_chunk=4)
+/// mem.append({"role": "user", "content": "tell me about Rust"})
+/// mem.append({"role": "assistant", "content": "Rust is a systems..."})
+/// # ... many turns later ...
+/// mem.compact(model)            # fold oldest 4 msgs into running summary
+/// msgs = mem.messages()         # [system_pin?, summary_msg?, ...recent]
+/// ```
+///
+/// Summarization is decoupled from `append` so the sync Memory API stays
+/// non-blocking. Call `compact(model)` before invoking the model if
+/// `needs_compact` is True (or just call it unconditionally — it's a
+/// no-op when under cap).
+#[pyclass(name = "SummaryBufferMemory", module = "litgraph.memory")]
+pub struct PySummaryBufferMemory {
+    inner: Arc<Mutex<SummaryBufferMemory>>,
+}
+
+#[pymethods]
+impl PySummaryBufferMemory {
+    #[new]
+    #[pyo3(signature = (max_recent_messages=20, summarize_chunk=10))]
+    fn new(max_recent_messages: usize, summarize_chunk: usize) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(SummaryBufferMemory::new(
+                max_recent_messages,
+                summarize_chunk,
+            ))),
+        }
+    }
+
+    fn append<'py>(&self, py: Python<'py>, message: Bound<'py, PyAny>) -> PyResult<()> {
+        let m = parse_one_message(message)?;
+        py.allow_threads(|| {
+            let mut g = self.inner.lock().map_err(|_| PyRuntimeError::new_err("memory poisoned"))?;
+            g.append(m);
+            Ok(())
+        })
+    }
+
+    fn messages<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        let snapshot = self.inner.lock()
+            .map_err(|_| PyRuntimeError::new_err("memory poisoned"))?
+            .messages();
+        messages_to_py_list(py, &snapshot)
+    }
+
+    fn clear(&self) -> PyResult<()> {
+        self.inner.lock().map_err(|_| PyRuntimeError::new_err("memory poisoned"))?.clear();
+        Ok(())
+    }
+
+    #[pyo3(signature = (message=None))]
+    fn set_system<'py>(&self, message: Option<Bound<'py, PyAny>>) -> PyResult<()> {
+        let m = message.map(parse_one_message).transpose()?;
+        self.inner.lock()
+            .map_err(|_| PyRuntimeError::new_err("memory poisoned"))?
+            .set_system(m);
+        Ok(())
+    }
+
+    /// Current running summary (may be empty string if none yet).
+    fn running_summary(&self) -> PyResult<Option<String>> {
+        Ok(self.inner.lock()
+            .map_err(|_| PyRuntimeError::new_err("memory poisoned"))?
+            .running_summary()
+            .map(|s| s.to_string()))
+    }
+
+    fn recent_len(&self) -> PyResult<usize> {
+        Ok(self.inner.lock()
+            .map_err(|_| PyRuntimeError::new_err("memory poisoned"))?
+            .recent_len())
+    }
+
+    fn needs_compact(&self) -> PyResult<bool> {
+        Ok(self.inner.lock()
+            .map_err(|_| PyRuntimeError::new_err("memory poisoned"))?
+            .needs_compact())
+    }
+
+    /// Summarize the oldest `summarize_chunk` messages into the running
+    /// summary IFF the buffer exceeds `max_recent_messages`. Returns True
+    /// if compaction ran, False if no-op.
+    fn compact<'py>(
+        &self,
+        py: Python<'py>,
+        model: Bound<'py, PyAny>,
+    ) -> PyResult<bool> {
+        let chat = extract_chat_model(&model)?;
+        // Same pattern as PyBufferMemory::summarize_and_compact — snapshot,
+        // await, restore. Avoids holding std::sync::Mutex across an await.
+        let (snap, max_recent, chunk) = {
+            let g = self.inner.lock()
+                .map_err(|_| PyRuntimeError::new_err("memory poisoned"))?;
+            (g.snapshot(), g.max_recent_messages, g.summarize_chunk)
+        };
+        let (new_snap, ran) = py.allow_threads(|| {
+            block_on_compat(async move {
+                let mut tmp = SummaryBufferMemory::new(max_recent, chunk);
+                tmp.restore(snap);
+                let r = tmp.compact(&*chat).await?;
+                Ok::<_, litgraph_core::Error>((tmp.snapshot(), r))
+            })
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })?;
+        self.inner.lock()
+            .map_err(|_| PyRuntimeError::new_err("memory poisoned"))?
+            .restore(new_snap);
+        Ok(ran)
+    }
+
+    /// Force-summarize the ENTIRE recent buffer into the running summary.
+    /// Useful at session boundaries.
+    fn compact_all<'py>(
+        &self,
+        py: Python<'py>,
+        model: Bound<'py, PyAny>,
+    ) -> PyResult<bool> {
+        let chat = extract_chat_model(&model)?;
+        let (snap, max_recent, chunk) = {
+            let g = self.inner.lock()
+                .map_err(|_| PyRuntimeError::new_err("memory poisoned"))?;
+            (g.snapshot(), g.max_recent_messages, g.summarize_chunk)
+        };
+        let (new_snap, ran) = py.allow_threads(|| {
+            block_on_compat(async move {
+                let mut tmp = SummaryBufferMemory::new(max_recent, chunk);
+                tmp.restore(snap);
+                let r = tmp.compact_all(&*chat).await?;
+                Ok::<_, litgraph_core::Error>((tmp.snapshot(), r))
+            })
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })?;
+        self.inner.lock()
+            .map_err(|_| PyRuntimeError::new_err("memory poisoned"))?
+            .restore(new_snap);
+        Ok(ran)
+    }
+
+    fn __repr__(&self) -> String {
+        let g = self.inner.lock();
+        let (n, has_sum) = g.as_ref()
+            .map(|m| (m.recent_len(), m.running_summary().is_some()))
+            .unwrap_or((0, false));
+        format!("SummaryBufferMemory(recent={n}, summary={})", if has_sum { "yes" } else { "no" })
+    }
+
+    fn to_bytes<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, pyo3::types::PyBytes>> {
+        let bytes = self.inner.lock()
+            .map_err(|_| PyRuntimeError::new_err("memory poisoned"))?
+            .to_bytes()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        Ok(pyo3::types::PyBytes::new_bound(py, &bytes))
+    }
+
+    fn restore(&self, bytes: &[u8]) -> PyResult<()> {
+        let snap = litgraph_core::MemorySnapshot::from_bytes(bytes)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        self.inner.lock()
+            .map_err(|_| PyRuntimeError::new_err("memory poisoned"))?
+            .restore(snap);
+        Ok(())
+    }
+
+    #[staticmethod]
+    fn from_bytes(max_recent_messages: usize, summarize_chunk: usize, bytes: &[u8]) -> PyResult<Self> {
+        let m = SummaryBufferMemory::from_bytes(max_recent_messages, summarize_chunk, bytes)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        Ok(Self { inner: Arc::new(Mutex::new(m)) })
     }
 }
 

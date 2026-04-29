@@ -8,10 +8,12 @@ use std::sync::{Arc, Mutex};
 use futures::StreamExt;
 use litgraph_cache::{CachedModel, SemanticCachedModel};
 use litgraph_resilience::{
-    FallbackChatModel, RateLimitConfig, RateLimitedChatModel, RetryConfig, RetryingChatModel,
+    CostCappedChatModel, FallbackChatModel, PiiScrubbingChatModel, PromptCachingChatModel,
+    RateLimitConfig, RateLimitedChatModel, RetryConfig, RetryingChatModel,
+    SelfConsistencyChatModel, TokenBudgetChatModel,
 };
 use litgraph_core::model::ChatStreamEvent;
-use litgraph_core::{ChatModel, ChatOptions, Message, Role};
+use litgraph_core::{ChatModel, ChatOptions, Message, PiiScrubber, Role};
 use litgraph_observability::{CallbackBus, InstrumentedChatModel};
 use litgraph_providers_anthropic::{AnthropicChat, AnthropicConfig};
 use litgraph_providers_bedrock::{AwsCredentials, BedrockChat, BedrockConfig, BedrockConverseChat};
@@ -38,6 +40,11 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyChatStream>()?;
     m.add_class::<PyStructuredChatModel>()?;
     m.add_class::<PyFallbackChat>()?;
+    m.add_class::<PyTokenBudgetChat>()?;
+    m.add_class::<PyPiiScrubbingChat>()?;
+    m.add_class::<PyPromptCachingChat>()?;
+    m.add_class::<PyCostCappedChat>()?;
+    m.add_class::<PySelfConsistencyChat>()?;
     m.add_function(wrap_pyfunction!(with_structured_output, m)?)?;
     m.add_function(wrap_pyfunction!(ollama_chat, m)?)?;
     m.add_function(wrap_pyfunction!(groq_chat, m)?)?;
@@ -1476,6 +1483,473 @@ impl PyFallbackChat {
 }
 
 impl PyFallbackChat {
+    pub(crate) fn chat_model(&self) -> Arc<dyn ChatModel> {
+        self.inner.clone()
+    }
+}
+
+/// Token-budget wrapper. Enforces a per-invocation token cap to prevent
+/// runaway history growth from blowing up LLM bills. Two modes:
+///
+///   - Strict (default): messages over budget raise `ValueError`.
+///   - Auto-trim: drops oldest non-system messages until under budget.
+///     System + last message always preserved.
+///
+/// ```python
+/// from litgraph.providers import OpenAIChat, TokenBudgetChat
+/// raw = OpenAIChat(api_key=..., model="gpt-4o-mini")
+/// chat = TokenBudgetChat(raw, max_tokens=4096, auto_trim=True)
+/// resp = chat.invoke(long_message_history)  # auto-trimmed if over 4096
+/// ```
+#[pyclass(name = "TokenBudgetChat", module = "litgraph.providers")]
+pub struct PyTokenBudgetChat {
+    inner: Arc<dyn ChatModel>,
+}
+
+#[pymethods]
+impl PyTokenBudgetChat {
+    #[new]
+    #[pyo3(signature = (model, max_tokens, auto_trim=false))]
+    fn new(model: Py<PyAny>, max_tokens: usize, auto_trim: bool) -> PyResult<Self> {
+        let chat_model: Arc<dyn ChatModel> =
+            Python::with_gil(|py| crate::agents::extract_chat_model(model.bind(py)))?;
+        let mut wrapper = TokenBudgetChatModel::new(chat_model, max_tokens);
+        if auto_trim {
+            wrapper = wrapper.auto_trim();
+        }
+        Ok(Self { inner: Arc::new(wrapper) })
+    }
+
+    #[pyo3(signature = (messages, temperature=None, max_tokens=None))]
+    fn invoke<'py>(
+        &self,
+        py: Python<'py>,
+        messages: Bound<'py, PyList>,
+        temperature: Option<f32>,
+        max_tokens: Option<u32>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let msgs = parse_messages(&messages)?;
+        let opts = ChatOptions { temperature, max_tokens, ..Default::default() };
+        let m = self.inner.clone();
+        let resp = py.allow_threads(|| {
+            block_on_compat(async move { m.invoke(msgs, &opts).await })
+                .map_err(|e| PyValueError::new_err(e.to_string()))
+        })?;
+        response_to_py_dict(py, &resp)
+    }
+
+    fn __repr__(&self) -> String {
+        format!("TokenBudgetChat(inner={})", self.inner.name())
+    }
+}
+
+impl PyTokenBudgetChat {
+    pub(crate) fn chat_model(&self) -> Arc<dyn ChatModel> {
+        self.inner.clone()
+    }
+}
+
+/// `PiiScrubbingChat` — wrap any `ChatModel` to redact PII before send.
+///
+/// Scrubs User role messages (and optionally System) with a `PiiScrubber`,
+/// then forwards to the inner model. Assistant + Tool messages in the
+/// history pass through untouched so agent traces stay intact.
+///
+/// - `scrub_system=False` by default (operator prompts trusted).
+/// - `scrub_outputs=False` by default (response formatting preserved).
+///
+/// ```python
+/// from litgraph.providers import OpenAIChat, PiiScrubbingChat
+/// raw = OpenAIChat(api_key=..., model="gpt-4o-mini")
+/// chat = PiiScrubbingChat(raw)           # scrubs outgoing user messages
+/// chat.invoke([("user", "Email me at a@b.com")])  # sends "<EMAIL>"
+/// ```
+#[pyclass(name = "PiiScrubbingChat", module = "litgraph.providers")]
+pub struct PyPiiScrubbingChat {
+    inner: Arc<dyn ChatModel>,
+}
+
+#[pymethods]
+impl PyPiiScrubbingChat {
+    #[new]
+    #[pyo3(signature = (model, scrubber=None, scrub_system=false, scrub_outputs=false))]
+    fn new(
+        model: Py<PyAny>,
+        scrubber: Option<Py<PyAny>>,
+        scrub_system: bool,
+        scrub_outputs: bool,
+    ) -> PyResult<Self> {
+        let chat_model: Arc<dyn ChatModel> =
+            Python::with_gil(|py| crate::agents::extract_chat_model(model.bind(py)))?;
+        let scrub = Python::with_gil(|py| -> PyResult<PiiScrubber> {
+            match scrubber {
+                Some(obj) => {
+                    let bound = obj.bind(py);
+                    let s = bound.extract::<PyRef<crate::evaluators::PyPiiScrubber>>()?;
+                    Ok(s.clone_inner())
+                }
+                None => Ok(PiiScrubber::new()),
+            }
+        })?;
+        let mut wrapper = PiiScrubbingChatModel::new(chat_model)
+            .with_scrubber(Arc::new(scrub));
+        if scrub_system {
+            wrapper = wrapper.with_system_scrubbing();
+        }
+        if scrub_outputs {
+            wrapper = wrapper.with_output_scrubbing();
+        }
+        Ok(Self { inner: Arc::new(wrapper) })
+    }
+
+    #[pyo3(signature = (messages, temperature=None, max_tokens=None))]
+    fn invoke<'py>(
+        &self,
+        py: Python<'py>,
+        messages: Bound<'py, PyList>,
+        temperature: Option<f32>,
+        max_tokens: Option<u32>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let msgs = parse_messages(&messages)?;
+        let opts = ChatOptions { temperature, max_tokens, ..Default::default() };
+        let m = self.inner.clone();
+        let resp = py.allow_threads(|| {
+            block_on_compat(async move { m.invoke(msgs, &opts).await })
+                .map_err(|e| PyValueError::new_err(e.to_string()))
+        })?;
+        response_to_py_dict(py, &resp)
+    }
+
+    fn __repr__(&self) -> String {
+        format!("PiiScrubbingChat(inner={})", self.inner.name())
+    }
+}
+
+impl PyPiiScrubbingChat {
+    pub(crate) fn chat_model(&self) -> Arc<dyn ChatModel> {
+        self.inner.clone()
+    }
+}
+
+/// `PromptCachingChat` — auto-mark messages as Anthropic prompt-cache breakpoints.
+///
+/// Wraps any `ChatModel`. On every invoke, sets `cache=True` on messages
+/// matching the policy BEFORE forwarding. Anthropic/Bedrock-on-Anthropic
+/// providers attach `cache_control: {"type":"ephemeral"}` to those messages'
+/// last content blocks — cached input tokens cost ~0.1×. Other providers
+/// ignore the flag, so stacking is safe.
+///
+/// - `cache_system=True` (default) — mark the first system message.
+/// - `cache_last_user_if_over=N` — mark the LAST user message if its text
+///   exceeds N bytes (long-context-in-user pattern).
+/// - `cache_indices=[i, ...]` — manual: mark specific message indices.
+///
+/// Anthropic caps at 4 breakpoints per request; keep policies minimal.
+///
+/// ```python
+/// from litgraph.providers import AnthropicChat, PromptCachingChat
+/// raw = AnthropicChat(api_key=..., model="claude-opus-4-7")
+/// chat = PromptCachingChat(raw, cache_last_user_if_over=4096)
+/// chat.invoke([
+///     {"role": "system", "content": "<long system prompt>"},
+///     {"role": "user",   "content": "<long context>"},
+/// ])
+/// ```
+#[pyclass(name = "PromptCachingChat", module = "litgraph.providers")]
+pub struct PyPromptCachingChat {
+    inner: Arc<dyn ChatModel>,
+}
+
+#[pymethods]
+impl PyPromptCachingChat {
+    #[new]
+    #[pyo3(signature = (
+        model,
+        cache_system=true,
+        cache_last_user_if_over=None,
+        cache_indices=None,
+    ))]
+    fn new(
+        model: Py<PyAny>,
+        cache_system: bool,
+        cache_last_user_if_over: Option<usize>,
+        cache_indices: Option<Vec<usize>>,
+    ) -> PyResult<Self> {
+        let chat_model: Arc<dyn ChatModel> =
+            Python::with_gil(|py| crate::agents::extract_chat_model(model.bind(py)))?;
+        let mut wrapper = PromptCachingChatModel::new(chat_model);
+        if !cache_system {
+            wrapper = wrapper.without_system();
+        }
+        if let Some(b) = cache_last_user_if_over {
+            wrapper = wrapper.cache_last_user_if_over(b);
+        }
+        if let Some(idxs) = cache_indices {
+            wrapper = wrapper.cache_indices(idxs);
+        }
+        Ok(Self { inner: Arc::new(wrapper) })
+    }
+
+    #[pyo3(signature = (messages, temperature=None, max_tokens=None))]
+    fn invoke<'py>(
+        &self,
+        py: Python<'py>,
+        messages: Bound<'py, PyList>,
+        temperature: Option<f32>,
+        max_tokens: Option<u32>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let msgs = parse_messages(&messages)?;
+        let opts = ChatOptions { temperature, max_tokens, ..Default::default() };
+        let m = self.inner.clone();
+        let resp = py.allow_threads(|| {
+            block_on_compat(async move { m.invoke(msgs, &opts).await })
+                .map_err(|e| PyValueError::new_err(e.to_string()))
+        })?;
+        response_to_py_dict(py, &resp)
+    }
+
+    fn __repr__(&self) -> String {
+        format!("PromptCachingChat(inner={})", self.inner.name())
+    }
+}
+
+impl PyPromptCachingChat {
+    pub(crate) fn chat_model(&self) -> Arc<dyn ChatModel> {
+        self.inner.clone()
+    }
+}
+
+/// `CostCappedChat` — hard USD cap on cumulative spend across calls.
+///
+/// Wraps any `ChatModel`. On each invoke, checks the running total against
+/// `max_usd`. Once at or above the cap, further calls fail with ValueError
+/// BEFORE hitting the provider — the failing call burns no tokens. Prices
+/// default to the litGraph built-in table (all major hosted LLMs as of
+/// 2026-04). Override with `prices={"model": (prompt_usd_per_mtok, completion_usd_per_mtok)}`.
+///
+/// Unpriced models add $0 per call (fail-open — custom / internal models
+/// don't stall the pipeline; add them to `prices` to opt in).
+///
+/// ```python
+/// from litgraph.providers import OpenAIChat, CostCappedChat
+/// raw = OpenAIChat(api_key=..., model="gpt-4o-mini")
+/// chat = CostCappedChat(raw, max_usd=1.00)  # $1 daily cap
+/// try:
+///     chat.invoke(...)
+/// except ValueError as e:
+///     if "cost cap" in str(e): reset_daily_budget()
+/// print(chat.total_usd(), chat.remaining_usd())
+/// ```
+#[pyclass(name = "CostCappedChat", module = "litgraph.providers")]
+pub struct PyCostCappedChat {
+    inner: Arc<dyn ChatModel>,
+    capped: Arc<CostCappedChatModel>,
+}
+
+#[pymethods]
+impl PyCostCappedChat {
+    #[new]
+    #[pyo3(signature = (model, max_usd, prices=None))]
+    fn new(
+        model: Py<PyAny>,
+        max_usd: f64,
+        prices: Option<Bound<'_, PyDict>>,
+    ) -> PyResult<Self> {
+        let chat_model: Arc<dyn ChatModel> =
+            Python::with_gil(|py| crate::agents::extract_chat_model(model.bind(py)))?;
+        let sheet = match prices {
+            Some(d) => {
+                let mut s = litgraph_observability::cost::PriceSheet::new();
+                for (k, v) in d.iter() {
+                    let model_key: String = k.extract()?;
+                    let tup: (f64, f64) = v.extract()?;
+                    s.set(
+                        model_key,
+                        litgraph_observability::cost::ModelPrice {
+                            prompt_per_mtok: tup.0,
+                            completion_per_mtok: tup.1,
+                        },
+                    );
+                }
+                s
+            }
+            None => litgraph_observability::cost::default_prices(),
+        };
+        let capped = Arc::new(CostCappedChatModel::new(chat_model, sheet, max_usd));
+        Ok(Self {
+            inner: capped.clone(),
+            capped,
+        })
+    }
+
+    #[pyo3(signature = (messages, temperature=None, max_tokens=None))]
+    fn invoke<'py>(
+        &self,
+        py: Python<'py>,
+        messages: Bound<'py, PyList>,
+        temperature: Option<f32>,
+        max_tokens: Option<u32>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let msgs = parse_messages(&messages)?;
+        let opts = ChatOptions { temperature, max_tokens, ..Default::default() };
+        let m = self.inner.clone();
+        let resp = py.allow_threads(|| {
+            block_on_compat(async move { m.invoke(msgs, &opts).await })
+                .map_err(|e| PyValueError::new_err(e.to_string()))
+        })?;
+        response_to_py_dict(py, &resp)
+    }
+
+    /// Cumulative USD spent through this wrapper.
+    fn total_usd(&self) -> f64 {
+        self.capped.total_usd()
+    }
+
+    /// `max_usd - total_usd`, floored at 0.
+    fn remaining_usd(&self) -> f64 {
+        self.capped.remaining_usd()
+    }
+
+    /// Reset the spend counter — e.g. at midnight UTC for a daily budget.
+    fn reset(&self) {
+        self.capped.reset();
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "CostCappedChat(inner={}, spent=${:.4}, remaining=${:.4})",
+            self.inner.name(),
+            self.capped.total_usd(),
+            self.capped.remaining_usd()
+        )
+    }
+}
+
+impl PyCostCappedChat {
+    pub(crate) fn chat_model(&self) -> Arc<dyn ChatModel> {
+        self.inner.clone()
+    }
+}
+
+/// `SelfConsistencyChat` — sample the model N times at elevated temperature,
+/// pick the majority answer (Wang et al 2022). Classic reasoning-accuracy
+/// boost for math/code/multi-step tasks, at the cost of N× tokens.
+///
+/// Defaults: `samples=5`, `temperature=0.7`. The default voter picks the
+/// most-common normalized response text (trim + lowercase + collapse
+/// whitespace). For tasks where raw-text majority never converges (long
+/// reasoning chains that reach the same answer through different wording),
+/// pass `voter=callable` that extracts the answer field from each response
+/// and returns the majority value.
+///
+/// `voter`: 1-arg callable receiving a list of response dicts (each with
+/// `{"text","model","usage",...}`), returning a string-comparable value
+/// per response. The wrapper counts these values and picks the majority.
+/// Return `None` from the callable for responses where the field is missing
+/// — those get excluded from the vote.
+///
+/// ```python
+/// from litgraph.providers import OpenAIChat, SelfConsistencyChat
+/// raw = OpenAIChat(api_key=..., model="gpt-4o-mini")
+///
+/// # Default: text-majority.
+/// voter_chat = SelfConsistencyChat(raw, samples=5)
+/// resp = voter_chat.invoke([{"role": "user", "content": "2+2?"}])
+///
+/// # Custom: extract the last number.
+/// import re
+/// def last_number(r):
+///     nums = re.findall(r"-?\d+", r["text"])
+///     return nums[-1] if nums else None
+/// smart = SelfConsistencyChat(raw, samples=5, voter=last_number)
+/// ```
+#[pyclass(name = "SelfConsistencyChat", module = "litgraph.providers")]
+pub struct PySelfConsistencyChat {
+    inner: Arc<dyn ChatModel>,
+}
+
+#[pymethods]
+impl PySelfConsistencyChat {
+    #[new]
+    #[pyo3(signature = (model, samples=5, temperature=0.7, voter=None))]
+    fn new(
+        model: Py<PyAny>,
+        samples: usize,
+        temperature: f32,
+        voter: Option<Py<PyAny>>,
+    ) -> PyResult<Self> {
+        let chat_model: Arc<dyn ChatModel> =
+            Python::with_gil(|py| crate::agents::extract_chat_model(model.bind(py)))?;
+        let mut wrapper = SelfConsistencyChatModel::new(chat_model, samples)
+            .with_temperature(temperature);
+        if let Some(cb) = voter {
+            let cb_arc = Arc::new(cb);
+            let voter_fn: litgraph_resilience::ConsistencyVoter =
+                Arc::new(move |responses: &[litgraph_core::ChatResponse]| {
+                    Python::with_gil(|py| -> Option<usize> {
+                        let mut extracted: Vec<Option<String>> = Vec::with_capacity(responses.len());
+                        for r in responses {
+                            let d = pyo3::types::PyDict::new_bound(py);
+                            d.set_item("text", r.message.text_content()).ok()?;
+                            d.set_item("model", &r.model).ok()?;
+                            let u = pyo3::types::PyDict::new_bound(py);
+                            u.set_item("prompt", r.usage.prompt).ok()?;
+                            u.set_item("completion", r.usage.completion).ok()?;
+                            u.set_item("total", r.usage.total).ok()?;
+                            d.set_item("usage", u).ok()?;
+                            match cb_arc.call1(py, (d,)) {
+                                Ok(v) => {
+                                    if v.is_none(py) {
+                                        extracted.push(None);
+                                    } else {
+                                        extracted.push(v.extract::<String>(py).ok());
+                                    }
+                                }
+                                Err(_) => extracted.push(None),
+                            }
+                        }
+                        use std::collections::HashMap;
+                        let mut counts: HashMap<&str, usize> = HashMap::new();
+                        for e in &extracted {
+                            if let Some(v) = e {
+                                *counts.entry(v.as_str()).or_insert(0) += 1;
+                            }
+                        }
+                        let (best, _) = counts.iter().max_by_key(|(_, c)| *c)?;
+                        extracted
+                            .iter()
+                            .position(|e| e.as_deref() == Some(*best))
+                    })
+                });
+            wrapper = wrapper.with_voter(voter_fn);
+        }
+        Ok(Self { inner: Arc::new(wrapper) })
+    }
+
+    #[pyo3(signature = (messages, temperature=None, max_tokens=None))]
+    fn invoke<'py>(
+        &self,
+        py: Python<'py>,
+        messages: Bound<'py, PyList>,
+        temperature: Option<f32>,
+        max_tokens: Option<u32>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let msgs = parse_messages(&messages)?;
+        let opts = ChatOptions { temperature, max_tokens, ..Default::default() };
+        let m = self.inner.clone();
+        let resp = py.allow_threads(|| {
+            block_on_compat(async move { m.invoke(msgs, &opts).await })
+                .map_err(|e| PyValueError::new_err(e.to_string()))
+        })?;
+        response_to_py_dict(py, &resp)
+    }
+
+    fn __repr__(&self) -> String {
+        format!("SelfConsistencyChat(inner={})", self.inner.name())
+    }
+}
+
+impl PySelfConsistencyChat {
     pub(crate) fn chat_model(&self) -> Arc<dyn ChatModel> {
         self.inner.clone()
     }

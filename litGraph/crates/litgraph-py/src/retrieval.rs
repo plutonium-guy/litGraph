@@ -8,7 +8,7 @@ use litgraph_retrieval::{
     embedding_redundant_filter, long_context_reorder, mmr_select, AttributeInfo, Bm25Index,
     ChildSplitter, Compressor, ContextualCompressionRetriever, DocStore,
     EmbeddingsFilterCompressor, HybridRetriever, LlmExtractCompressor, MemoryDocStore,
-    MultiQueryRetriever, ParentDocumentRetriever, PipelineCompressor, Reranker,
+    HydeRetriever, MultiQueryRetriever, ParentDocumentRetriever, PipelineCompressor, Reranker,
     RerankingRetriever, Retriever, SelfQueryRetriever, TimeWeightedRetriever, VectorRetriever,
 };
 use litgraph_rerankers_cohere::{CohereConfig, CohereReranker};
@@ -48,6 +48,7 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyParentDocumentRetriever>()?;
     m.add_class::<PyMemoryDocStore>()?;
     m.add_class::<PyMultiQueryRetriever>()?;
+    m.add_class::<PyHydeRetriever>()?;
     m.add_class::<PyLlmExtractCompressor>()?;
     m.add_class::<PyEmbeddingsFilterCompressor>()?;
     m.add_class::<PyPipelineCompressor>()?;
@@ -1962,6 +1963,96 @@ impl PyTimeWeightedRetriever {
     ) -> PyResult<Bound<'py, PyList>> {
         let r = self.inner.clone();
         let docs = py.allow_threads(move || {
+            block_on_compat(async move { r.retrieve(&query, k).await })
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })?;
+        docs_to_pylist(py, docs)
+    }
+}
+
+// ---------- HydeRetriever (iter 132) ----------
+//
+// Hypothetical Document Embeddings. Wraps a base retriever + ChatModel.
+// Asks the LLM to write a hypothetical answer to the user's question,
+// then retrieves using THAT answer's embedding. Boosts recall on
+// abstract / conceptual queries where question + document vocabulary
+// diverge.
+//
+// Orthogonal to MultiQueryRetriever — MultiQuery generates N question
+// paraphrases; HyDE generates ONE answer passage. Stack both for
+// maximum recall on high-precision workloads.
+#[pyclass(name = "HydeRetriever", module = "litgraph.retrieval")]
+#[derive(Clone)]
+pub struct PyHydeRetriever { pub(crate) inner: Arc<HydeRetriever> }
+
+#[pymethods]
+impl PyHydeRetriever {
+    /// `base` — any litGraph Retriever.
+    /// `llm` — any litGraph chat model (pair with a cheap model;
+    /// the hypothetical doesn't need to be factually correct).
+    /// `include_original=True` also retrieves with the raw user query
+    /// (belt-and-suspenders — good for off-topic hypotheticals).
+    /// `system_prompt=None` uses the default encyclopedia-style prompt.
+    #[new]
+    #[pyo3(signature = (base, llm, include_original=true, system_prompt=None))]
+    fn new(
+        base: Bound<'_, PyAny>,
+        llm: Bound<'_, PyAny>,
+        include_original: bool,
+        system_prompt: Option<String>,
+    ) -> PyResult<Self> {
+        let base_arc: Arc<dyn Retriever> = if let Ok(v) = base.extract::<PyRef<PyVectorRetriever>>() {
+            v.as_retriever()
+        } else if let Ok(b) = base.extract::<PyRef<PyBm25Index>>() {
+            b.as_retriever()
+        } else if let Ok(r) = base.extract::<PyRef<PyRerankingRetriever>>() {
+            r.as_retriever()
+        } else if let Ok(h) = base.extract::<PyRef<PyHybridRetriever>>() {
+            h.as_retriever()
+        } else if let Ok(p) = base.extract::<PyRef<PyParentDocumentRetriever>>() {
+            p.as_retriever()
+        } else if let Ok(m) = base.extract::<PyRef<PyMultiQueryRetriever>>() {
+            m.inner.clone() as Arc<dyn Retriever>
+        } else if let Ok(hy) = base.extract::<PyRef<PyHydeRetriever>>() {
+            hy.inner.clone() as Arc<dyn Retriever>
+        } else {
+            return Err(pyo3::exceptions::PyTypeError::new_err(
+                "base must be a litGraph Retriever (VectorRetriever / Bm25Index / RerankingRetriever / HybridRetriever / ParentDocumentRetriever / MultiQueryRetriever / HydeRetriever)",
+            ));
+        };
+
+        let llm_arc = crate::agents::extract_chat_model(&llm)?;
+        let mut hyde = HydeRetriever::new(base_arc, llm_arc)
+            .with_include_original(include_original);
+        if let Some(p) = system_prompt {
+            hyde = hyde.with_system_prompt(p);
+        }
+        Ok(Self { inner: Arc::new(hyde) })
+    }
+
+    /// Generate the hypothetical answer without retrieving — useful for
+    /// previewing / caching outside the retrieval path.
+    fn generate_hypothetical<'py>(
+        &self,
+        py: Python<'py>,
+        query: String,
+    ) -> PyResult<String> {
+        let r = self.inner.clone();
+        py.allow_threads(|| {
+            block_on_compat(async move { r.generate_hypothetical(&query).await })
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })
+    }
+
+    #[pyo3(signature = (query, k=4))]
+    fn retrieve<'py>(
+        &self,
+        py: Python<'py>,
+        query: String,
+        k: usize,
+    ) -> PyResult<Bound<'py, PyList>> {
+        let r = self.inner.clone();
+        let docs = py.allow_threads(|| {
             block_on_compat(async move { r.retrieve(&query, k).await })
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))
         })?;

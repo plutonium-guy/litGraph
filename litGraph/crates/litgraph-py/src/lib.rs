@@ -31,6 +31,7 @@ mod mcp;
 mod prompts;
 mod parsers;
 mod evaluators;
+mod tracing_otel;
 mod runtime;
 
 #[pyfunction]
@@ -78,6 +79,7 @@ fn litgraph(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     add_sub(py, m, "prompts", prompts::register)?;
     add_sub(py, m, "parsers", parsers::register)?;
     add_sub(py, m, "evaluators", evaluators::register)?;
+    add_sub(py, m, "tracing", tracing_otel::register)?;
 
     Ok(())
 }

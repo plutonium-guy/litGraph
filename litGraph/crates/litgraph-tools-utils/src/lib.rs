@@ -16,6 +16,7 @@ mod dalle;
 mod tts;
 mod cached;
 mod python_repl;
+mod webhook;
 
 pub use calculator::CalculatorTool;
 pub use http_request::{HttpRequestTool, HttpRequestConfig};
@@ -27,3 +28,4 @@ pub use dalle::{DalleConfig, DalleImageTool};
 pub use tts::{TtsAudioTool, TtsConfig};
 pub use cached::CachedTool;
 pub use python_repl::{PythonReplConfig, PythonReplTool};
+pub use webhook::{WebhookConfig, WebhookPreset, WebhookTool};

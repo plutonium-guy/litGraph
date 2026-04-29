@@ -170,6 +170,60 @@ impl Checkpointer for SqliteCheckpointer {
         .await
         .map_err(|e| GraphError::Checkpoint(format!("join: {e}")))?
     }
+
+    /// Native DELETE-WHERE-step>target. Faster than the default
+    /// list+clear+re-put because we never round-trip the surviving rows.
+    async fn rewind_to(&self, thread_id: &str, target_step: u64) -> Result<usize> {
+        let conn = self.conn.clone();
+        let tid = thread_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let guard = conn
+                .lock()
+                .map_err(|_| GraphError::Checkpoint("mutex poisoned".into()))?;
+            // Guard: target must exist.
+            let exists: Option<i64> = guard
+                .query_row(
+                    "SELECT 1 FROM checkpoints WHERE thread_id = ?1 AND step = ?2",
+                    params![tid, target_step as i64],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(|e| GraphError::Checkpoint(e.to_string()))?;
+            if exists.is_none() {
+                return Err(GraphError::Checkpoint(format!(
+                    "rewind_to: thread `{tid}` has no checkpoint at step {target_step}"
+                )));
+            }
+            let dropped = guard
+                .execute(
+                    "DELETE FROM checkpoints WHERE thread_id = ?1 AND step > ?2",
+                    params![tid, target_step as i64],
+                )
+                .map_err(|e| GraphError::Checkpoint(e.to_string()))?;
+            Ok::<usize, GraphError>(dropped)
+        })
+        .await
+        .map_err(|e| GraphError::Checkpoint(format!("join: {e}")))?
+    }
+
+    async fn clear_thread(&self, thread_id: &str) -> Result<()> {
+        let conn = self.conn.clone();
+        let tid = thread_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let guard = conn
+                .lock()
+                .map_err(|_| GraphError::Checkpoint("mutex poisoned".into()))?;
+            guard
+                .execute(
+                    "DELETE FROM checkpoints WHERE thread_id = ?1",
+                    params![tid],
+                )
+                .map_err(|e| GraphError::Checkpoint(e.to_string()))?;
+            Ok::<(), GraphError>(())
+        })
+        .await
+        .map_err(|e| GraphError::Checkpoint(format!("join: {e}")))?
+    }
 }
 
 #[cfg(test)]
@@ -215,5 +269,63 @@ mod tests {
         assert_eq!(list.len(), 3);
         assert_eq!(list[0].step, 1);
         assert_eq!(list[2].step, 3);
+    }
+
+    fn mkcp(thread: &str, step: u64) -> Checkpoint {
+        Checkpoint {
+            thread_id: thread.into(),
+            step,
+            state: vec![step as u8],
+            next_nodes: vec!["node".into()],
+            next_sends: vec![],
+            pending_interrupt: None,
+            ts_ms: step * 100,
+        }
+    }
+
+    #[tokio::test]
+    async fn sqlite_rewind_drops_later_atomically() {
+        let cp = SqliteCheckpointer::in_memory().unwrap();
+        for s in 0..5 {
+            cp.put(mkcp("t1", s)).await.unwrap();
+        }
+        let dropped = cp.rewind_to("t1", 2).await.unwrap();
+        assert_eq!(dropped, 2);
+        assert_eq!(cp.list("t1").await.unwrap().len(), 3);
+        assert_eq!(cp.latest("t1").await.unwrap().unwrap().step, 2);
+    }
+
+    #[tokio::test]
+    async fn sqlite_rewind_nonexistent_step_errors() {
+        let cp = SqliteCheckpointer::in_memory().unwrap();
+        cp.put(mkcp("t1", 0)).await.unwrap();
+        let err = cp.rewind_to("t1", 99).await.unwrap_err();
+        assert!(format!("{err}").contains("no checkpoint at step 99"));
+        // Nothing was dropped.
+        assert_eq!(cp.list("t1").await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn sqlite_fork_at_copies_history_into_new_thread() {
+        let cp = SqliteCheckpointer::in_memory().unwrap();
+        for s in 0..4 {
+            cp.put(mkcp("main", s)).await.unwrap();
+        }
+        let copied = cp.fork_at("main", 1, "fork-a").await.unwrap();
+        assert_eq!(copied, 2);
+        let fork_hist = cp.list("fork-a").await.unwrap();
+        assert_eq!(fork_hist.len(), 2);
+        assert!(fork_hist.iter().all(|c| c.thread_id == "fork-a"));
+        // Main unchanged.
+        assert_eq!(cp.list("main").await.unwrap().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn sqlite_clear_thread_drops_all() {
+        let cp = SqliteCheckpointer::in_memory().unwrap();
+        cp.put(mkcp("t1", 0)).await.unwrap();
+        cp.put(mkcp("t1", 1)).await.unwrap();
+        cp.clear_thread("t1").await.unwrap();
+        assert!(cp.list("t1").await.unwrap().is_empty());
     }
 }

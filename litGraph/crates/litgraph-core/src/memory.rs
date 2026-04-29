@@ -317,6 +317,189 @@ impl ConversationMemory for TokenBufferMemory {
     }
 }
 
+/// Rolling buffer with an LLM-distilled running summary of evicted turns.
+/// LangChain parity: `ConversationSummaryBufferMemory`. The difference from
+/// `BufferMemory` is that evicted messages don't vanish — they get folded
+/// into a running summary preserved as a synthetic pre-system message, so
+/// long-horizon context survives even when recent-buffer caps kick in.
+///
+/// # Flow
+///
+/// 1. Caller appends messages as usual (sync — `append()` never blocks).
+/// 2. Before invoking the model, call `compact(model).await?` if needed.
+///    If `len(buffer) > max_recent`, the oldest `summarize_chunk` messages
+///    are drained + summarized via `summarize_conversation`, and the summary
+///    is folded into `running_summary` (extended on each compaction).
+/// 3. `messages()` returns `[system_pin?, synthetic_summary_msg?, ...recent]`.
+///
+/// Summarization is deliberately decoupled from `append` so the sync
+/// `ConversationMemory` trait still fits. If the caller skips `compact`
+/// the buffer just grows; this is predictable and debuggable.
+pub struct SummaryBufferMemory {
+    pub max_recent_messages: usize,
+    pub summarize_chunk: usize,
+    system: Option<Message>,
+    running_summary: Option<String>,
+    history: std::collections::VecDeque<Message>,
+}
+
+impl SummaryBufferMemory {
+    /// `max_recent_messages`: soft cap on how many recent messages to keep
+    /// verbatim. `summarize_chunk`: how many of the oldest messages to drain
+    /// + summarize per `compact()` call. `summarize_chunk` must be ≥ 1; a
+    /// typical choice is `max_recent / 2` (amortize LLM cost — compact only
+    /// when over budget, and summarize enough to drop well under it).
+    pub fn new(max_recent_messages: usize, summarize_chunk: usize) -> Self {
+        Self {
+            max_recent_messages: max_recent_messages.max(1),
+            summarize_chunk: summarize_chunk.max(1),
+            system: None,
+            running_summary: None,
+            history: std::collections::VecDeque::new(),
+        }
+    }
+
+    /// Current running summary, if any. `None` until `compact()` runs at
+    /// least once. Snapshot-friendly — the caller can persist it.
+    pub fn running_summary(&self) -> Option<&str> {
+        self.running_summary.as_deref()
+    }
+
+    /// Current recent buffer size (excludes system pin + summary).
+    pub fn recent_len(&self) -> usize {
+        self.history.len()
+    }
+
+    /// True if `compact()` would evict + summarize on the next call.
+    pub fn needs_compact(&self) -> bool {
+        self.history.len() > self.max_recent_messages
+    }
+
+    /// Drain the oldest `summarize_chunk` messages and fold them into the
+    /// running summary. No-op when the buffer is at or under the cap.
+    /// Returns `Ok(true)` if compaction ran, `Ok(false)` if no-op.
+    pub async fn compact(&mut self, model: &dyn ChatModel) -> Result<bool> {
+        if !self.needs_compact() {
+            return Ok(false);
+        }
+        let to_drain = self.summarize_chunk.min(self.history.len());
+        let drained: Vec<Message> = self.history.drain(..to_drain).collect();
+        let prior = self.running_summary.as_deref();
+        let new_summary = summarize_conversation(model, &drained, prior).await?;
+        self.running_summary = Some(new_summary);
+        Ok(true)
+    }
+
+    /// Force a full compact — summarize ALL buffered messages into the
+    /// running summary, leaving the recent buffer empty. Useful at session
+    /// boundaries or before persisting memory to a cold store.
+    pub async fn compact_all(&mut self, model: &dyn ChatModel) -> Result<bool> {
+        if self.history.is_empty() {
+            return Ok(false);
+        }
+        let drained: Vec<Message> = self.history.drain(..).collect();
+        let prior = self.running_summary.as_deref();
+        let new_summary = summarize_conversation(model, &drained, prior).await?;
+        self.running_summary = Some(new_summary);
+        Ok(true)
+    }
+
+    pub fn snapshot(&self) -> MemorySnapshot {
+        // Pack the running summary into the system field as a synthetic
+        // system message (prefixed) so round-trips through
+        // `MemorySnapshot::{to_bytes, from_bytes}` preserve it. Callers
+        // using `restore` on a fresh instance get it back.
+        let system = match (&self.system, &self.running_summary) {
+            (Some(s), Some(sum)) => Some(Message::system(format!(
+                "{}\n\n[Conversation summary so far]\n{sum}",
+                s.text_content()
+            ))),
+            (Some(s), None) => Some(s.clone()),
+            (None, Some(sum)) => Some(Message::system(format!(
+                "[Conversation summary so far]\n{sum}"
+            ))),
+            (None, None) => None,
+        };
+        MemorySnapshot {
+            version: MemorySnapshot::CURRENT_VERSION,
+            system,
+            history: self.history.iter().cloned().collect(),
+        }
+    }
+
+    pub fn restore(&mut self, snap: MemorySnapshot) {
+        // Unpack: if the system message has our marker, split the summary
+        // back out; else treat it as a plain pin.
+        const MARKER: &str = "\n\n[Conversation summary so far]\n";
+        self.system = None;
+        self.running_summary = None;
+        if let Some(sys) = snap.system {
+            let text = sys.text_content();
+            if let Some(idx) = text.find(MARKER) {
+                let (head, tail) = text.split_at(idx);
+                let sum = &tail[MARKER.len()..];
+                if !head.is_empty() {
+                    self.system = Some(Message::system(head));
+                }
+                if !sum.is_empty() {
+                    self.running_summary = Some(sum.to_string());
+                }
+            } else if let Some(inner) = text.strip_prefix("[Conversation summary so far]\n") {
+                self.running_summary = Some(inner.to_string());
+            } else {
+                self.system = Some(sys);
+            }
+        }
+        self.history.clear();
+        for m in snap.history {
+            self.history.push_back(m);
+        }
+    }
+
+    pub fn to_bytes(&self) -> Result<Vec<u8>> { self.snapshot().to_bytes() }
+    pub fn from_bytes(
+        max_recent: usize,
+        summarize_chunk: usize,
+        bytes: &[u8],
+    ) -> Result<Self> {
+        let snap = MemorySnapshot::from_bytes(bytes)?;
+        let mut m = Self::new(max_recent, summarize_chunk);
+        m.restore(snap);
+        Ok(m)
+    }
+}
+
+impl ConversationMemory for SummaryBufferMemory {
+    fn append(&mut self, m: Message) {
+        if matches!(m.role, crate::Role::System) {
+            self.system = Some(m);
+            return;
+        }
+        self.history.push_back(m);
+        // Do NOT summarize here — it's async. Caller must `compact().await`.
+    }
+    fn messages(&self) -> Vec<Message> {
+        let mut out = Vec::with_capacity(self.history.len() + 2);
+        if let Some(s) = &self.system {
+            out.push(s.clone());
+        }
+        if let Some(sum) = &self.running_summary {
+            out.push(Message::system(format!(
+                "Summary of earlier turns:\n{sum}"
+            )));
+        }
+        out.extend(self.history.iter().cloned());
+        out
+    }
+    fn clear(&mut self) {
+        self.history.clear();
+        self.running_summary = None;
+    }
+    fn set_system(&mut self, m: Option<Message>) {
+        self.system = m;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -578,5 +761,187 @@ mod tests {
         let got = mem.messages();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].text_content(), "only one");
+    }
+
+    // --- SummaryBufferMemory tests ---
+
+    #[tokio::test]
+    async fn summary_buffer_no_compact_when_under_cap() {
+        let m = FakeSummarizer {
+            captured_prompt: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            canned_summary: "should not run".into(),
+        };
+        let mut mem = SummaryBufferMemory::new(10, 4);
+        mem.append(Message::user("hi"));
+        assert!(!mem.needs_compact());
+        let ran = mem.compact(&m).await.unwrap();
+        assert!(!ran, "no-op under cap");
+        assert!(mem.running_summary().is_none());
+    }
+
+    #[tokio::test]
+    async fn summary_buffer_compacts_oldest_chunk() {
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let m = FakeSummarizer {
+            captured_prompt: captured.clone(),
+            canned_summary: "greetings exchanged".into(),
+        };
+        let mut mem = SummaryBufferMemory::new(3, 2);
+        mem.append(Message::user("hi"));
+        mem.append(Message::assistant("hello"));
+        mem.append(Message::user("how are you"));
+        mem.append(Message::assistant("good"));  // now 4 > cap 3 → compact
+        assert!(mem.needs_compact());
+
+        let ran = mem.compact(&m).await.unwrap();
+        assert!(ran);
+        // Oldest 2 drained + summarized; 2 remaining.
+        assert_eq!(mem.recent_len(), 2);
+        assert_eq!(mem.running_summary(), Some("greetings exchanged"));
+
+        // messages() surfaces summary as a synthetic system message.
+        let got = mem.messages();
+        assert_eq!(got.len(), 3, "summary + 2 recent");
+        assert_eq!(got[0].role, Role::System);
+        assert!(got[0].text_content().contains("greetings exchanged"));
+        assert_eq!(got[1].text_content(), "how are you");
+        assert_eq!(got[2].text_content(), "good");
+    }
+
+    #[tokio::test]
+    async fn summary_buffer_extends_prior_summary_across_compactions() {
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let m = FakeSummarizer {
+            captured_prompt: captured.clone(),
+            canned_summary: "second-summary".into(),
+        };
+        let mut mem = SummaryBufferMemory::new(2, 2);
+        mem.append(Message::user("m1"));
+        mem.append(Message::user("m2"));
+        mem.append(Message::user("m3"));  // trigger first compact
+        mem.compact(&m).await.unwrap();
+        // Fake always returns "second-summary" — overwrite in subsequent compactions.
+        mem.append(Message::user("m4"));
+        mem.append(Message::user("m5"));  // trigger second compact
+        mem.compact(&m).await.unwrap();
+
+        // Second compact's prompt should reference the prior summary.
+        let prompt = captured.lock().unwrap().clone().unwrap();
+        assert!(prompt.contains("Previous summary:"),
+                "second compact must pass prior summary to the LLM");
+    }
+
+    #[tokio::test]
+    async fn summary_buffer_messages_includes_system_pin_and_summary() {
+        let m = FakeSummarizer {
+            captured_prompt: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            canned_summary: "distilled".into(),
+        };
+        let mut mem = SummaryBufferMemory::new(1, 2);
+        mem.set_system(Some(Message::system("you are helpful")));
+        mem.append(Message::user("first"));
+        mem.append(Message::user("second"));
+        mem.append(Message::user("third"));
+        mem.compact(&m).await.unwrap();
+        let got = mem.messages();
+        // [system_pin, summary, ...recent]
+        assert_eq!(got[0].role, Role::System);
+        assert_eq!(got[0].text_content(), "you are helpful");
+        assert_eq!(got[1].role, Role::System);
+        assert!(got[1].text_content().contains("distilled"));
+    }
+
+    #[tokio::test]
+    async fn summary_buffer_compact_all_drains_everything() {
+        let m = FakeSummarizer {
+            captured_prompt: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            canned_summary: "everything summarized".into(),
+        };
+        let mut mem = SummaryBufferMemory::new(100, 10);
+        mem.append(Message::user("a"));
+        mem.append(Message::user("b"));
+        mem.append(Message::user("c"));
+        let ran = mem.compact_all(&m).await.unwrap();
+        assert!(ran);
+        assert_eq!(mem.recent_len(), 0);
+        assert_eq!(mem.running_summary(), Some("everything summarized"));
+    }
+
+    #[tokio::test]
+    async fn summary_buffer_clear_removes_summary_too() {
+        let m = FakeSummarizer {
+            captured_prompt: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            canned_summary: "gone".into(),
+        };
+        let mut mem = SummaryBufferMemory::new(1, 2);
+        mem.append(Message::user("x"));
+        mem.append(Message::user("y"));
+        mem.append(Message::user("z"));
+        mem.compact(&m).await.unwrap();
+        assert!(mem.running_summary().is_some());
+        mem.clear();
+        assert_eq!(mem.recent_len(), 0);
+        assert!(mem.running_summary().is_none());
+    }
+
+    #[tokio::test]
+    async fn summary_buffer_system_via_append_sets_pin() {
+        let m = FakeSummarizer {
+            captured_prompt: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            canned_summary: "_".into(),
+        };
+        let mut mem = SummaryBufferMemory::new(10, 2);
+        mem.append(Message::system("pin via append"));
+        mem.append(Message::user("x"));
+        let got = mem.messages();
+        assert_eq!(got[0].role, Role::System);
+        assert_eq!(got[0].text_content(), "pin via append");
+        let _ = m;
+    }
+
+    #[tokio::test]
+    async fn summary_buffer_snapshot_roundtrip_preserves_summary() {
+        let m = FakeSummarizer {
+            captured_prompt: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            canned_summary: "state of the world".into(),
+        };
+        let mut mem = SummaryBufferMemory::new(1, 2);
+        mem.set_system(Some(Message::system("op prompt")));
+        mem.append(Message::user("a"));
+        mem.append(Message::user("b"));
+        mem.append(Message::user("c"));
+        mem.compact(&m).await.unwrap();
+        let bytes = mem.to_bytes().unwrap();
+        let restored = SummaryBufferMemory::from_bytes(1, 2, &bytes).unwrap();
+        assert_eq!(restored.running_summary(), Some("state of the world"));
+        let got = restored.messages();
+        assert!(got.iter().any(|m| m.text_content() == "op prompt"));
+        assert!(got.iter().any(|m| m.text_content().contains("state of the world")));
+    }
+
+    #[tokio::test]
+    async fn summary_buffer_compact_chunk_capped_at_history_len() {
+        let m = FakeSummarizer {
+            captured_prompt: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            canned_summary: "single".into(),
+        };
+        // Chunk is 10, buffer has only 2 over cap.
+        let mut mem = SummaryBufferMemory::new(1, 10);
+        mem.append(Message::user("a"));
+        mem.append(Message::user("b"));
+        mem.compact(&m).await.unwrap();
+        assert_eq!(mem.recent_len(), 0, "chunk clamps to history len");
+        assert_eq!(mem.running_summary(), Some("single"));
+    }
+
+    #[tokio::test]
+    async fn summary_buffer_construction_clamps_zero_inputs() {
+        // `new(0, 0)` should still produce a sane memory — clamp to 1.
+        let mut mem = SummaryBufferMemory::new(0, 0);
+        assert_eq!(mem.max_recent_messages, 1);
+        assert_eq!(mem.summarize_chunk, 1);
+        mem.append(Message::user("x"));
+        mem.append(Message::user("y"));
+        assert!(mem.needs_compact());
     }
 }

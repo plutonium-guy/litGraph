@@ -4,7 +4,8 @@ use std::sync::Arc;
 
 use litgraph_core::{Document, Embeddings};
 use litgraph_splitters::{
-    HtmlHeaderSplitter, JsonSplitter, Language, MarkdownHeaderSplitter, RecursiveCharacterSplitter,
+    CodeSplitter, HtmlHeaderSplitter, JsonSplitter, Language, MarkdownHeaderSplitter,
+    RecursiveCharacterSplitter,
     SemanticChunker, Splitter,
 };
 use pyo3::exceptions::PyRuntimeError;
@@ -24,6 +25,7 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PySemanticChunker>()?;
     m.add_class::<PyJsonSplitter>()?;
     m.add_class::<PyHtmlHeaderSplitter>()?;
+    m.add_class::<PyCodeSplitter>()?;
     Ok(())
 }
 
@@ -278,3 +280,69 @@ impl PySemanticChunker {
         )
     }
 }
+
+/// Definition-boundary code splitter — splits at function/class/impl
+/// boundaries for the chosen language. Keeps whole definitions together
+/// when they fit; oversize ones fall back to recursive char splitting.
+///
+/// Languages (case-insensitive): `python`, `rust`, `javascript`, `typescript`,
+/// `go`, `java`, `cpp`, `ruby`, `php`. (`markdown` and `html` accepted but
+/// fall through to recursive char splitting — use `MarkdownHeaderSplitter`
+/// or `HtmlHeaderSplitter` for those.)
+///
+/// ```python
+/// from litgraph.splitters import CodeSplitter
+/// splitter = CodeSplitter(language="python", chunk_size=1500, chunk_overlap=0)
+/// chunks = splitter.split_text(open("module.py").read())
+/// ```
+#[pyclass(name = "CodeSplitter", module = "litgraph.splitters")]
+pub struct PyCodeSplitter {
+    pub(crate) inner: CodeSplitter,
+}
+
+#[pymethods]
+impl PyCodeSplitter {
+    #[new]
+    #[pyo3(signature = (language, chunk_size=1500, chunk_overlap=0))]
+    fn new(language: &str, chunk_size: usize, chunk_overlap: usize) -> PyResult<Self> {
+        let lang = match language.to_ascii_lowercase().as_str() {
+            "python" | "py" => Language::Python,
+            "rust" | "rs" => Language::Rust,
+            "javascript" | "js" => Language::JavaScript,
+            "typescript" | "ts" => Language::TypeScript,
+            "go" | "golang" => Language::Go,
+            "java" => Language::Java,
+            "cpp" | "c++" => Language::Cpp,
+            "ruby" | "rb" => Language::Ruby,
+            "php" => Language::Php,
+            "markdown" | "md" => Language::Markdown,
+            "html" | "htm" => Language::Html,
+            other => return Err(pyo3::exceptions::PyValueError::new_err(
+                format!("unknown language: '{other}' (supported: python, rust, javascript, typescript, go, java, cpp, ruby, php, markdown, html)")
+            )),
+        };
+        Ok(Self { inner: CodeSplitter::new(chunk_size, chunk_overlap, lang) })
+    }
+
+    fn split_text(&self, py: Python<'_>, text: String) -> Vec<String> {
+        py.allow_threads(|| self.inner.split_text(&text))
+    }
+
+    fn split_documents<'py>(
+        &self,
+        py: Python<'py>,
+        docs: Bound<'py, PyList>,
+    ) -> PyResult<Bound<'py, PyList>> {
+        let parsed: Vec<Document> = parse_docs(&docs)?;
+        let chunks = py.allow_threads(|| self.inner.split_documents(&parsed));
+        docs_to_pylist(py, chunks)
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "CodeSplitter(chunk_size={}, chunk_overlap={})",
+            self.inner.chunk_size, self.inner.chunk_overlap
+        )
+    }
+}
+

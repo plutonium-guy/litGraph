@@ -193,4 +193,41 @@ impl Checkpointer for PgCheckpointer {
             .map_err(query_err)?;
         rows.iter().map(row_to_checkpoint).collect()
     }
+
+    /// Native DELETE-WHERE-step>target. Atomic single-statement.
+    async fn rewind_to(&self, thread_id: &str, target_step: u64) -> Result<usize> {
+        let client = self.pool.get().await.map_err(pool_err)?;
+        let exists = client
+            .query_opt(
+                "SELECT 1 FROM litgraph_checkpoints WHERE thread_id = $1 AND step = $2",
+                &[&thread_id, &(target_step as i64)],
+            )
+            .await
+            .map_err(query_err)?;
+        if exists.is_none() {
+            return Err(GraphError::Checkpoint(format!(
+                "rewind_to: thread `{thread_id}` has no checkpoint at step {target_step}"
+            )));
+        }
+        let dropped = client
+            .execute(
+                "DELETE FROM litgraph_checkpoints WHERE thread_id = $1 AND step > $2",
+                &[&thread_id, &(target_step as i64)],
+            )
+            .await
+            .map_err(query_err)?;
+        Ok(dropped as usize)
+    }
+
+    async fn clear_thread(&self, thread_id: &str) -> Result<()> {
+        let client = self.pool.get().await.map_err(pool_err)?;
+        client
+            .execute(
+                "DELETE FROM litgraph_checkpoints WHERE thread_id = $1",
+                &[&thread_id],
+            )
+            .await
+            .map_err(query_err)?;
+        Ok(())
+    }
 }

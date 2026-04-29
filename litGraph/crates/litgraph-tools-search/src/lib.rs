@@ -205,6 +205,137 @@ impl Tool for TavilySearch {
     }
 }
 
+/// Tavily /extract — fetch full article text for a list of URLs. Pairs
+/// with `TavilySearch` to complete the web-research loop: search returns
+/// snippets, extract returns full bodies. Much better than hand-rolled
+/// HTML scraping — Tavily does readability extraction server-side.
+///
+/// Input: `{"urls": [url1, url2, ...], "extract_depth"?: "basic"|"advanced"}`.
+/// The tool silently caps at 20 URLs per call (Tavily's own limit).
+///
+/// Returns: `{"results": [{"url", "content"}, ...], "failed_results"?: [...]}`
+/// — failures (unreachable / robots-blocked / paywall) are surfaced in a
+/// separate array so the caller can decide whether to retry or skip.
+pub struct TavilyExtract {
+    cfg: TavilyConfig,
+    http: Client,
+}
+
+impl TavilyExtract {
+    pub fn new(cfg: TavilyConfig) -> Result<Self> {
+        let http = Client::builder()
+            .timeout(cfg.timeout)
+            .build()
+            .map_err(|e| Error::other(format!("http build: {e}")))?;
+        Ok(Self { cfg, http })
+    }
+}
+
+#[async_trait]
+impl Tool for TavilyExtract {
+    fn schema(&self) -> ToolSchema {
+        ToolSchema {
+            name: "web_extract".into(),
+            description: "Fetch full article text from a list of URLs via Tavily \
+                          /extract. Use after `web_search` to read the top results \
+                          rather than relying on snippets."
+                .into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "urls": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "URLs to extract (1-20). Supply the URLs from web_search results."
+                    },
+                    "extract_depth": {
+                        "type": "string",
+                        "enum": ["basic", "advanced"],
+                        "description": "`basic` is faster/cheaper; `advanced` pulls more complete text for JS-heavy pages. Default: basic."
+                    }
+                },
+                "required": ["urls"]
+            }),
+        }
+    }
+
+    async fn run(&self, args: Value) -> Result<Value> {
+        // Accept either a JSON array OR a single string (agents sometimes
+        // pass one URL as a bare string; don't punish them for it).
+        let urls: Vec<String> = match args.get("urls") {
+            Some(Value::Array(a)) => a
+                .iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect(),
+            Some(Value::String(s)) => vec![s.clone()],
+            _ => {
+                return Err(Error::invalid(
+                    "tavily_extract: missing `urls` (expected array of strings)",
+                ));
+            }
+        };
+        if urls.is_empty() {
+            return Err(Error::invalid("tavily_extract: `urls` is empty"));
+        }
+        // Tavily caps at 20 per call; truncate silently.
+        let urls: Vec<String> = urls.into_iter().take(20).collect();
+
+        let extract_depth = args
+            .get("extract_depth")
+            .and_then(|v| v.as_str())
+            .unwrap_or("basic");
+
+        let url = format!("{}/extract", self.cfg.base_url.trim_end_matches('/'));
+        let body = json!({
+            "api_key": self.cfg.api_key,
+            "urls": urls,
+            "extract_depth": extract_depth,
+        });
+        let resp = self
+            .http
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| Error::other(format!("tavily extract send: {e}")))?;
+        if !resp.status().is_success() {
+            let s = resp.status();
+            let t = resp.text().await.unwrap_or_default();
+            return Err(Error::other(format!("tavily extract {s}: {t}")));
+        }
+        let v: Value = resp
+            .json()
+            .await
+            .map_err(|e| Error::other(format!("tavily extract decode: {e}")))?;
+
+        // Normalize the response: Tavily returns `raw_content` but we
+        // expose it as `content` for consistency with other loaders.
+        let mut out = Vec::new();
+        if let Some(results) = v.get("results").and_then(|r| r.as_array()) {
+            for r in results {
+                out.push(json!({
+                    "url": r.get("url").and_then(|t| t.as_str()).unwrap_or(""),
+                    "content": r
+                        .get("raw_content")
+                        .or_else(|| r.get("content"))
+                        .and_then(|t| t.as_str())
+                        .unwrap_or(""),
+                }));
+            }
+        }
+        let mut failed = Vec::new();
+        if let Some(fails) = v.get("failed_results").and_then(|r| r.as_array()) {
+            for f in fails {
+                failed.push(json!({
+                    "url": f.get("url").and_then(|t| t.as_str()).unwrap_or(""),
+                    "error": f.get("error").and_then(|t| t.as_str()).unwrap_or("unknown"),
+                }));
+            }
+        }
+        Ok(json!({"results": out, "failed_results": failed}))
+    }
+}
+
 /// DuckDuckGo via the Instant-Answer JSON endpoint — the only stable
 /// no-API-key escape hatch. Returns the AbstractText (Wikipedia-style summary)
 /// and any RelatedTopics that have URLs. Limited vs Brave/Tavily — for
@@ -518,5 +649,105 @@ mod tests {
         let s = t.schema();
         assert_eq!(s.name, "web_search");
         assert!(s.description.contains("DuckDuckGo"));
+    }
+
+    // ----- TavilyExtract tests -----
+
+    #[tokio::test]
+    async fn tavily_extract_returns_normalized_results() {
+        let body = r#"{
+            "results": [
+                {"url": "https://a.example", "raw_content": "full body of A"},
+                {"url": "https://b.example", "raw_content": "full body of B"}
+            ],
+            "failed_results": []
+        }"#;
+        let port = start_fake("POST", body);
+        let cfg = TavilyConfig::new("tvly-key")
+            .with_base_url(format!("http://127.0.0.1:{port}"));
+        let t = TavilyExtract::new(cfg).unwrap();
+        let out = t
+            .run(json!({"urls": ["https://a.example", "https://b.example"]}))
+            .await
+            .unwrap();
+        let results = out["results"].as_array().unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0]["url"], json!("https://a.example"));
+        assert_eq!(results[0]["content"], json!("full body of A"));
+        assert_eq!(results[1]["content"], json!("full body of B"));
+        assert_eq!(out["failed_results"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn tavily_extract_surfaces_failed_results_array() {
+        let body = r#"{
+            "results": [{"url": "https://ok", "raw_content": "ok content"}],
+            "failed_results": [
+                {"url": "https://paywall", "error": "403 Forbidden"},
+                {"url": "https://dead", "error": "connection refused"}
+            ]
+        }"#;
+        let port = start_fake("POST", body);
+        let cfg = TavilyConfig::new("tvly-key")
+            .with_base_url(format!("http://127.0.0.1:{port}"));
+        let t = TavilyExtract::new(cfg).unwrap();
+        let out = t
+            .run(json!({"urls": ["https://ok", "https://paywall", "https://dead"]}))
+            .await
+            .unwrap();
+        assert_eq!(out["results"].as_array().unwrap().len(), 1);
+        let failed = out["failed_results"].as_array().unwrap();
+        assert_eq!(failed.len(), 2);
+        assert_eq!(failed[0]["url"], json!("https://paywall"));
+        assert_eq!(failed[0]["error"], json!("403 Forbidden"));
+    }
+
+    #[tokio::test]
+    async fn tavily_extract_accepts_single_url_string() {
+        // Agents sometimes pass a bare string; don't punish them.
+        let body = r#"{"results":[{"url":"https://x","raw_content":"body"}]}"#;
+        let port = start_fake("POST", body);
+        let cfg = TavilyConfig::new("k").with_base_url(format!("http://127.0.0.1:{port}"));
+        let t = TavilyExtract::new(cfg).unwrap();
+        let out = t.run(json!({"urls": "https://x"})).await.unwrap();
+        assert_eq!(out["results"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn tavily_extract_missing_urls_returns_invalid_input() {
+        let cfg = TavilyConfig::new("k");
+        let t = TavilyExtract::new(cfg).unwrap();
+        let err = t.run(json!({})).await.unwrap_err();
+        assert!(matches!(err, Error::InvalidInput(_)));
+    }
+
+    #[tokio::test]
+    async fn tavily_extract_empty_urls_returns_invalid_input() {
+        let cfg = TavilyConfig::new("k");
+        let t = TavilyExtract::new(cfg).unwrap();
+        let err = t.run(json!({"urls": []})).await.unwrap_err();
+        assert!(matches!(err, Error::InvalidInput(_)));
+    }
+
+    #[test]
+    fn tavily_extract_schema_has_urls_array_required() {
+        let cfg = TavilyConfig::new("k");
+        let t = TavilyExtract::new(cfg).unwrap();
+        let s = t.schema();
+        assert_eq!(s.name, "web_extract");
+        assert_eq!(s.parameters["properties"]["urls"]["type"], json!("array"));
+        assert!(s.parameters["required"].as_array().unwrap().contains(&json!("urls")));
+    }
+
+    #[tokio::test]
+    async fn tavily_extract_falls_back_to_content_if_no_raw_content() {
+        // Some Tavily responses use `content` instead of `raw_content`
+        // for short pages. Both should surface.
+        let body = r#"{"results":[{"url":"https://x","content":"short body"}]}"#;
+        let port = start_fake("POST", body);
+        let cfg = TavilyConfig::new("k").with_base_url(format!("http://127.0.0.1:{port}"));
+        let t = TavilyExtract::new(cfg).unwrap();
+        let out = t.run(json!({"urls": ["https://x"]})).await.unwrap();
+        assert_eq!(out["results"][0]["content"], json!("short body"));
     }
 }

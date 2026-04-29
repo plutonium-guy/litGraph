@@ -10,12 +10,14 @@ use async_trait::async_trait;
 use litgraph_core::Result as LgResult;
 use litgraph_core::tool::{Tool, ToolSchema};
 use litgraph_tools_search::{
-    BraveSearch, BraveSearchConfig, DuckDuckGoConfig, DuckDuckGoSearch, TavilyConfig, TavilySearch,
+    BraveSearch, BraveSearchConfig, DuckDuckGoConfig, DuckDuckGoSearch, TavilyConfig, TavilyExtract,
+    TavilySearch,
 };
 use litgraph_tools_utils::{
     CachedTool, CalculatorTool, DalleConfig, DalleImageTool, FsRoot, HttpRequestConfig,
     HttpRequestTool, ListDirectoryTool, PythonReplConfig, PythonReplTool, ReadFileTool, ShellTool,
-    SqliteQueryTool, TtsAudioTool, TtsConfig, WhisperConfig, WhisperTranscribeTool, WriteFileTool,
+    SqliteQueryTool, TtsAudioTool, TtsConfig, WebhookConfig, WebhookTool, WhisperConfig,
+    WhisperTranscribeTool, WriteFileTool,
 };
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
@@ -27,6 +29,7 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyFunctionTool>()?;
     m.add_class::<PyBraveSearchTool>()?;
     m.add_class::<PyTavilySearchTool>()?;
+    m.add_class::<PyTavilyExtractTool>()?;
     m.add_class::<PyCalculatorTool>()?;
     m.add_class::<PyHttpRequestTool>()?;
     m.add_class::<PyReadFileTool>()?;
@@ -40,6 +43,7 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyTtsAudioTool>()?;
     m.add_class::<PyCachedTool>()?;
     m.add_class::<PyPythonReplTool>()?;
+    m.add_class::<PyWebhookTool>()?;
     m.add_function(pyo3::wrap_pyfunction!(tool, m)?)?;
     Ok(())
 }
@@ -55,6 +59,9 @@ pub(crate) fn extract_tool_arc(bound: &Bound<'_, PyAny>) -> PyResult<Arc<dyn Too
         return Ok(t.as_tool());
     }
     if let Ok(t) = bound.extract::<PyRef<PyTavilySearchTool>>() {
+        return Ok(t.as_tool());
+    }
+    if let Ok(t) = bound.extract::<PyRef<PyTavilyExtractTool>>() {
         return Ok(t.as_tool());
     }
     if let Ok(t) = bound.extract::<PyRef<PyDuckDuckGoSearchTool>>() {
@@ -94,6 +101,9 @@ pub(crate) fn extract_tool_arc(bound: &Bound<'_, PyAny>) -> PyResult<Arc<dyn Too
         return Ok(t.as_tool());
     }
     if let Ok(t) = bound.extract::<PyRef<PyPythonReplTool>>() {
+        return Ok(t.as_tool());
+    }
+    if let Ok(t) = bound.extract::<PyRef<PyWebhookTool>>() {
         return Ok(t.as_tool());
     }
     Err(pyo3::exceptions::PyValueError::new_err(
@@ -580,6 +590,82 @@ impl PyPythonReplTool {
     pub(crate) fn as_tool(&self) -> Arc<dyn Tool> { self.inner.clone() as Arc<dyn Tool> }
 }
 
+/// Post agent messages to Slack / Discord / generic incoming webhooks.
+/// URL is hard-coded at construction (NOT a tool arg) so a prompt-
+/// injected agent can't pivot the target channel — it only picks the
+/// message text.
+///
+/// Use different `preset`:
+///   - `"slack"` → payload shape `{"text": "...", "username"?: "..."}`
+///   - `"discord"` → `{"content": "...", "username"?: "..."}`
+///   - `"generic"` → agent's `message` is forwarded verbatim as the
+///     POST body (must be valid JSON)
+///
+/// For multi-channel, construct multiple `WebhookTool`s with distinct
+/// `name=` values (`slack_oncall`, `slack_release`, etc) and let the
+/// agent pick by tool name.
+///
+/// ```python
+/// from litgraph.tools import WebhookTool
+/// oncall = WebhookTool(
+///     url=os.environ["SLACK_ONCALL_WEBHOOK"],
+///     preset="slack",
+///     name="notify_oncall",
+///     description="Page the on-call engineer. Use ONLY for P1 incidents.",
+/// )
+/// agent = ReactAgent(model, tools=[oncall])
+/// ```
+#[pyclass(name = "WebhookTool", module = "litgraph.tools")]
+#[derive(Clone)]
+pub struct PyWebhookTool { pub(crate) inner: Arc<WebhookTool> }
+
+#[pymethods]
+impl PyWebhookTool {
+    #[new]
+    #[pyo3(signature = (url, preset="slack", name=None, description=None, timeout_s=10))]
+    fn new(
+        url: String,
+        preset: &str,
+        name: Option<String>,
+        description: Option<String>,
+        timeout_s: u64,
+    ) -> PyResult<Self> {
+        let mut cfg = match preset {
+            "slack" => WebhookConfig::slack(url),
+            "discord" => WebhookConfig::discord(url),
+            "generic" => WebhookConfig::generic(url),
+            other => {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "WebhookTool preset must be 'slack' | 'discord' | 'generic', got '{other}'"
+                )));
+            }
+        };
+        cfg = cfg.with_timeout(std::time::Duration::from_secs(timeout_s));
+        if let Some(n) = name {
+            cfg = cfg.with_name(n);
+        }
+        if let Some(d) = description {
+            cfg = cfg.with_description(d);
+        }
+        let t = WebhookTool::new(cfg)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        Ok(Self { inner: Arc::new(t) })
+    }
+    #[getter]
+    fn name(&self) -> String {
+        self.inner.schema().name
+    }
+    fn __repr__(&self) -> String {
+        format!("WebhookTool(name='{}')", self.inner.schema().name)
+    }
+}
+
+impl PyWebhookTool {
+    pub(crate) fn as_tool(&self) -> Arc<dyn Tool> {
+        self.inner.clone() as Arc<dyn Tool>
+    }
+}
+
 /// DuckDuckGo Instant Answer search — no API key required. Limited results
 /// vs Brave/Tavily (best for definitions + disambiguation queries) but the
 /// only zero-credentials web-search escape hatch.
@@ -920,6 +1006,48 @@ impl PyTavilySearchTool {
 }
 
 impl PyTavilySearchTool {
+    pub(crate) fn as_tool(&self) -> Arc<dyn Tool> {
+        self.inner.clone() as Arc<dyn Tool>
+    }
+}
+
+/// Tavily /extract — fetch full article text for a list of URLs. Pair with
+/// `TavilySearchTool` for search → extract → answer loops. Reuses the same
+/// API key as TavilySearch (Tavily uses one key for both endpoints).
+///
+/// ```python
+/// from litgraph.tools import TavilyExtractTool
+/// extract = TavilyExtractTool(api_key="tvly-...")
+/// # Agent can pass:
+/// #   {"urls": ["https://foo/bar", "https://baz/qux"], "extract_depth": "basic"}
+/// ```
+#[pyclass(name = "TavilyExtractTool", module = "litgraph.tools")]
+#[derive(Clone)]
+pub struct PyTavilyExtractTool {
+    pub(crate) inner: Arc<TavilyExtract>,
+}
+
+#[pymethods]
+impl PyTavilyExtractTool {
+    #[new]
+    #[pyo3(signature = (api_key, base_url=None, timeout_s=30))]
+    fn new(api_key: String, base_url: Option<String>, timeout_s: u64) -> PyResult<Self> {
+        let mut cfg = TavilyConfig::new(api_key);
+        cfg.timeout = std::time::Duration::from_secs(timeout_s);
+        if let Some(url) = base_url {
+            cfg = cfg.with_base_url(url);
+        }
+        let t = TavilyExtract::new(cfg)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        Ok(Self { inner: Arc::new(t) })
+    }
+
+    #[getter]
+    fn name(&self) -> &'static str { "web_extract" }
+    fn __repr__(&self) -> String { "TavilyExtractTool()".into() }
+}
+
+impl PyTavilyExtractTool {
     pub(crate) fn as_tool(&self) -> Arc<dyn Tool> {
         self.inner.clone() as Arc<dyn Tool>
     }

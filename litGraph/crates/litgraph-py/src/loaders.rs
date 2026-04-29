@@ -3,10 +3,12 @@
 
 use litgraph_loaders::{
     ConfluenceLoader, CsvLoader, DirectoryLoader, DocxLoader, GithubFilesLoader,
-    GithubIssuesLoader, GmailLoader, GoogleDriveLoader, HtmlLoader, JsonLinesLoader, JsonLoader,
-    Loader, MarkdownLoader, NotionLoader, PdfLoader, SlackLoader, TextLoader, WebLoader,
+    GithubIssuesLoader, GmailLoader, GoogleDriveLoader, HtmlLoader, JiraIssuesLoader,
+    JsonLinesLoader, JsonLoader, LinearIssuesLoader,
+    Loader, MarkdownLoader, NotionLoader, PdfLoader, S3Loader, SlackLoader, TextLoader, WebLoader,
     default_dispatcher,
 };
+use litgraph_providers_bedrock::AwsCredentials;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::PyList;
@@ -31,6 +33,9 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyGithubFilesLoader>()?;
     m.add_class::<PyGmailLoader>()?;
     m.add_class::<PyGoogleDriveLoader>()?;
+    m.add_class::<PyLinearIssuesLoader>()?;
+    m.add_class::<PyJiraIssuesLoader>()?;
+    m.add_class::<PyS3Loader>()?;
     Ok(())
 }
 
@@ -712,6 +717,148 @@ impl PyGoogleDriveLoader {
         if let Some(mts) = mime_types { inner = inner.with_mime_types(mts); }
         if let Some(url) = base_url { inner = inner.with_base_url(url); }
         inner.timeout = std::time::Duration::from_secs(timeout_s);
+        Self { inner }
+    }
+
+    fn load<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        let docs = py.allow_threads(|| self.inner.load()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string())))?;
+        docs_to_pylist(py, docs)
+    }
+}
+
+// ---------- LinearIssuesLoader (iter 124) ----------
+//
+// First GraphQL-backed loader. Auth quirk: raw API key in Authorization
+// header — NO `Bearer` prefix. Filters (team_key / state_names /
+// label_names) stack AND-semantics in the GraphQL filter.
+#[pyclass(name = "LinearIssuesLoader", module = "litgraph.loaders")]
+pub struct PyLinearIssuesLoader { inner: LinearIssuesLoader }
+
+#[pymethods]
+impl PyLinearIssuesLoader {
+    #[new]
+    #[pyo3(signature = (
+        api_key, team_key=None, state_names=None, label_names=None,
+        max_issues=500, base_url=None, timeout_s=30,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        api_key: String,
+        team_key: Option<String>,
+        state_names: Option<Vec<String>>,
+        label_names: Option<Vec<String>>,
+        max_issues: usize,
+        base_url: Option<String>,
+        timeout_s: u64,
+    ) -> Self {
+        let mut inner = LinearIssuesLoader::new(api_key)
+            .with_timeout(std::time::Duration::from_secs(timeout_s))
+            .with_max_issues(max_issues);
+        if let Some(tk) = team_key { inner = inner.with_team(tk); }
+        if let Some(sn) = state_names { inner = inner.with_states(sn); }
+        if let Some(ln) = label_names { inner = inner.with_labels(ln); }
+        if let Some(url) = base_url { inner = inner.with_base_url(url); }
+        Self { inner }
+    }
+
+    fn load<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        let docs = py.allow_threads(|| self.inner.load()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string())))?;
+        docs_to_pylist(py, docs)
+    }
+}
+
+// ---------- JiraIssuesLoader (iter 125) ----------
+//
+// Auth: Cloud (email + API token → Basic) or Data Center (Bearer PAT).
+// Dispatch via `token`: when `email` is set, Basic; otherwise Bearer.
+// JQL is required — caller picks the project/filter scope.
+#[pyclass(name = "JiraIssuesLoader", module = "litgraph.loaders")]
+pub struct PyJiraIssuesLoader { inner: JiraIssuesLoader }
+
+#[pymethods]
+impl PyJiraIssuesLoader {
+    #[new]
+    #[pyo3(signature = (
+        base_url, jql, email=None, api_token=None, bearer_token=None,
+        max_issues=500, timeout_s=30,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        base_url: String,
+        jql: String,
+        email: Option<String>,
+        api_token: Option<String>,
+        bearer_token: Option<String>,
+        max_issues: usize,
+        timeout_s: u64,
+    ) -> PyResult<Self> {
+        let inner = match (email, api_token, bearer_token) {
+            (Some(e), Some(t), None) => JiraIssuesLoader::cloud(base_url, e, t, jql),
+            (None, None, Some(bt)) => JiraIssuesLoader::with_bearer_token(base_url, bt, jql),
+            _ => {
+                return Err(PyRuntimeError::new_err(
+                    "JiraIssuesLoader: pass either (email, api_token) for Cloud OR (bearer_token) for Data Center — not both, not neither"
+                ));
+            }
+        };
+        let inner = inner
+            .with_max_issues(max_issues)
+            .with_timeout(std::time::Duration::from_secs(timeout_s));
+        Ok(Self { inner })
+    }
+
+    fn load<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        let docs = py.allow_threads(|| self.inner.load()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string())))?;
+        docs_to_pylist(py, docs)
+    }
+}
+
+// ---------- S3Loader (iter 126) ----------
+//
+// AWS S3 bucket loader. SigV4 auth via access_key_id + secret_access_key
+// (optional session_token for STS-scoped creds). Filters: prefix,
+// extensions allowlist, exclude-path substrings, size cap, max-files.
+// Works with S3-compatible stores (MinIO, Cloudflare R2, Backblaze B2)
+// via `base_url` override.
+#[pyclass(name = "S3Loader", module = "litgraph.loaders")]
+pub struct PyS3Loader { inner: S3Loader }
+
+#[pymethods]
+impl PyS3Loader {
+    #[new]
+    #[pyo3(signature = (
+        access_key_id, secret_access_key, region, bucket,
+        session_token=None, prefix=None, extensions=None, exclude_paths=None,
+        max_files=500, max_file_size_bytes=10_485_760,
+        base_url=None, timeout_s=30,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        access_key_id: String,
+        secret_access_key: String,
+        region: String,
+        bucket: String,
+        session_token: Option<String>,
+        prefix: Option<String>,
+        extensions: Option<Vec<String>>,
+        exclude_paths: Option<Vec<String>>,
+        max_files: usize,
+        max_file_size_bytes: u64,
+        base_url: Option<String>,
+        timeout_s: u64,
+    ) -> Self {
+        let creds = AwsCredentials { access_key_id, secret_access_key, session_token };
+        let mut inner = S3Loader::new(creds, region, bucket)
+            .with_max_files(max_files)
+            .with_max_file_size_bytes(max_file_size_bytes)
+            .with_timeout(std::time::Duration::from_secs(timeout_s));
+        if let Some(p) = prefix { inner = inner.with_prefix(p); }
+        if let Some(e) = extensions { inner = inner.with_extensions(e); }
+        if let Some(ex) = exclude_paths { inner = inner.with_exclude_paths(ex); }
+        if let Some(url) = base_url { inner = inner.with_base_url(url); }
         Self { inner }
     }
 

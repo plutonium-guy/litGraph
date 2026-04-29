@@ -164,7 +164,7 @@ where
                 let cp = Checkpoint {
                     thread_id: self.thread_id.clone(),
                     step: self.step,
-                    state: bincode::serialize(&state)?,
+                    state: rmp_serde::to_vec(&state)?,
                     next_nodes: checkpoint_nodes,
                     next_sends: checkpoint_sends,
                     pending_interrupt: Some(crate::interrupt::Interrupt {
@@ -287,7 +287,7 @@ where
                             let cp = Checkpoint {
                                 thread_id: self.thread_id.clone(),
                                 step,
-                                state: bincode::serialize(&state)?,
+                                state: rmp_serde::to_vec(&state)?,
                                 next_nodes: checkpoint_nodes,
                                 next_sends: checkpoint_sends,
                                 pending_interrupt: Some(crate::interrupt::Interrupt {
@@ -326,7 +326,7 @@ where
             let cp = Checkpoint {
                 thread_id: self.thread_id.clone(),
                 step,
-                state: bincode::serialize(&state)?,
+                state: rmp_serde::to_vec(&state)?,
                 next_nodes: checkpoint_nodes,
                 next_sends: checkpoint_sends,
                 pending_interrupt: None,

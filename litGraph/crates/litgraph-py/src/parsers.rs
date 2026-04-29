@@ -2,18 +2,23 @@
 //! (LangChain `XMLOutputParser` parity). More parsers (regex, list,
 //! comma-separated-list) land here over time.
 
+use std::sync::Arc;
+
 use litgraph_core::{
-    boolean_format_instructions, comma_list_format_instructions,
+    boolean_format_instructions, comma_list_format_instructions, fix_with_llm as core_fix,
     markdown_list_format_instructions, numbered_list_format_instructions, parse_boolean,
     parse_comma_list, parse_markdown_list, parse_nested_xml, parse_numbered_list,
-    parse_react_step, parse_xml_tags, react_format_instructions, xml_format_instructions,
-    ReactStep,
+    parse_partial_json as core_parse_partial, parse_react_step,
+    parse_with_retry as core_parse_retry, parse_xml_tags, react_format_instructions,
+    repair_partial_json as core_repair_partial, xml_format_instructions, ChatModel, ChatOptions,
+    Error, ReactStep,
 };
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
 use crate::graph::json_to_py;
+use crate::runtime::block_on_compat;
 
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(parse_xml_tags_py, m)?)?;
@@ -29,6 +34,10 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(boolean_format_instructions_py, m)?)?;
     m.add_function(wrap_pyfunction!(xml_format_instructions_py, m)?)?;
     m.add_function(wrap_pyfunction!(react_format_instructions_py, m)?)?;
+    m.add_function(wrap_pyfunction!(fix_with_llm_py, m)?)?;
+    m.add_function(wrap_pyfunction!(parse_json_with_retry_py, m)?)?;
+    m.add_function(wrap_pyfunction!(parse_partial_json_py, m)?)?;
+    m.add_function(wrap_pyfunction!(repair_partial_json_py, m)?)?;
     Ok(())
 }
 
@@ -229,4 +238,118 @@ fn xml_format_instructions_py(tags: Vec<String>) -> String {
 fn react_format_instructions_py(tools: Vec<String>) -> String {
     let tool_refs: Vec<&str> = tools.iter().map(|s| s.as_str()).collect();
     react_format_instructions(&tool_refs)
+}
+
+/// Send raw output + parse error + format hint to a fixer LLM. Returns
+/// the model's correction. One call, no parse loop.
+///
+/// `model` accepts any chat model (OpenAIChat, AnthropicChat, etc).
+/// `format_instructions` may be empty.
+///
+/// ```python
+/// from litgraph.parsers import fix_with_llm
+/// from litgraph.providers import OpenAIChat
+/// fixer = OpenAIChat(api_key=..., model="gpt-4o-mini")
+/// corrected = fix_with_llm(
+///     raw='{"x": 1,}',
+///     error="trailing comma",
+///     instructions="valid JSON object",
+///     model=fixer,
+/// )
+/// ```
+#[pyfunction(name = "fix_with_llm")]
+#[pyo3(signature = (raw, error, instructions, model))]
+fn fix_with_llm_py(
+    py: Python<'_>,
+    raw: String,
+    error: String,
+    instructions: String,
+    model: Py<PyAny>,
+) -> PyResult<String> {
+    let chat_model: Arc<dyn ChatModel> = crate::agents::extract_chat_model(model.bind(py))?;
+    let opts = ChatOptions::default();
+    py.allow_threads(|| {
+        block_on_compat(async move {
+            core_fix(&raw, &error, &instructions, chat_model, &opts).await
+        })
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    })
+}
+
+/// JSON-specialized parse-with-retry. Try `json.loads(raw)`; on fail,
+/// ask the fixer model to repair, re-parse, repeat. Returns the parsed
+/// dict / list / scalar, or raises on final failure.
+///
+/// ```python
+/// from litgraph.parsers import parse_json_with_retry
+/// from litgraph.providers import OpenAIChat
+/// fixer = OpenAIChat(api_key=..., model="gpt-4o-mini")
+/// data = parse_json_with_retry(
+///     raw='{"x": 1,}',  # malformed
+///     model=fixer,
+///     schema_hint="{'x': int}",
+///     max_retries=2,
+/// )
+/// ```
+#[pyfunction(name = "parse_json_with_retry")]
+#[pyo3(signature = (raw, model, schema_hint="", max_retries=1))]
+fn parse_json_with_retry_py<'py>(
+    py: Python<'py>,
+    raw: String,
+    model: Py<PyAny>,
+    schema_hint: &str,
+    max_retries: usize,
+) -> PyResult<Bound<'py, PyAny>> {
+    let chat_model: Arc<dyn ChatModel> = crate::agents::extract_chat_model(model.bind(py))?;
+    let opts = ChatOptions::default();
+    let instructions = if schema_hint.is_empty() {
+        "valid JSON (object, array, or scalar)".to_string()
+    } else {
+        format!("valid JSON matching this schema: {schema_hint}")
+    };
+    let parse =
+        |s: &str| serde_json::from_str::<serde_json::Value>(s).map_err(Error::from);
+    let value = py.allow_threads(|| {
+        block_on_compat(async move {
+            core_parse_retry(raw, parse, chat_model, &opts, &instructions, max_retries).await
+        })
+        .map_err(|e| PyValueError::new_err(e.to_string()))
+    })?;
+    json_to_py(py, &value)
+}
+
+/// Best-effort parse of a partial JSON string. Auto-closes unclosed
+/// strings / braces / brackets at EOF so progressive UIs can render
+/// the accumulating object as tokens arrive. Returns `None` if the
+/// buffer has no recognizable root or repair still fails.
+///
+/// ```python
+/// from litgraph.parsers import parse_partial_json
+/// acc = ""
+/// for token in stream_tokens:
+///     acc += token
+///     partial = parse_partial_json(acc)
+///     if partial is not None:
+///         render_ui(partial)
+/// ```
+///
+/// Monotonic-growth invariant: as the buffer grows, the parse result
+/// keeps accumulating keys (no UI flicker from disappearing fields).
+#[pyfunction(name = "parse_partial_json")]
+fn parse_partial_json_py<'py>(
+    py: Python<'py>,
+    text: &str,
+) -> PyResult<Option<Bound<'py, PyAny>>> {
+    match core_parse_partial(text) {
+        Some(v) => Ok(Some(json_to_py(py, &v)?)),
+        None => Ok(None),
+    }
+}
+
+/// Like `parse_partial_json` but returns the REPAIRED JSON string
+/// instead of the parsed value. Useful for inspecting what the repair
+/// produced or forwarding to a different JSON library.
+#[pyfunction(name = "repair_partial_json")]
+fn repair_partial_json_py(text: &str) -> Option<String> {
+    core_repair_partial(text)
 }

@@ -31,7 +31,9 @@ pub mod interrupt;
 pub use state::{Reducer, merge_append, merge_replace};
 pub use node::{NodeOutput, NodeFn};
 pub use graph::{StateGraph, CompiledGraph, START, END};
-pub use checkpoint::{Checkpointer, MemoryCheckpointer, Checkpoint};
+pub use checkpoint::{
+    state_history, Checkpoint, Checkpointer, MemoryCheckpointer, StateHistoryEntry,
+};
 pub use event::GraphEvent;
 pub use interrupt::{Interrupt, Command};
 
@@ -63,6 +65,12 @@ pub enum GraphError {
 
     #[error("bincode: {0}")]
     Bincode(#[from] bincode::Error),
+
+    #[error("rmp-encode: {0}")]
+    RmpEncode(#[from] rmp_serde::encode::Error),
+
+    #[error("rmp-decode: {0}")]
+    RmpDecode(#[from] rmp_serde::decode::Error),
 
     #[error(transparent)]
     Core(#[from] litgraph_core::Error),

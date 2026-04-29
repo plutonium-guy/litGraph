@@ -3,6 +3,73 @@
 Production-grade, slim alternative to LangChain + LangGraph.
 Rust core, Python bindings via PyO3 0.28 + maturin.
 
+## Status — 2026-04-29 (iter 142)
+
+38 crates · ~866 Rust tests · ~773 Python tests · all passing.
+
+**Legend:** ✅ done · ⏳ in flight · ❌ not started · 🚫 deferred indefinitely
+
+### Done — v1.0 must-haves
+- ✅ ChatModel + Embeddings traits
+- ✅ Providers: OpenAI, OpenAIResponses, Anthropic, Gemini (AI Studio + Vertex), Bedrock (native + Converse), Cohere, OpenAI-compat (Ollama, Groq, Together, Mistral, DeepSeek, xAI, Fireworks)
+- ✅ Native function/tool calling per provider
+- ✅ SSE streaming → Python async iterator
+- ✅ Tokenizers (tiktoken-rs + HF tokenizers)
+- ✅ Resilience: RetryingChatModel + RateLimitedChatModel + FallbackChatModel + TokenBudgetChatModel + PiiScrubbingChatModel + PromptCachingChatModel + CostCappedChatModel + **SelfConsistencyChatModel** (iter 140, Wang et al 2022)
+- ✅ on_request hook
+- ✅ ChatPromptTemplate + FewShot + MessagesPlaceholder + minijinja strict-undefined
+- ✅ Structured output via StructuredChatModel + schemars
+- ✅ Tool trait + #[tool] proc-macro + JSON schema
+- ✅ Built-in tools (~17): Calculator, HttpRequest, ReadFile/WriteFile/ListDirectory, Shell, SqliteQuery, BraveSearch/Tavily/DuckDuckGo, **TavilyExtract** (iter 141), Mcp, Whisper, Dalle, Tts, CachedTool, PythonRepl
+- ✅ Agents: ReactAgent (tool-calling, parallel) + SupervisorAgent + TextReActAgent (text-mode for non-tool-calling models, with streaming)
+- ✅ Vector stores: memory, hnsw, pgvector, chroma, qdrant, weaviate
+- ✅ Retrievers: Vector, BM25, Hybrid (RRF), Reranking, ParentDocument, MultiQuery, ContextualCompression, SelfQuery, TimeWeighted
+- ✅ Document transformers: MMR, EmbeddingRedundantFilter, LongContextReorder
+- ✅ Loaders (15): text, markdown, json, jsonl, csv, html, pdf, docx, directory, web, notion, slack, confluence, github-issues, github-files, gmail, gdrive
+- ✅ Splitters: recursive char (with language separators), markdown header, html header, json, semantic (embedding-based), **CodeSplitter** (definition-boundary, iter 142)
+- ✅ Parallel ingestion (Rayon)
+- ✅ StateGraph + reducers macro + Send fan-out + Kahn scheduler
+- ✅ Checkpointers: memory, sqlite, postgres, redis
+- ✅ Streaming events: values / updates / messages / custom
+- ✅ Memory: BufferMemory, TokenBufferMemory, **SummaryBufferMemory** (iter 137), summarize_conversation, SqliteChatHistory
+- ✅ Caching: memory, sqlite, embedding, semantic
+- ✅ Observability: CostTracker + GraphEvent + AgentEvent + tracing spans
+- ✅ PyO3 abi3 wheels (cp39+) via maturin
+- ✅ Output parsers: JSON (StructuredChatModel), XML (flat + nested), comma-list, numbered-list, markdown-list, boolean, ReAct text-mode
+- ✅ format_instructions helpers (paired with each parser)
+- ✅ String evaluators (10): exact_match, levenshtein_ratio, jaccard_similarity, regex_match, json_validity, embedding_cosine, contains_all/any
+- ✅ MCP support (client + server; server spec-complete with **resources + prompts** iter 139)
+- ✅ Modality matrix complete: text in/out, image in/out, audio in/out
+- ✅ Human-in-the-loop: interrupt + Command(resume/goto)
+
+### Left — v1.0 must-haves
+- ✅ **OutputFixingParser** (iter 119) — `fix_with_llm`, `parse_with_retry`, Python `parse_json_with_retry`. LangChain parity.
+- ✅ **Time travel + state history API** (iter 120) — `state_history`, `rewind_to`, `fork_at`, `clear_thread` on Checkpointer + PyCompiledGraph. Native DELETE paths on sqlite/pg/redis. Scheduler serialization swapped bincode→rmp-serde (fixed pre-existing PyCompiledGraph.resume() bug for Value-state graphs).
+- ✅ **OpenTelemetry OTLP exporter** (iter 121) — new crate `litgraph-tracing-otel`. `init_otlp(endpoint, service_name)` / `init_stdout()` / in-memory for tests. Batch span processor. Env var fallbacks. Drop-guard. Python `litgraph.tracing.{init_otlp, init_stdout, shutdown}`.
+- ❌ **`pyo3-stub-gen` `.pyi` generation** — line 157. Every Pyright import warning is from missing stubs.
+- ✅ **Streaming JSON parser** (iter 122) — `parse_partial_json` + `repair_partial_json`. Auto-closes unclosed braces/quotes/brackets. Monotonic-growth invariant. Powers progressive structured-output UIs.
+
+### Left — local inference (lines 173, 219-220)
+- ❌ **fastembed-rs** local embeddings (no-network)
+- ❌ **candle / mistral.rs** local chat (in-process small models)
+- ❌ **ort** ONNX runtime (local cross-encoder rerankers)
+
+### Left — v1.1 nice-to-haves
+- ✅ LangSmith OTel compat shim (iter 127) — `init_langsmith(api_key, project_name)` + generic `init_otlp_http(endpoint, service_name, headers)`. Traces flow to LangSmith UI with zero re-plumbing.
+- ✅ Webhook / generic notifier tool (iter 123) — `WebhookTool` with Slack/Discord/generic presets. URL hard-coded (not agent-controllable). Python `litgraph.tools.WebhookTool(url, preset, ...)`.
+- ✅ `LinearIssuesLoader` (iter 124) — GraphQL-backed. First of its kind in the loader stack.
+- ✅ `JiraIssuesLoader` (iter 125) — REST v3 + JQL. Cloud (Basic: email+token) or Data Center (Bearer PAT). ADF description→text walker.
+- ✅ `S3Loader` (iter 126) — SigV4 (reused from bedrock). list-objects-v2 + get-object. Prefix/ext/exclude/size filters. Works with MinIO/R2/B2 via `base_url`. **Loader matrix complete — 20 sources.**
+- 🚫 LanceDB / Pinecone vector stores — heavy deps (arrow-rs, datafusion); deferred per memory
+- 🚫 LangChain `Callbacks` API parity — wide surface; CostTracker + events already cover use cases
+- 🚫 Streaming tool execution — requires Tool trait extension; deferred
+
+### Iteration log (recent — last 30)
+- 107 ReAct parser · 108 format_instructions · 109 TextReActAgent · 110 TextReActAgent.stream() · 111 string evaluators · 112 doc transformers · 113 FallbackChatModel · 114 Whisper · 115 Dalle · 116 Tts · 117 CachedTool · 118 PythonReplTool · 119 OutputFixingParser · 120 time travel + state history · 121 litgraph-tracing-otel · 122 partial JSON · 123 WebhookTool · 124 LinearIssuesLoader · 125 JiraIssuesLoader + ADF walker · 126 S3Loader · 127 LangSmith OTel shim · 128 LlmJudge · 129 PII scrubber · 130 TokenBudgetChatModel · 131 MCP server · 132 HydeRetriever · 133 FallbackEmbeddings · 134 Retrying + RateLimited Embeddings · 135 PiiScrubbingChatModel · 136 PromptCachingChatModel · 137 SummaryBufferMemory · 138 CostCappedChatModel · 139 MCP resources + prompts · 140 SelfConsistencyChatModel · 141 TavilyExtract tool · 142 CodeSplitter
+
+---
+
+
 ## Guiding Principles
 
 1. **Rust heavy lifting, Python ergonomics** — every hot path (HTTP, SSE parse, tokenize, embed math, vector search, JSON parse, graph scheduling) runs in Rust. Python is a thin shim.

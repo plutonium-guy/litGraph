@@ -190,6 +190,12 @@ where
         self
     }
 
+    /// Borrow the underlying checkpointer — use for state-history +
+    /// fork_at + rewind_to from outside the scheduler.
+    pub fn checkpointer(&self) -> &Arc<dyn Checkpointer> {
+        &self.checkpointer
+    }
+
     pub async fn invoke(&self, initial: S, thread_id: Option<String>) -> Result<S> {
         let mut sched = Scheduler::new(self.inner.clone(), self.checkpointer.clone(), thread_id);
         sched.run(initial).await
@@ -219,7 +225,7 @@ where
             .latest(&thread_id)
             .await?
             .ok_or_else(|| GraphError::Checkpoint(format!("no checkpoint for {thread_id}")))?;
-        let state: S = bincode::deserialize(&cp.state)?;
+        let state: S = rmp_serde::from_slice(&cp.state)?;
         // Apply resume value as a state update via reducer, then continue.
         let state = (self.inner.reducer)(state, resume_value)?;
         let mut sched = Scheduler::new(self.inner.clone(), self.checkpointer.clone(), Some(thread_id));

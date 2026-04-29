@@ -8,7 +8,12 @@
 
 use std::sync::Mutex;
 
-use litgraph_core::{ChatPromptTemplate, FewShotChatPromptTemplate, Message, Role};
+use std::sync::Arc;
+
+use litgraph_core::{
+    ChatPromptTemplate, FewShotChatPromptTemplate, Message, Role,
+    SemanticSimilarityExampleSelector,
+};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
@@ -19,6 +24,7 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyChatPromptTemplate>()?;
     m.add_class::<PyPromptValue>()?;
     m.add_class::<PyFewShotChatPromptTemplate>()?;
+    m.add_class::<PySemanticSimilarityExampleSelector>()?;
     Ok(())
 }
 
@@ -326,4 +332,137 @@ impl PyFewShotChatPromptTemplate {
     fn __repr__(&self) -> String {
         format!("FewShotChatPromptTemplate(examples={})", self.inner.examples.len())
     }
+}
+
+/// `SemanticSimilarityExampleSelector` — embedding-based selector for FewShot.
+/// Embed the candidate pool once (lazy on first call), embed the query
+/// per call, return top-K examples by cosine similarity.
+///
+/// ```python
+/// from litgraph.prompts import SemanticSimilarityExampleSelector, FewShotChatPromptTemplate
+/// from litgraph.embeddings import OpenAIEmbeddings
+///
+/// pool = [
+///     {"input": "fix borrow checker", "output": "use clone or rework lifetimes"},
+///     {"input": "css flexbox alignment", "output": "use justify-content"},
+///     {"input": "python list comprehension", "output": "use [x for x in ...]"},
+///     # ... 50 more ...
+/// ]
+/// embedder = OpenAIEmbeddings(api_key=..., model="text-embedding-3-small")
+/// selector = SemanticSimilarityExampleSelector(pool, embedder, key_field="input")
+///
+/// # Per query: pick the 3 most-relevant examples + render.
+/// picked = selector.select("how do I fix a borrow error?", k=3)
+/// few_shot = FewShotChatPromptTemplate(...).with_examples(picked)
+/// msgs = few_shot.format({"question": "..."})
+/// ```
+#[pyclass(name = "SemanticSimilarityExampleSelector", module = "litgraph.prompts")]
+pub struct PySemanticSimilarityExampleSelector {
+    inner: Arc<SemanticSimilarityExampleSelector>,
+}
+
+#[pymethods]
+impl PySemanticSimilarityExampleSelector {
+    /// `pool` is a list of dicts (each MUST contain a string field named
+    /// `key_field`). `embeddings` is any litGraph Embeddings instance.
+    #[new]
+    #[pyo3(signature = (pool, embeddings, key_field="input"))]
+    fn new(
+        pool: Bound<'_, PyList>,
+        embeddings: Bound<'_, PyAny>,
+        key_field: &str,
+    ) -> PyResult<Self> {
+        let mut pool_vec = Vec::with_capacity(pool.len());
+        for item in pool.iter() {
+            let d: Bound<'_, PyDict> = item.downcast_into().map_err(|_| {
+                PyValueError::new_err("each pool entry must be a dict")
+            })?;
+            let json_val = py_dict_to_json(&d)?;
+            pool_vec.push(json_val);
+        }
+        let embedder = crate::embeddings::extract_embeddings(&embeddings)?;
+        let inner = SemanticSimilarityExampleSelector::new(pool_vec, embedder, key_field);
+        Ok(Self { inner: Arc::new(inner) })
+    }
+
+    /// Top-K most-similar pool examples to `query`. Returns a Python list
+    /// of dicts (the original pool entries verbatim). Empty list if pool
+    /// is empty or k=0.
+    fn select<'py>(
+        &self,
+        py: Python<'py>,
+        query: &str,
+        k: usize,
+    ) -> PyResult<Bound<'py, PyList>> {
+        let inner = self.inner.clone();
+        let q = query.to_string();
+        let picked = py.allow_threads(|| {
+            crate::runtime::block_on_compat(async move { inner.select(&q, k).await })
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })?;
+        let out = PyList::empty_bound(py);
+        for v in picked {
+            let d = json_to_py_dict(py, &v)?;
+            out.append(d)?;
+        }
+        Ok(out)
+    }
+
+    /// Pre-compute pool embeddings. Idempotent; eliminates first-`select`
+    /// latency.
+    fn warmup(&self, py: Python<'_>) -> PyResult<()> {
+        let inner = self.inner.clone();
+        py.allow_threads(|| {
+            crate::runtime::block_on_compat(async move { inner.warmup().await })
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })
+    }
+
+    fn pool_size(&self) -> usize {
+        self.inner.pool_size()
+    }
+
+    fn __repr__(&self) -> String {
+        format!("SemanticSimilarityExampleSelector(pool_size={})", self.inner.pool_size())
+    }
+}
+
+/// serde_json::Value → Python dict (only top-level Object case used here).
+fn json_to_py_dict<'py>(
+    py: Python<'py>,
+    v: &serde_json::Value,
+) -> PyResult<Bound<'py, PyDict>> {
+    let d = PyDict::new_bound(py);
+    if let serde_json::Value::Object(map) = v {
+        for (k, val) in map {
+            d.set_item(k, json_to_pyobj(py, val)?)?;
+        }
+    }
+    Ok(d)
+}
+
+fn json_to_pyobj<'py>(py: Python<'py>, v: &serde_json::Value) -> PyResult<Py<PyAny>> {
+    use serde_json::Value as J;
+    Ok(match v {
+        J::Null => py.None(),
+        J::Bool(b) => b.into_py(py),
+        J::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                i.into_py(py)
+            } else if let Some(f) = n.as_f64() {
+                f.into_py(py)
+            } else {
+                py.None()
+            }
+        }
+        J::String(s) => s.clone().into_py(py),
+        J::Array(arr) => {
+            let list = PyList::empty_bound(py);
+            for item in arr {
+                list.append(json_to_pyobj(py, item)?)?;
+            }
+            list.into_py(py)
+        }
+        J::Object(_) => json_to_py_dict(py, v)?.into_py(py),
+    })
 }

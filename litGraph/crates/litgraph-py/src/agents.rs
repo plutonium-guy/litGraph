@@ -17,15 +17,16 @@ use tokio::sync::mpsc;
 use crate::graph::json_to_py;
 
 use crate::providers::{
-    PyAnthropicChat, PyBedrockChat, PyBedrockConverseChat, PyCohereChat, PyFallbackChat,
-    PyGeminiChat, PyOpenAIChat, PyOpenAIResponses, PyStructuredChatModel,
+    PyAnthropicChat, PyBedrockChat, PyBedrockConverseChat, PyCohereChat, PyCostCappedChat,
+    PyFallbackChat, PyGeminiChat, PyOpenAIChat, PyOpenAIResponses, PyPiiScrubbingChat,
+    PyPromptCachingChat, PySelfConsistencyChat, PyStructuredChatModel, PyTokenBudgetChat,
 };
 use crate::runtime::{block_on_compat, rt};
 use crate::tools::{
     PyBraveSearchTool, PyCachedTool, PyCalculatorTool, PyDalleImageTool, PyDuckDuckGoSearchTool,
     PyFunctionTool, PyHttpRequestTool, PyListDirectoryTool, PyPythonReplTool, PyReadFileTool,
-    PyShellTool, PySqliteQueryTool, PyTavilySearchTool, PyTtsAudioTool, PyWhisperTranscribeTool,
-    PyWriteFileTool,
+    PyShellTool, PySqliteQueryTool, PyTavilyExtractTool, PyTavilySearchTool, PyTtsAudioTool,
+    PyWebhookTool, PyWhisperTranscribeTool, PyWriteFileTool,
 };
 use crate::mcp::PyMcpTool;
 
@@ -75,13 +76,17 @@ fn extract_tools(tools: &Bound<'_, PyList>) -> PyResult<Vec<Arc<dyn litgraph_cor
             tool_vec.push(ct.as_tool());
         } else if let Ok(pr) = item.extract::<PyRef<PyPythonReplTool>>() {
             tool_vec.push(pr.as_tool());
+        } else if let Ok(wh) = item.extract::<PyRef<PyWebhookTool>>() {
+            tool_vec.push(wh.as_tool());
+        } else if let Ok(te) = item.extract::<PyRef<PyTavilyExtractTool>>() {
+            tool_vec.push(te.as_tool());
         } else {
             return Err(PyValueError::new_err(
                 "tools must be FunctionTool, BraveSearchTool, TavilySearchTool, \
-                 DuckDuckGoSearchTool, CalculatorTool, HttpRequestTool, ReadFileTool, \
-                 WriteFileTool, ListDirectoryTool, ShellTool, SqliteQueryTool, \
+                 TavilyExtractTool, DuckDuckGoSearchTool, CalculatorTool, HttpRequestTool, \
+                 ReadFileTool, WriteFileTool, ListDirectoryTool, ShellTool, SqliteQueryTool, \
                  WhisperTranscribeTool, DalleImageTool, TtsAudioTool, CachedTool, \
-                 PythonReplTool, or McpTool",
+                 PythonReplTool, WebhookTool, or McpTool",
             ));
         }
     }
@@ -107,9 +112,19 @@ pub(crate) fn extract_chat_model(bound: &Bound<'_, PyAny>) -> PyResult<Arc<dyn C
         Ok(s.chat_model())
     } else if let Ok(f) = bound.extract::<PyRef<PyFallbackChat>>() {
         Ok(f.chat_model())
+    } else if let Ok(tb) = bound.extract::<PyRef<PyTokenBudgetChat>>() {
+        Ok(tb.chat_model())
+    } else if let Ok(ps) = bound.extract::<PyRef<PyPiiScrubbingChat>>() {
+        Ok(ps.chat_model())
+    } else if let Ok(pc) = bound.extract::<PyRef<PyPromptCachingChat>>() {
+        Ok(pc.chat_model())
+    } else if let Ok(cc) = bound.extract::<PyRef<PyCostCappedChat>>() {
+        Ok(cc.chat_model())
+    } else if let Ok(sc) = bound.extract::<PyRef<PySelfConsistencyChat>>() {
+        Ok(sc.chat_model())
     } else {
         Err(PyValueError::new_err(
-            "model must be OpenAIChat, OpenAIResponses, AnthropicChat, GeminiChat, BedrockChat, CohereChat, StructuredChatModel, or FallbackChat",
+            "model must be OpenAIChat, OpenAIResponses, AnthropicChat, GeminiChat, BedrockChat, CohereChat, StructuredChatModel, FallbackChat, TokenBudgetChat, PiiScrubbingChat, PromptCachingChat, CostCappedChat, or SelfConsistencyChat",
         ))
     }
 }
@@ -170,13 +185,17 @@ impl PyReactAgent {
                 tool_vec.push(ct.as_tool());
             } else if let Ok(pr) = item.extract::<PyRef<PyPythonReplTool>>() {
                 tool_vec.push(pr.as_tool());
+            } else if let Ok(wh) = item.extract::<PyRef<PyWebhookTool>>() {
+                tool_vec.push(wh.as_tool());
+            } else if let Ok(te) = item.extract::<PyRef<PyTavilyExtractTool>>() {
+                tool_vec.push(te.as_tool());
             } else {
                 return Err(PyValueError::new_err(
                     "tools must be FunctionTool, BraveSearchTool, TavilySearchTool, \
-                     DuckDuckGoSearchTool, CalculatorTool, HttpRequestTool, ReadFileTool, \
-                     WriteFileTool, ListDirectoryTool, ShellTool, SqliteQueryTool, \
+                     TavilyExtractTool, DuckDuckGoSearchTool, CalculatorTool, HttpRequestTool, \
+                     ReadFileTool, WriteFileTool, ListDirectoryTool, ShellTool, SqliteQueryTool, \
                      WhisperTranscribeTool, DalleImageTool, TtsAudioTool, CachedTool, \
-                     PythonReplTool, or McpTool",
+                     PythonReplTool, WebhookTool, or McpTool",
                 ));
             }
         }

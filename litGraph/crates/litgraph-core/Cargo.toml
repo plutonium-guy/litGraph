@@ -17,6 +17,8 @@ thiserror.workspace = true
 minijinja.workspace = true
 tracing.workspace = true
 regex.workspace = true
+once_cell = "1"
+parking_lot.workspace = true
 tokio = { workspace = true, optional = true }
 
 [features]

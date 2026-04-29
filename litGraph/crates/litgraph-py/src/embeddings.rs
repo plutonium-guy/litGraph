@@ -14,7 +14,10 @@ use litgraph_providers_gemini::{GeminiEmbeddings, GeminiEmbeddingsConfig};
 use litgraph_providers_jina::{JinaEmbeddings, JinaEmbeddingsConfig};
 use litgraph_providers_openai::{OpenAIEmbeddings, OpenAIEmbeddingsConfig};
 use litgraph_providers_voyage::{VoyageEmbeddings, VoyageEmbeddingsConfig};
-use pyo3::exceptions::PyRuntimeError;
+use litgraph_resilience::{
+    FallbackEmbeddings, RateLimitConfig, RateLimitedEmbeddings, RetryConfig, RetryingEmbeddings,
+};
+use pyo3::exceptions::{PyRuntimeError, PyTypeError};
 use pyo3::prelude::*;
 use pyo3::types::PyList;
 use pyo3::wrap_pyfunction;
@@ -29,9 +32,51 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyGeminiEmbeddings>()?;
     m.add_class::<PyBedrockEmbeddings>()?;
     m.add_class::<PyJinaEmbeddings>()?;
+    m.add_class::<PyFallbackEmbeddings>()?;
+    m.add_class::<PyRetryingEmbeddings>()?;
+    m.add_class::<PyRateLimitedEmbeddings>()?;
     m.add_function(wrap_pyfunction!(tei_embeddings, m)?)?;
     m.add_function(wrap_pyfunction!(together_embeddings, m)?)?;
     Ok(())
+}
+
+/// Extract an `Arc<dyn Embeddings>` from any registered embedding pyclass.
+/// Central helper for FallbackEmbeddings + any future wrappers that
+/// accept multiple embedding backends.
+pub(crate) fn extract_embeddings(bound: &Bound<'_, PyAny>) -> PyResult<Arc<dyn Embeddings>> {
+    if let Ok(e) = bound.extract::<PyRef<PyOpenAIEmbeddings>>() {
+        return Ok(e.as_embeddings());
+    }
+    if let Ok(e) = bound.extract::<PyRef<PyCohereEmbeddings>>() {
+        return Ok(e.as_embeddings());
+    }
+    if let Ok(e) = bound.extract::<PyRef<PyVoyageEmbeddings>>() {
+        return Ok(e.as_embeddings());
+    }
+    if let Ok(e) = bound.extract::<PyRef<PyGeminiEmbeddings>>() {
+        return Ok(e.as_embeddings());
+    }
+    if let Ok(e) = bound.extract::<PyRef<PyBedrockEmbeddings>>() {
+        return Ok(e.as_embeddings());
+    }
+    if let Ok(e) = bound.extract::<PyRef<PyJinaEmbeddings>>() {
+        return Ok(e.as_embeddings());
+    }
+    if let Ok(e) = bound.extract::<PyRef<PyFunctionEmbeddings>>() {
+        return Ok(e.as_embeddings());
+    }
+    if let Ok(e) = bound.extract::<PyRef<PyFallbackEmbeddings>>() {
+        return Ok(e.as_embeddings());
+    }
+    if let Ok(e) = bound.extract::<PyRef<PyRetryingEmbeddings>>() {
+        return Ok(e.as_embeddings());
+    }
+    if let Ok(e) = bound.extract::<PyRef<PyRateLimitedEmbeddings>>() {
+        return Ok(e.as_embeddings());
+    }
+    Err(PyTypeError::new_err(
+        "expected a litgraph embeddings class (OpenAIEmbeddings / CohereEmbeddings / VoyageEmbeddings / GeminiEmbeddings / BedrockEmbeddings / JinaEmbeddings / FunctionEmbeddings / FallbackEmbeddings / RetryingEmbeddings / RateLimitedEmbeddings)",
+    ))
 }
 
 /// HuggingFace TEI (Text Embeddings Inference) — self-hostable embeddings
@@ -635,3 +680,249 @@ impl PyBedrockEmbeddings {
     }
 }
 
+
+/// Cross-provider Embeddings fallback. Parallels `FallbackChat` for
+/// chat models. Walks an ordered list of embedding providers; on
+/// transient failure (rate-limit / timeout / 5xx) routes to the next.
+/// Last provider's error propagates.
+///
+/// **ALL providers must agree on `dimensions()`** — silently switching
+/// between a 1536-dim and 768-dim embedder would corrupt your vector
+/// index. Constructor raises `ValueError` on mismatch at startup (better
+/// to catch the config bug now than 10k docs into production).
+///
+/// ```python
+/// from litgraph.embeddings import OpenAIEmbeddings, VoyageEmbeddings, FallbackEmbeddings
+/// primary = OpenAIEmbeddings(api_key=..., model="text-embedding-3-small")  # 1536
+/// backup  = VoyageEmbeddings(api_key=..., model="voyage-3-large")          # 1024  ← MISMATCH
+/// # That would raise ValueError. Use a dim-matched backup:
+/// primary = OpenAIEmbeddings(api_key=..., model="text-embedding-3-small")  # 1536
+/// backup  = OpenAIEmbeddings(api_key=backup_key, model="text-embedding-3-small")
+/// emb = FallbackEmbeddings([primary, backup])
+/// # Use anywhere Embeddings is accepted — VectorStore.add(...), VectorRetriever, etc.
+/// ```
+#[pyclass(name = "FallbackEmbeddings", module = "litgraph.embeddings")]
+pub struct PyFallbackEmbeddings {
+    inner: Arc<dyn Embeddings>,
+}
+
+#[pymethods]
+impl PyFallbackEmbeddings {
+    #[new]
+    #[pyo3(signature = (providers, fall_through_on_all=false))]
+    fn new(providers: Bound<'_, PyList>, fall_through_on_all: bool) -> PyResult<Self> {
+        if providers.is_empty() {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "FallbackEmbeddings: providers list must be non-empty",
+            ));
+        }
+        let mut inners: Vec<Arc<dyn Embeddings>> = Vec::with_capacity(providers.len());
+        for item in providers.iter() {
+            inners.push(extract_embeddings(&item)?);
+        }
+        // Pre-validate dims here (Rust new() panics — convert to ValueError).
+        let first = inners[0].dimensions();
+        for (i, e) in inners.iter().enumerate().skip(1) {
+            if e.dimensions() != first {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "FallbackEmbeddings: provider #{} has dim {} but #0 has dim {}. \
+                     Mixed dimensions would corrupt your vector index — use same-family models.",
+                    i,
+                    e.dimensions(),
+                    first
+                )));
+            }
+        }
+        let mut chain = FallbackEmbeddings::new(inners);
+        if fall_through_on_all {
+            chain = chain.fall_through_on_all();
+        }
+        Ok(Self { inner: Arc::new(chain) })
+    }
+
+    #[getter]
+    fn dimensions(&self) -> usize {
+        self.inner.dimensions()
+    }
+
+    fn embed_query<'py>(&self, py: Python<'py>, text: String) -> PyResult<Vec<f32>> {
+        let inner = self.inner.clone();
+        py.allow_threads(|| {
+            block_on_compat(async move { inner.embed_query(&text).await })
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })
+    }
+
+    fn embed_documents<'py>(
+        &self,
+        py: Python<'py>,
+        texts: Vec<String>,
+    ) -> PyResult<Vec<Vec<f32>>> {
+        let inner = self.inner.clone();
+        py.allow_threads(|| {
+            block_on_compat(async move { inner.embed_documents(&texts).await })
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "FallbackEmbeddings(dim={})",
+            self.inner.dimensions()
+        )
+    }
+}
+
+impl PyFallbackEmbeddings {
+    pub(crate) fn as_embeddings(&self) -> Arc<dyn Embeddings> {
+        self.inner.clone()
+    }
+}
+
+/// Retry wrapper for embeddings. Exponential backoff on transient errors
+/// (rate-limit, timeout, 5xx). Terminal errors (bad request, parse) fail
+/// fast. Mirrors the chat-side `with_retry` pattern.
+///
+/// ```python
+/// from litgraph.embeddings import OpenAIEmbeddings, RetryingEmbeddings
+/// raw = OpenAIEmbeddings(api_key=..., model="text-embedding-3-small")
+/// resilient = RetryingEmbeddings(raw, max_retries=5, min_delay_ms=200, max_delay_ms=30_000)
+/// # Use `resilient` anywhere Embeddings is accepted.
+/// ```
+#[pyclass(name = "RetryingEmbeddings", module = "litgraph.embeddings")]
+pub struct PyRetryingEmbeddings {
+    inner: Arc<dyn Embeddings>,
+}
+
+#[pymethods]
+impl PyRetryingEmbeddings {
+    #[new]
+    #[pyo3(signature = (inner, max_retries=5, min_delay_ms=200, max_delay_ms=30_000, factor=2.0, jitter=true))]
+    fn new(
+        inner: Bound<'_, PyAny>,
+        max_retries: usize,
+        min_delay_ms: u64,
+        max_delay_ms: u64,
+        factor: f32,
+        jitter: bool,
+    ) -> PyResult<Self> {
+        let inner_emb = extract_embeddings(&inner)?;
+        let cfg = RetryConfig {
+            min_delay: std::time::Duration::from_millis(min_delay_ms),
+            max_delay: std::time::Duration::from_millis(max_delay_ms),
+            factor,
+            max_times: max_retries,
+            jitter,
+        };
+        let wrapper = RetryingEmbeddings::new(inner_emb, cfg);
+        Ok(Self {
+            inner: Arc::new(wrapper),
+        })
+    }
+
+    #[getter]
+    fn dimensions(&self) -> usize {
+        self.inner.dimensions()
+    }
+
+    fn embed_query<'py>(&self, py: Python<'py>, text: String) -> PyResult<Vec<f32>> {
+        let inner = self.inner.clone();
+        py.allow_threads(|| {
+            block_on_compat(async move { inner.embed_query(&text).await })
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })
+    }
+
+    fn embed_documents<'py>(
+        &self,
+        py: Python<'py>,
+        texts: Vec<String>,
+    ) -> PyResult<Vec<Vec<f32>>> {
+        let inner = self.inner.clone();
+        py.allow_threads(|| {
+            block_on_compat(async move { inner.embed_documents(&texts).await })
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })
+    }
+
+    fn __repr__(&self) -> String {
+        format!("RetryingEmbeddings(dim={})", self.inner.dimensions())
+    }
+}
+
+impl PyRetryingEmbeddings {
+    pub(crate) fn as_embeddings(&self) -> Arc<dyn Embeddings> {
+        self.inner.clone()
+    }
+}
+
+/// Token-bucket rate-limiter for embeddings. `requests_per_minute` caps
+/// the steady-state rate; `burst` allows short spikes (default = rpm,
+/// set to 1 for strict pacing). Counts per CALL, not per text — an
+/// `embed_documents` batch of 100 consumes 1 token.
+///
+/// ```python
+/// from litgraph.embeddings import OpenAIEmbeddings, RateLimitedEmbeddings
+/// raw = OpenAIEmbeddings(api_key=..., model="text-embedding-3-small")
+/// capped = RateLimitedEmbeddings(raw, requests_per_minute=3000, burst=100)
+/// ```
+#[pyclass(name = "RateLimitedEmbeddings", module = "litgraph.embeddings")]
+pub struct PyRateLimitedEmbeddings {
+    inner: Arc<dyn Embeddings>,
+}
+
+#[pymethods]
+impl PyRateLimitedEmbeddings {
+    #[new]
+    #[pyo3(signature = (inner, requests_per_minute, burst=None))]
+    fn new(
+        inner: Bound<'_, PyAny>,
+        requests_per_minute: u32,
+        burst: Option<u32>,
+    ) -> PyResult<Self> {
+        let inner_emb = extract_embeddings(&inner)?;
+        let cfg = match burst {
+            Some(b) => RateLimitConfig::per_minute(requests_per_minute).with_burst(b),
+            None => RateLimitConfig::per_minute(requests_per_minute),
+        };
+        let wrapper = RateLimitedEmbeddings::new(inner_emb, cfg);
+        Ok(Self {
+            inner: Arc::new(wrapper),
+        })
+    }
+
+    #[getter]
+    fn dimensions(&self) -> usize {
+        self.inner.dimensions()
+    }
+
+    fn embed_query<'py>(&self, py: Python<'py>, text: String) -> PyResult<Vec<f32>> {
+        let inner = self.inner.clone();
+        py.allow_threads(|| {
+            block_on_compat(async move { inner.embed_query(&text).await })
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })
+    }
+
+    fn embed_documents<'py>(
+        &self,
+        py: Python<'py>,
+        texts: Vec<String>,
+    ) -> PyResult<Vec<Vec<f32>>> {
+        let inner = self.inner.clone();
+        py.allow_threads(|| {
+            block_on_compat(async move { inner.embed_documents(&texts).await })
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })
+    }
+
+    fn __repr__(&self) -> String {
+        format!("RateLimitedEmbeddings(dim={})", self.inner.dimensions())
+    }
+}
+
+impl PyRateLimitedEmbeddings {
+    pub(crate) fn as_embeddings(&self) -> Arc<dyn Embeddings> {
+        self.inner.clone()
+    }
+}

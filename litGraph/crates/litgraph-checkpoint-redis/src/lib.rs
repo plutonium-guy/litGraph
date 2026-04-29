@@ -124,4 +124,44 @@ impl Checkpointer for RedisCheckpointer {
         }
         Ok(out)
     }
+
+    /// Native ZREMRANGEBYSCORE — drops members with score > target_step.
+    async fn rewind_to(&self, thread_id: &str, target_step: u64) -> Result<usize> {
+        let mut conn = self.conn.clone();
+        let k = key(thread_id);
+        // Guard: target must exist.
+        let existing: Vec<(Vec<u8>, f64)> = conn
+            .zrangebyscore_limit_withscores(
+                &k,
+                target_step as f64,
+                target_step as f64,
+                0,
+                1,
+            )
+            .await
+            .map_err(err)?;
+        if existing.is_empty() {
+            return Err(GraphError::Checkpoint(format!(
+                "rewind_to: thread `{thread_id}` has no checkpoint at step {target_step}"
+            )));
+        }
+        // ZREMRANGEBYSCORE is inclusive; use (target_step+1, "+inf") for
+        // strictly greater. Use raw `cmd()` since the AsyncCommands helper
+        // name varies across redis-rs versions.
+        let dropped: i64 = redis::cmd("ZREMRANGEBYSCORE")
+            .arg(&k)
+            .arg(target_step + 1)
+            .arg("+inf")
+            .query_async(&mut conn)
+            .await
+            .map_err(err)?;
+        Ok(dropped.max(0) as usize)
+    }
+
+    async fn clear_thread(&self, thread_id: &str) -> Result<()> {
+        let mut conn = self.conn.clone();
+        let k = key(thread_id);
+        let _: i64 = conn.del(&k).await.map_err(err)?;
+        Ok(())
+    }
 }

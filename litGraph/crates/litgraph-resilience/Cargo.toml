@@ -9,10 +9,16 @@ description = "Resilient wrappers for litGraph providers — retry with exponent
 
 [dependencies]
 litgraph-core.workspace = true
+litgraph-tokenizers.workspace = true
+litgraph-observability.workspace = true
 async-trait.workspace = true
 tokio = { workspace = true }
 backon.workspace = true
 tracing.workspace = true
+parking_lot.workspace = true
+futures-util.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }
+regex.workspace = true
+serde_json.workspace = true

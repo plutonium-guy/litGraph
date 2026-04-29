@@ -268,6 +268,92 @@ impl PyCompiledGraph {
         let rx = inner.stream(initial, thread_id);
         Ok(PyGraphStream { rx: Arc::new(Mutex::new(Some(rx))) })
     }
+
+    // ─── time-travel API (iter 120) ───────────────────────────────────────
+
+    /// List every checkpoint for `thread_id` in step order. Each entry is
+    /// a dict: `{step, state, next_nodes, pending_interrupt, ts_ms}`.
+    /// Useful for UIs ("show me the trajectory"), debugging ("what was
+    /// state at step 3?"), and fork-point selection.
+    fn state_history<'py>(
+        &self,
+        py: Python<'py>,
+        thread_id: String,
+    ) -> PyResult<Bound<'py, PyList>> {
+        let cp = self.inner.checkpointer().clone();
+        let entries = py.allow_threads(|| {
+            block_on_compat(async move {
+                litgraph_graph::state_history::<serde_json::Value>(&*cp, &thread_id).await
+            })
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })?;
+        let out = PyList::empty_bound(py);
+        for e in entries {
+            let d = PyDict::new_bound(py);
+            d.set_item("thread_id", e.thread_id)?;
+            d.set_item("step", e.step)?;
+            d.set_item("state", json_to_py(py, &e.state)?)?;
+            d.set_item("next_nodes", e.next_nodes)?;
+            d.set_item(
+                "pending_interrupt",
+                match e.pending_interrupt {
+                    Some(i) => json_to_py(py, &serde_json::to_value(i).unwrap_or_default())?,
+                    None => py.None().into_bound(py),
+                },
+            )?;
+            d.set_item("ts_ms", e.ts_ms)?;
+            out.append(d)?;
+        }
+        Ok(out)
+    }
+
+    /// Drop checkpoints with `step > target_step`. The retained checkpoint
+    /// at `target_step` becomes the new latest; next `resume()` picks up
+    /// from there. Returns the number of checkpoints dropped. Raises
+    /// `ValueError` if `thread_id` has no checkpoint at `target_step`.
+    fn rewind_to(
+        &self,
+        py: Python<'_>,
+        thread_id: String,
+        target_step: u64,
+    ) -> PyResult<usize> {
+        let cp = self.inner.checkpointer().clone();
+        py.allow_threads(|| {
+            block_on_compat(async move { cp.rewind_to(&thread_id, target_step).await })
+                .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+        })
+    }
+
+    /// Copy `thread_id` checkpoints with `step <= source_step` into
+    /// `new_thread_id`. The new thread becomes an independent timeline
+    /// branching off the original at `source_step`. Returns the number
+    /// of checkpoints copied. Raises `ValueError` if `thread_id` has no
+    /// checkpoint at `source_step` OR `new_thread_id` already has checkpoints.
+    fn fork_at(
+        &self,
+        py: Python<'_>,
+        thread_id: String,
+        source_step: u64,
+        new_thread_id: String,
+    ) -> PyResult<usize> {
+        let cp = self.inner.checkpointer().clone();
+        py.allow_threads(|| {
+            block_on_compat(async move {
+                cp.fork_at(&thread_id, source_step, &new_thread_id).await
+            })
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+        })
+    }
+
+    /// Drop ALL checkpoints for `thread_id`. Use for GDPR "delete this
+    /// session" or resetting a stuck thread.
+    fn clear_thread(&self, py: Python<'_>, thread_id: String) -> PyResult<()> {
+        let cp = self.inner.checkpointer().clone();
+        py.allow_threads(|| {
+            block_on_compat(async move { cp.clear_thread(&thread_id).await })
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })
+    }
 }
 
 /// Iterator wrapper over a `Receiver<GraphEvent>`. Each `__next__` blocks on

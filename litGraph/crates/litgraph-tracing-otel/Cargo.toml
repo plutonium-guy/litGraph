@@ -1,0 +1,22 @@
+[package]
+name = "litgraph-tracing-otel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "OpenTelemetry OTLP exporter for litGraph — pipes the existing `tracing` spans (emitted by every provider / graph node / tool call / retriever) to an OTLP-compatible collector. Not LangSmith-locked — vendor-neutral."
+
+[dependencies]
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tracing-opentelemetry.workspace = true
+opentelemetry.workspace = true
+opentelemetry_sdk.workspace = true
+opentelemetry-otlp.workspace = true
+opentelemetry-stdout.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }

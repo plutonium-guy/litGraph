@@ -47,6 +47,15 @@ pub use gmail::GmailLoader;
 pub mod gdrive;
 pub use gdrive::GoogleDriveLoader;
 
+pub mod linear;
+pub use linear::LinearIssuesLoader;
+
+pub mod jira;
+pub use jira::JiraIssuesLoader;
+
+pub mod s3;
+pub use s3::S3Loader;
+
 #[derive(Debug, thiserror::Error)]
 pub enum LoaderError {
     #[error("io: {0}")]

@@ -19,7 +19,7 @@
 //! the AWS SDK at app startup, then pass them in.
 
 mod event_stream;
-mod sigv4;
+pub mod sigv4;
 
 use std::sync::Arc;
 use std::time::Duration;
