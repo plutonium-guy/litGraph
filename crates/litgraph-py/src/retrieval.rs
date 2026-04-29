@@ -7,7 +7,7 @@ use litgraph_retrieval::store::VectorStore;
 use litgraph_retrieval::{
     embedding_redundant_filter, long_context_reorder, mmr_select, AttributeInfo, Bm25Index,
     ChildSplitter, Compressor, ContextualCompressionRetriever, DocStore,
-    EmbeddingsFilterCompressor, EnsembleRetriever, HybridRetriever, LlmExtractCompressor, MemoryDocStore,
+    EmbeddingsFilterCompressor, EnsembleReranker, EnsembleRetriever, HybridRetriever, LlmExtractCompressor, MemoryDocStore,
     HydeRetriever, MaxMarginalRelevanceRetriever, MultiQueryRetriever, ParentDocumentRetriever,
     PipelineCompressor, Reranker,
     RerankingRetriever, Retriever, SelfQueryRetriever, TimeWeightedRetriever, VectorRetriever,
@@ -44,6 +44,7 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyCohereReranker>()?;
     m.add_class::<PyVoyageReranker>()?;
     m.add_class::<PyJinaReranker>()?;
+    m.add_class::<PyEnsembleReranker>()?;
     m.add_class::<PyRerankingRetriever>()?;
     m.add_class::<PyHybridRetriever>()?;
     m.add_class::<PyEnsembleRetriever>()?;
@@ -1001,6 +1002,104 @@ impl PyJinaReranker {
     }
 }
 
+/// Concurrent reranker ensemble — fan out N rerankers over the same
+/// candidate set, fuse their orderings via weighted Reciprocal Rank
+/// Fusion. All children invoke in parallel via `tokio::join_all`, so
+/// the wall-clock latency is `max(t_i)` across rerankers, not the
+/// sum.
+///
+/// Use this when one reranker isn't reliably better than another and
+/// you want the ensemble to smooth out per-model bias — e.g. Cohere
+/// + Voyage + a local fastembed cross-encoder. Pass `weights` to
+/// emphasise the ones you trust more.
+///
+/// `weights` length must equal `children` length when given. A
+/// weight of `0.0` mutes that branch entirely.
+///
+/// ```python
+/// from litgraph.retrieval import (
+///     CohereReranker, VoyageReranker, EnsembleReranker, RerankingRetriever,
+/// )
+/// rerank = EnsembleReranker(
+///     [CohereReranker(...), VoyageReranker(...)],
+///     weights=[0.6, 0.4],
+/// )
+/// retriever = RerankingRetriever(base=hybrid, reranker=rerank)
+/// ```
+#[pyclass(name = "EnsembleReranker", module = "litgraph.retrieval")]
+pub struct PyEnsembleReranker {
+    pub(crate) inner: Arc<EnsembleReranker>,
+}
+
+impl PyEnsembleReranker {
+    pub(crate) fn as_reranker(&self) -> Arc<dyn Reranker> {
+        self.inner.clone() as Arc<dyn Reranker>
+    }
+}
+
+#[pymethods]
+impl PyEnsembleReranker {
+    #[new]
+    #[pyo3(signature = (children, weights=None, rrf_k=60.0))]
+    fn new(
+        children: Bound<'_, PyList>,
+        weights: Option<Vec<f32>>,
+        rrf_k: f32,
+    ) -> PyResult<Self> {
+        if children.len() < 2 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "EnsembleReranker needs at least 2 children",
+            ));
+        }
+        let mut child_arcs: Vec<Arc<dyn Reranker>> = Vec::with_capacity(children.len());
+        for item in children.iter() {
+            let r: Arc<dyn Reranker> = if let Ok(c) = item.extract::<PyRef<PyCohereReranker>>() {
+                c.as_reranker()
+            } else if let Ok(v) = item.extract::<PyRef<PyVoyageReranker>>() {
+                v.as_reranker()
+            } else if let Ok(j) = item.extract::<PyRef<PyJinaReranker>>() {
+                j.as_reranker()
+            } else {
+                return Err(pyo3::exceptions::PyTypeError::new_err(
+                    "each child must be CohereReranker, VoyageReranker, or JinaReranker",
+                ));
+            };
+            child_arcs.push(r);
+        }
+        let mut e = match weights {
+            Some(w) => EnsembleReranker::with_weights(child_arcs, w)
+                .map_err(|err| pyo3::exceptions::PyValueError::new_err(err.to_string()))?,
+            None => EnsembleReranker::new(child_arcs),
+        };
+        e = e.with_rrf_k(rrf_k);
+        Ok(Self { inner: Arc::new(e) })
+    }
+
+    fn rerank<'py>(
+        &self,
+        py: Python<'py>,
+        query: String,
+        docs: Bound<'py, PyList>,
+        top_k: usize,
+    ) -> PyResult<Bound<'py, PyList>> {
+        let parsed = parse_docs(&docs)?;
+        let r = self.inner.clone();
+        let results = py.allow_threads(move || {
+            block_on_compat(async move { r.rerank(&query, parsed, top_k).await })
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })?;
+        docs_to_pylist(py, results)
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "EnsembleReranker(children={}, rrf_k={})",
+            self.inner.children.len(),
+            self.inner.rrf_k,
+        )
+    }
+}
+
 /// Two-stage retriever: pull `over_fetch_k` candidates from a base, then
 /// rerank-narrow to `k`. Standard cross-encoder pattern for production RAG.
 #[pyclass(name = "RerankingRetriever", module = "litgraph.retrieval")]
@@ -1025,9 +1124,11 @@ impl PyRerankingRetriever {
             v.as_reranker()
         } else if let Ok(j) = reranker.extract::<PyRef<PyJinaReranker>>() {
             j.as_reranker()
+        } else if let Ok(e) = reranker.extract::<PyRef<PyEnsembleReranker>>() {
+            e.as_reranker()
         } else {
             return Err(pyo3::exceptions::PyTypeError::new_err(
-                "reranker must be CohereReranker, VoyageReranker, or JinaReranker",
+                "reranker must be CohereReranker, VoyageReranker, JinaReranker, or EnsembleReranker",
             ));
         };
         let mut r = RerankingRetriever::new(base.as_retriever(), r_arc);

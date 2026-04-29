@@ -190,6 +190,7 @@ long-term Store. Older (v0.3) features rolled in from prior audit.
 | BM25 retriever (lexical) | Keyword grounding | ✅ |
 | Hybrid (RRF) retriever | Best of both | ✅ |
 | Reranking retriever (Cohere/Jina/Voyage) | Quality lift | ✅ |
+| EnsembleReranker (concurrent reranker fusion) | Reduce per-model bias | ✅ `litgraph_retrieval::EnsembleReranker` — fans N rerankers over the same candidates concurrently via `tokio::join_all`, fuses orderings with weighted RRF (rank-based, scale-free across providers). Python: `litgraph.retrieval.EnsembleReranker(children, weights, rrf_k)`; composes as `RerankingRetriever(base, ensemble)`. (iter 186) |
 | Local ONNX reranker (no API key) | Air-gap quality lift | ✅ `litgraph-rerankers-fastembed::FastembedReranker` — ONNX cross-encoder via fastembed; `BGERerankerBase` default (English), `BGERerankerV2M3`/`JINARerankerV2BaseMultilingual` for multilingual; CPU-bound calls in `spawn_blocking`; live-verified rerank picks correct top-1 |
 | MaxMarginalRelevance | Diversity | ✅ |
 | ParentDocumentRetriever | Small-chunk match, big-chunk return | ✅ |
