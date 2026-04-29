@@ -35,11 +35,14 @@
 //! row's vector to insert into a vector store). For partial-result
 //! semantics, drop down to per-chunk concurrency yourself.
 
+use std::pin::Pin;
 use std::sync::Arc;
 
+use futures::Stream;
 use serde::{Deserialize, Serialize};
-use tokio::sync::Semaphore;
+use tokio::sync::{mpsc, Semaphore};
 use tokio::task::JoinSet;
+use tokio_stream::wrappers::ReceiverStream;
 
 use crate::{Embeddings, Error, Progress, Result};
 
@@ -113,6 +116,83 @@ pub async fn embed_documents_concurrent(
         )));
     }
     Ok(out)
+}
+
+/// One emitted result from [`embed_documents_concurrent_stream`] —
+/// the chunk index plus that chunk's outcome. The chunk index is the
+/// chunk's position when `texts` was split by `chunk_size`, so the
+/// `i`-th chunk's embeddings cover `texts[i*chunk_size .. min(end, len)]`.
+pub type EmbedStreamItem = (usize, Result<Vec<Vec<f32>>>);
+
+/// Streaming variant of [`embed_documents_concurrent`]. Yields
+/// `(chunk_idx, Result)` pairs **in completion order** as each
+/// chunk's `embed_documents` call finishes — caller can start
+/// writing embeddings to a vector store / on-disk index as soon as
+/// the first chunk lands instead of waiting for the slowest.
+///
+/// # When to use this vs `embed_documents_concurrent`
+///
+/// - `embed_documents_concurrent`: caller wants the **whole aligned
+///   `Vec<Vec<f32>>`** when finished. Simpler integration with
+///   downstream code that expects a complete result.
+/// - `embed_documents_concurrent_stream` (this): caller wants to
+///   **upsert chunks to a vector store as they arrive**, **render
+///   bulk-ingestion progress live**, or **drop the stream early** to
+///   abort remaining chunks.
+///
+/// The chunk index lets callers reassemble in input order if
+/// needed; otherwise the per-chunk `Vec<Vec<f32>>` is internally
+/// aligned with the chunk's slice.
+///
+/// `chunk_size = 0` is normalised to one chunk; `max_concurrency = 0`
+/// to 1 (sequential). Empty input yields an empty stream.
+pub fn embed_documents_concurrent_stream(
+    embedder: Arc<dyn Embeddings>,
+    texts: Vec<String>,
+    chunk_size: usize,
+    max_concurrency: usize,
+) -> Pin<Box<dyn Stream<Item = EmbedStreamItem> + Send>> {
+    if texts.is_empty() {
+        return Box::pin(futures::stream::empty());
+    }
+    let cap = max_concurrency.max(1);
+    let chunk = if chunk_size == 0 { texts.len() } else { chunk_size };
+    let chunks: Vec<Vec<String>> = texts.chunks(chunk).map(|s| s.to_vec()).collect();
+    let n_chunks = chunks.len();
+    let buf = n_chunks.min(cap.max(8));
+    let (tx, rx) = mpsc::channel::<EmbedStreamItem>(buf);
+
+    tokio::spawn(async move {
+        let sem = Arc::new(Semaphore::new(cap));
+        let mut set: JoinSet<EmbedStreamItem> = JoinSet::new();
+        for (idx, chunk_texts) in chunks.into_iter().enumerate() {
+            let sem = sem.clone();
+            let embedder = embedder.clone();
+            set.spawn(async move {
+                let _permit = match sem.acquire_owned().await {
+                    Ok(p) => p,
+                    Err(_) => return (idx, Err(Error::other("embed semaphore closed"))),
+                };
+                let r = embedder.embed_documents(&chunk_texts).await;
+                (idx, r)
+            });
+        }
+        while let Some(joined) = set.join_next().await {
+            let item = match joined {
+                Ok(it) => it,
+                Err(e) => (
+                    usize::MAX,
+                    Err(Error::other(format!("embed task join: {e}"))),
+                ),
+            };
+            if tx.send(item).await.is_err() {
+                set.abort_all();
+                break;
+            }
+        }
+    });
+
+    Box::pin(ReceiverStream::new(rx))
 }
 
 /// Counters maintained by [`embed_documents_concurrent_with_progress`].
@@ -500,6 +580,118 @@ mod tests {
         let snap = obs.snapshot();
         assert_eq!(snap.completed_chunks, 5);
         assert_eq!(snap.completed_texts, 20);
+    }
+
+    // ---- embed_documents_concurrent_stream tests ---------------------
+
+    use futures::StreamExt;
+
+    #[tokio::test]
+    async fn stream_yields_one_item_per_chunk() {
+        let (e, _peak, _seen) = probe(0);
+        let texts = ts(11); // chunk_size=4 → 3 chunks (4 + 4 + 3)
+        let mut s = embed_documents_concurrent_stream(e, texts, 4, 4);
+        let mut got_chunks: Vec<usize> = Vec::new();
+        let mut total_embeddings = 0usize;
+        while let Some((idx, r)) = s.next().await {
+            let v = r.unwrap();
+            total_embeddings += v.len();
+            got_chunks.push(idx);
+        }
+        got_chunks.sort();
+        assert_eq!(got_chunks, vec![0, 1, 2]);
+        assert_eq!(total_embeddings, 11);
+    }
+
+    #[tokio::test]
+    async fn stream_chunk_idx_aligns_with_chunk_size() {
+        // chunk_size=5 → texts[0..5] is chunk 0, texts[5..10] is chunk 1.
+        // The probe encodes input idx in dim 0 of the embedding;
+        // chunk 0's first embedding therefore has dim0 = 0.
+        let (e, _peak, _seen) = probe(0);
+        let texts = ts(10);
+        let mut s = embed_documents_concurrent_stream(e, texts, 5, 4);
+        // Reassemble into a Vec keyed by chunk idx.
+        let mut by_chunk: std::collections::HashMap<usize, Vec<Vec<f32>>> =
+            std::collections::HashMap::new();
+        while let Some((idx, r)) = s.next().await {
+            by_chunk.insert(idx, r.unwrap());
+        }
+        let chunk_0 = by_chunk.remove(&0).unwrap();
+        let chunk_1 = by_chunk.remove(&1).unwrap();
+        // Chunk 0 starts at input idx 0: dim 0 = 0.
+        assert_eq!(chunk_0[0][0] as usize, 0);
+        // Chunk 1 starts at input idx 5: dim 0 = 5.
+        assert_eq!(chunk_1[0][0] as usize, 5);
+    }
+
+    #[tokio::test]
+    async fn stream_per_chunk_failure_arrives_as_err_item() {
+        struct FailEmbed {
+            seen: Arc<AtomicUsize>,
+            fail_on: usize,
+        }
+        #[async_trait]
+        impl Embeddings for FailEmbed {
+            fn name(&self) -> &str {
+                "fail"
+            }
+            fn dimensions(&self) -> usize {
+                1
+            }
+            async fn embed_query(&self, _t: &str) -> Result<Vec<f32>> {
+                Ok(vec![0.0])
+            }
+            async fn embed_documents(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+                let n = self.seen.fetch_add(1, Ordering::SeqCst);
+                if n == self.fail_on {
+                    return Err(Error::other("synthetic"));
+                }
+                Ok(texts.iter().map(|_| vec![0.0]).collect())
+            }
+        }
+        let e: Arc<dyn Embeddings> = Arc::new(FailEmbed {
+            seen: Arc::new(AtomicUsize::new(0)),
+            fail_on: 1,
+        });
+        let texts = ts(15); // 3 chunks of 5
+        let mut s = embed_documents_concurrent_stream(e, texts, 5, 1);
+        let mut count = 0;
+        let mut errors = 0;
+        while let Some((_idx, r)) = s.next().await {
+            count += 1;
+            if r.is_err() {
+                errors += 1;
+            }
+        }
+        assert_eq!(count, 3);
+        assert_eq!(errors, 1);
+    }
+
+    #[tokio::test]
+    async fn stream_empty_input_yields_empty() {
+        let (e, _peak, _seen) = probe(0);
+        let mut s = embed_documents_concurrent_stream(e, vec![], 4, 4);
+        assert!(s.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn stream_caller_drop_aborts_in_flight_chunks() {
+        // 30 chunks each delayed 50ms with cap=2 — full sequential
+        // would take ~750ms. Drop after 1 item; total wall-clock
+        // should be far less.
+        let (e, _peak, _seen) = probe(50);
+        let texts = ts(30);
+        let started = std::time::Instant::now();
+        {
+            let mut s = embed_documents_concurrent_stream(e, texts, 1, 2);
+            let _first = s.next().await.unwrap();
+        }
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        assert!(
+            elapsed_ms < 400,
+            "elapsed {elapsed_ms}ms — caller-drop didn't abort remaining chunks",
+        );
     }
 
     #[tokio::test]
