@@ -66,6 +66,10 @@ pub use gitlab_files::GitLabFilesLoader;
 pub mod sitemap;
 pub use sitemap::SitemapLoader;
 pub use s3::S3Loader;
+pub mod arxiv;
+pub use arxiv::ArxivLoader;
+pub mod wikipedia;
+pub use wikipedia::WikipediaLoader;
 
 #[derive(Debug, thiserror::Error)]
 pub enum LoaderError {
