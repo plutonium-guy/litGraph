@@ -244,7 +244,7 @@ long-term Store. Older (v0.3) features rolled in from prior audit.
 | Jupyter notebook | ✅ |
 | Discord / Telegram / WhatsApp | ❌ |
 | YouTube transcript / Vimeo | ❌ |
-| arXiv / Wikipedia / PubMed | 🟡 `litgraph_loaders::ArxivLoader` (Atom API, search + sort + paginate; abstracts → content, authors/categories/PDF link → metadata) and `litgraph_loaders::WikipediaLoader` (MediaWiki Action API, title-lookup or search-then-fetch; full plaintext extracts; per-language). PubMed still pending. |
+| arXiv / Wikipedia / PubMed | ✅ `litgraph_loaders::ArxivLoader` (Atom), `WikipediaLoader` (MediaWiki Action API), `PubMedLoader` (NCBI E-utilities — esearch+efetch, structured-abstract section labels preserved, MeSH terms, DOI/PMCID, normalised pub_date, API-key support) |
 | Office365 / Outlook | ❌ |
 
 ## 15. Splitters
@@ -454,7 +454,7 @@ Top gaps to close, ranked by user-impact for a no-code-glue path:
 9. ❌ **LangServe-style HTTP serve crate** — `litgraph serve graph.py` → REST + SSE one command.
 10. ✅ **Graph visualizer (Mermaid)** — `to_mermaid()` + `to_ascii()` on StateGraph + CompiledGraph (8 Rust + 9 Py tests). PNG render still pending (out-of-process via `mmdc` or `kroki`).
 11. ✅ **Eval coverage** — trajectory evaluator, `PairwiseEvaluator`, and `synthesize_eval_cases` shipped. Eval suite covers golden-set runs, trajectory grading, A/B judging, and seed-based dataset synthesis.
-12. 🟡 **Discord/YouTube/PubMed loaders** — long-tail integrations remaining. (Redis chat history shipped iter 164. arXiv + Wikipedia loaders shipped iter 165.)
+12. 🟡 **Discord/YouTube loaders** — long-tail integrations remaining. (Redis chat history shipped iter 164. arXiv + Wikipedia loaders shipped iter 165. PubMed loader shipped iter 166.)
 
 ## Quick prod-ready agent recipe (uv, no venv)
 

@@ -70,6 +70,8 @@ pub mod arxiv;
 pub use arxiv::ArxivLoader;
 pub mod wikipedia;
 pub use wikipedia::WikipediaLoader;
+pub mod pubmed;
+pub use pubmed::PubMedLoader;
 
 #[derive(Debug, thiserror::Error)]
 pub enum LoaderError {
