@@ -32,6 +32,7 @@ pub mod eval_synth;
 pub mod tool_offload;
 pub mod dataset_version;
 pub mod prompt_hub;
+pub mod langmem;
 
 pub use error::{Error, Result};
 pub use structured::StructuredChatModel;
@@ -75,6 +76,7 @@ pub use dataset_version::{
     InMemoryRunStore, JsonlRunStore, RegressionAlert, RunRecord, RunStore,
 };
 pub use prompt_hub::{CachingPromptHub, FilesystemPromptHub, PromptHub, PromptRef};
+pub use langmem::{EpisodicMemory, Memory, MemoryExtractor, DEFAULT_EXTRACTION_SYSTEM_PROMPT};
 pub use eval_harness::{
     run_eval, AggregateScores, ContainsAllScorer, EvalCase, EvalCaseResult, EvalDataset,
     EvalReport, ExactMatchScorer, JaccardScorer, LevenshteinScorer, LlmJudgeScorer, RegexScorer,

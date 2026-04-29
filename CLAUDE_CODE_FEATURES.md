@@ -410,7 +410,7 @@ Distinct from short-term checkpointer — JSON document store keyed by
 | `InMemoryStore` (dev) | Local prototyping | ✅ `litgraph.store.InMemoryStore` |
 | `PostgresStore` (prod) | Durable distributed | ❌ pending crate |
 | Vector-indexed semantic search on Store | Memory recall by meaning | 🟡 `VectorStoreMemory` separate; not yet bolted onto Store |
-| `LangMem` SDK (episodic memory) | Auto-extract memories | ❌ |
+| `LangMem` SDK (episodic memory) | Auto-extract memories | ✅ `litgraph_core::{EpisodicMemory, MemoryExtractor, Memory}` — LLM extraction via structured output, kind/importance/source_thread metadata, importance threshold filtering, namespaced storage on any `Store` impl, `recall(query, k)` + `recall_as_system_message` ready-to-prepend |
 | TTL on memory entries | Auto-expire stale | ✅ `ttl_ms` per put, lazy eviction on read/search |
 | Per-user namespace isolation | GDPR / multi-tenant | ✅ namespace tuple + prefix search |
 | `put` / `get` / `delete` / `search` / `list_namespaces` ops | CRUD on long-term mem | ✅ |
