@@ -279,7 +279,7 @@ long-term Store. Older (v0.3) features rolled in from prior audit.
 | String evaluators (10) | Cheap auto-grading | ✅ exact_match, levenshtein, jaccard, regex, json_validity, contains_all/any, embedding_cosine |
 | LLM-as-judge | Quality grading | ✅ `LlmJudge`, `LlmJudgeScorer` |
 | Trajectory evaluators | Agent path grading | ✅ `litgraph.evaluators.evaluate_trajectory(actual, expected, policy)`; policies: `contains_all`, `exact_order`, `subsequence` (LCS), `levenshtein` |
-| Pairwise comparison | A/B model | ❌ |
+| Pairwise comparison | A/B model | ✅ `litgraph.evaluators.PairwiseEvaluator(model, criteria=None)` — returns `{winner, confidence, reason}`; deterministic order randomization for position-bias mitigation |
 | Synthetic data generation | Bootstrap eval set | ❌ |
 | Dataset versioning | Track regressions | ❌ no built-in |
 
@@ -452,7 +452,7 @@ Top gaps to close, ranked by user-impact for a no-code-glue path:
 8. ❌ **candle / mistral.rs local chat** — full offline agent.
 9. ❌ **LangServe-style HTTP serve crate** — `litgraph serve graph.py` → REST + SSE one command.
 10. ✅ **Graph visualizer (Mermaid)** — `to_mermaid()` + `to_ascii()` on StateGraph + CompiledGraph (8 Rust + 9 Py tests). PNG render still pending (out-of-process via `mmdc` or `kroki`).
-11. 🟡 **Eval coverage** — trajectory evaluator (4 policies, LCS-based subsequence) shipped (13 Rust + 12 Py tests). Pairwise comparison + synthetic eval-set generation still pending.
+11. 🟡 **Eval coverage** — trajectory evaluator + `PairwiseEvaluator` shipped (20 Rust + 14 Py tests). Synthetic eval-set generation still pending.
 12. ❌ **Redis chat history · Discord/YouTube/arXiv loaders** — long-tail integrations.
 
 ## Quick prod-ready agent recipe (uv, no venv)

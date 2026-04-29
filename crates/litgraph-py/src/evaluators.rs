@@ -12,8 +12,8 @@ use litgraph_core::{
     levenshtein_ratio as core_levenshtein_ratio, luhn_valid as core_luhn_valid,
     regex_match as core_regex_match, run_eval as core_run_eval, ChatModel, ContainsAllScorer,
     EvalCase, EvalDataset, ExactMatchScorer, JaccardScorer, LevenshteinScorer, LlmJudge,
-    LlmJudgeScorer, PiiScrubber as CorePiiScrubber, RegexScorer, Scorer, TrajectoryPolicy,
-    TrajectoryStep,
+    LlmJudgeScorer, PairwiseEvaluator, PiiScrubber as CorePiiScrubber, RegexScorer, Scorer,
+    TrajectoryPolicy, TrajectoryStep, Winner,
 };
 use pyo3::types::PyList;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
@@ -34,6 +34,7 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(contains_all, m)?)?;
     m.add_function(wrap_pyfunction!(contains_any, m)?)?;
     m.add_class::<PyLlmJudge>()?;
+    m.add_class::<PyPairwiseEvaluator>()?;
     m.add_class::<PyPiiScrubber>()?;
     m.add_function(wrap_pyfunction!(luhn_valid, m)?)?;
     m.add_function(wrap_pyfunction!(run_eval, m)?)?;
@@ -244,6 +245,60 @@ impl PyLlmJudge {
             out.push(d);
         }
         Ok(out)
+    }
+}
+
+/// LLM-as-judge for **pairwise A/B comparison**. Given the same input plus
+/// two candidate responses, returns `{winner, confidence, reason}`. Use
+/// `LlmJudge` for single-output absolute scoring; use this for relative
+/// ranking when there's no gold answer.
+///
+/// `randomize_order=True` (default) shuffles A/B labels deterministically per
+/// `(input, left, right)` triple to halve position bias; pass `False` for
+/// reproducible test fixtures.
+#[pyclass(name = "PairwiseEvaluator", module = "litgraph.evaluators")]
+pub struct PyPairwiseEvaluator {
+    inner: Arc<PairwiseEvaluator>,
+}
+
+#[pymethods]
+impl PyPairwiseEvaluator {
+    #[new]
+    #[pyo3(signature = (model, criteria=None))]
+    fn new(model: Py<PyAny>, criteria: Option<String>) -> PyResult<Self> {
+        let chat_model: Arc<dyn ChatModel> =
+            Python::with_gil(|py| crate::agents::extract_chat_model(model.bind(py)))?;
+        Ok(Self {
+            inner: Arc::new(PairwiseEvaluator::new(chat_model, criteria)),
+        })
+    }
+
+    #[pyo3(signature = (input, left, right, randomize_order=true))]
+    fn compare<'py>(
+        &self,
+        py: Python<'py>,
+        input: String,
+        left: String,
+        right: String,
+        randomize_order: bool,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let ev = self.inner.clone();
+        let result = py.allow_threads(|| {
+            block_on_compat(async move {
+                ev.compare(&input, &left, &right, randomize_order).await
+            })
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })?;
+        let d = PyDict::new_bound(py);
+        let winner_str = match result.winner {
+            Winner::Left => "left",
+            Winner::Right => "right",
+            Winner::Tie => "tie",
+        };
+        d.set_item("winner", winner_str)?;
+        d.set_item("confidence", result.confidence)?;
+        d.set_item("reason", result.reason)?;
+        Ok(d)
     }
 }
 

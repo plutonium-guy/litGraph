@@ -27,6 +27,7 @@ pub mod store;
 pub mod middleware;
 pub mod skill_loader;
 pub mod trajectory;
+pub mod pairwise;
 
 pub use error::{Error, Result};
 pub use structured::StructuredChatModel;
@@ -58,6 +59,7 @@ pub use middleware::{
 };
 pub use skill_loader::{load_agents_md, load_skills_dir, Skill, SystemPromptBuilder};
 pub use trajectory::{evaluate_trajectory, TrajectoryPolicy, TrajectoryStep};
+pub use pairwise::{PairwiseEvaluator, PairwiseResult, Winner};
 pub use eval_harness::{
     run_eval, AggregateScores, ContainsAllScorer, EvalCase, EvalCaseResult, EvalDataset,
     EvalReport, ExactMatchScorer, JaccardScorer, LevenshteinScorer, LlmJudgeScorer, RegexScorer,
