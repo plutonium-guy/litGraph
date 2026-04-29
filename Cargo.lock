@@ -2588,6 +2588,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "litgraph-rerankers-fastembed"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "fastembed",
+ "litgraph-core",
+ "litgraph-retrieval",
+ "parking_lot",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "litgraph-rerankers-jina"
 version = "0.1.0"
 dependencies = [

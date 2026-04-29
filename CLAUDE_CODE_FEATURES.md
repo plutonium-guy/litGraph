@@ -189,6 +189,7 @@ long-term Store. Older (v0.3) features rolled in from prior audit.
 | BM25 retriever (lexical) | Keyword grounding | ✅ |
 | Hybrid (RRF) retriever | Best of both | ✅ |
 | Reranking retriever (Cohere/Jina/Voyage) | Quality lift | ✅ |
+| Local ONNX reranker (no API key) | Air-gap quality lift | ✅ `litgraph-rerankers-fastembed::FastembedReranker` — ONNX cross-encoder via fastembed; `BGERerankerBase` default (English), `BGERerankerV2M3`/`JINARerankerV2BaseMultilingual` for multilingual; CPU-bound calls in `spawn_blocking`; live-verified rerank picks correct top-1 |
 | MaxMarginalRelevance | Diversity | ✅ |
 | ParentDocumentRetriever | Small-chunk match, big-chunk return | ✅ |
 | MultiQueryRetriever | Query rewriting | ✅ |

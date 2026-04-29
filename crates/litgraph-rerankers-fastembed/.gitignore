@@ -1,0 +1,3 @@
+# Local model cache (created by fastembed via hf-hub on first run).
+# ~280MB+ of ONNX cross-encoder weights — never commit.
+.fastembed_cache/

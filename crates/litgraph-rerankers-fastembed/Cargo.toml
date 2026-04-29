@@ -1,0 +1,20 @@
+[package]
+name = "litgraph-rerankers-fastembed"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Local ONNX-backed cross-encoder reranker for litGraph via fastembed-rs. No API key, no network at inference time."
+
+[dependencies]
+litgraph-core.workspace = true
+litgraph-retrieval.workspace = true
+async-trait.workspace = true
+tokio = { workspace = true }
+parking_lot.workspace = true
+tracing.workspace = true
+fastembed = { version = "5", default-features = false, features = [
+    "hf-hub-rustls-tls",
+    "ort-download-binaries-rustls-tls",
+] }
