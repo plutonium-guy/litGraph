@@ -89,7 +89,8 @@ pub use prompt_hub::{CachingPromptHub, FilesystemPromptHub, PromptHub, PromptRef
 pub use langmem::{EpisodicMemory, Memory, MemoryExtractor, DEFAULT_EXTRACTION_SYSTEM_PROMPT};
 pub use assistants::{Assistant, AssistantManager, AssistantPatch};
 pub use batch::{
-    batch_concurrent, batch_concurrent_fail_fast, batch_concurrent_with_progress, BatchProgress,
+    batch_concurrent, batch_concurrent_fail_fast, batch_concurrent_stream,
+    batch_concurrent_with_progress, BatchProgress, BatchStreamItem,
 };
 pub use embed_batch::{
     embed_documents_concurrent, embed_documents_concurrent_with_progress, EmbedProgress,

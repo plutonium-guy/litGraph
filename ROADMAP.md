@@ -225,6 +225,7 @@ patterns").
 | `retrieve_concurrent_with_progress` (iter 207) | Composes iter 190 + iter 199 | Fourth progress-aware composition. `RetrieveProgress { total, completed, docs_returned, errors }` watcher updated as each query completes — eval-harness pattern with a live counter |
 | `tool_dispatch_concurrent_with_progress` (iter 208) | Composes iter 191 + iter 199 | Fifth progress-aware composition. `ToolDispatchProgress { total, completed, errors, unknown_tool_errors }` — unknown-tool errors bucketed separately so dashboards distinguish a routing-bug regression (LLM emitted a name your registry doesn't know) from a runtime tool failure |
 | `rerank_concurrent_with_progress` (iter 209) | Composes iter 197 + iter 199 | Closes the progress-aware family across all 6 parallel-batch axes (ingest, chat batch, embed batch, retriever, tool, rerank). `RerankProgress { total, total_candidates, completed, docs_returned, errors }` — `total_candidates` exposed separately so eval reports can compute "X% of candidates reranked" rather than just "X% of pairs" |
+| `batch_concurrent_stream` (iter 210) | mpsc-backed streaming variant of iter 182 | Yields `(idx, Result<ChatResponse>)` pairs in completion order as each invoke finishes, instead of buffering the whole `Vec`. Caller can render results live, dispatch downstream work on early completers, or drop the stream to abort remaining in-flight work (the spawned pump calls `set.abort_all()` on receiver-drop). First "stream-out" variant in the parallel-batch family — same primitive, different consumer shape |
 
 ---
 

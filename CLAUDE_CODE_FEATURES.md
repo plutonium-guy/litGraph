@@ -40,7 +40,7 @@ long-term Store. Older (v0.3) features rolled in from prior audit.
 | Vision (image-in) | Multimodal agents | ✅ |
 | Audio I/O (whisper, TTS) | Voice agents | ✅ `WhisperTool`, `TtsTool` |
 | Image generation (DALL-E) | Creative agents | ✅ `DalleTool` |
-| Async batch API | Bulk evaluation | ✅ `litgraph_core::batch_concurrent` (+ `_fail_fast`) — bounded-concurrency parallel `ChatModel.invoke` over Tokio + Semaphore, order-preserving, per-call `Result`. Python: `litgraph.agents.batch_chat(model, inputs, max_concurrency, fail_fast=False)`. (iter 182) Plus `batch_concurrent_with_progress` (iter 205) — same shape, updates a `Progress<BatchProgress>` watcher with `{total, completed, errors}` for live eval-harness counters. |
+| Async batch API | Bulk evaluation | ✅ `litgraph_core::batch_concurrent` (+ `_fail_fast`) — bounded-concurrency parallel `ChatModel.invoke` over Tokio + Semaphore, order-preserving, per-call `Result`. Python: `litgraph.agents.batch_chat(model, inputs, max_concurrency, fail_fast=False)`. (iter 182) Plus `batch_concurrent_with_progress` (iter 205) — same shape, updates a `Progress<BatchProgress>` watcher with `{total, completed, errors}` for live eval-harness counters. Plus `batch_concurrent_stream` (iter 210) — yields `(idx, Result)` pairs as each call completes (mpsc-backed) so callers can render results live, dispatch downstream work on early-completers, and abort-on-drop to stop in-flight work. |
 | Token counters (tiktoken/HF) | Pre-flight cost/context limits | ✅ `litgraph.tokenizers` |
 
 ## 2. Resilience — survive prod

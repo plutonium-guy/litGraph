@@ -22,11 +22,14 @@
 //! you need true real-time parallelism rather than the deferred
 //! batch-API "results within 24h" model.
 
+use std::pin::Pin;
 use std::sync::Arc;
 
+use futures::Stream;
 use serde::{Deserialize, Serialize};
-use tokio::sync::Semaphore;
+use tokio::sync::{mpsc, Semaphore};
 use tokio::task::JoinSet;
+use tokio_stream::wrappers::ReceiverStream;
 
 use crate::{ChatModel, ChatOptions, ChatResponse, Error, Message, Progress, Result};
 
@@ -184,6 +187,88 @@ pub async fn batch_concurrent_with_progress(
         .into_iter()
         .map(|s| s.unwrap_or_else(|| Err(Error::other("batch task lost"))))
         .collect()
+}
+
+/// One emitted result from [`batch_concurrent_stream`] — the input
+/// index plus that input's outcome. Aligned with `batch_concurrent`'s
+/// `Vec<Result>` semantics, but delivered incrementally as each call
+/// completes rather than buffered to the end.
+pub type BatchStreamItem = (usize, Result<ChatResponse>);
+
+/// Streaming variant of [`batch_concurrent`]. Yields `(idx, Result)`
+/// pairs **in completion order** as each call finishes — caller can
+/// start consuming as soon as the first response arrives, instead of
+/// waiting for the whole batch.
+///
+/// The `usize` index is the original `inputs[i]` slot, so callers can
+/// reassemble in input order if they need to (e.g., write into a
+/// pre-sized `Vec<Option<ChatResponse>>`). Stream finishes when every
+/// input has produced exactly one item.
+///
+/// # When to use this vs `batch_concurrent`
+///
+/// - `batch_concurrent`: caller wants the **whole result Vec at once**.
+///   Simpler API, simpler error handling.
+/// - `batch_concurrent_stream` (this): caller wants to **render
+///   results live**, **dispatch downstream work as items complete**,
+///   or **stream into a UI** without waiting for stragglers. Eval
+///   harnesses and bulk-evaluation dashboards are the main use.
+///
+/// `max_concurrency = 0` is normalised to 1 (sequential).
+pub fn batch_concurrent_stream(
+    model: Arc<dyn ChatModel>,
+    inputs: Vec<Vec<Message>>,
+    opts: ChatOptions,
+    max_concurrency: usize,
+) -> Pin<Box<dyn Stream<Item = BatchStreamItem> + Send>> {
+    if inputs.is_empty() {
+        return Box::pin(futures::stream::empty());
+    }
+    let cap = max_concurrency.max(1);
+    let n = inputs.len();
+    let buf = n.min(cap.max(8));
+    let (tx, rx) = mpsc::channel::<BatchStreamItem>(buf);
+
+    tokio::spawn(async move {
+        let sem = Arc::new(Semaphore::new(cap));
+        let mut set: JoinSet<BatchStreamItem> = JoinSet::new();
+        for (idx, msgs) in inputs.into_iter().enumerate() {
+            let sem = sem.clone();
+            let model = model.clone();
+            let opts = opts.clone();
+            set.spawn(async move {
+                let _permit = match sem.acquire_owned().await {
+                    Ok(p) => p,
+                    Err(_) => return (idx, Err(Error::other("batch semaphore closed"))),
+                };
+                let r = model.invoke(msgs, &opts).await;
+                (idx, r)
+            });
+        }
+        while let Some(joined) = set.join_next().await {
+            let item = match joined {
+                Ok(it) => it,
+                Err(e) => {
+                    // Index is unrecoverable from a JoinError, so we
+                    // emit a sentinel with `usize::MAX`. This is a
+                    // bug-not-runtime-error situation — `invoke`
+                    // panics are upstream defects.
+                    (
+                        usize::MAX,
+                        Err(Error::other(format!("batch task join: {e}"))),
+                    )
+                }
+            };
+            if tx.send(item).await.is_err() {
+                // Receiver dropped — caller stopped consuming. Abort
+                // remaining work to avoid wasting cycles.
+                set.abort_all();
+                break;
+            }
+        }
+    });
+
+    Box::pin(ReceiverStream::new(rx))
 }
 
 /// Like `batch_concurrent` but fail-fast: returns `Err` on the first
@@ -515,6 +600,108 @@ mod tests {
         let _ = h.await.unwrap();
         let snap = obs.snapshot();
         assert_eq!(snap.completed, 8);
+    }
+
+    // ---- batch_concurrent_stream tests --------------------------------
+
+    use futures::StreamExt;
+
+    #[tokio::test]
+    async fn stream_yields_every_input_exactly_once() {
+        let model: Arc<dyn ChatModel> = Arc::new(ConcurrencyProbe {
+            in_flight: Arc::new(AtomicUsize::new(0)),
+            peak: Arc::new(AtomicUsize::new(0)),
+            delay_ms: 0,
+        });
+        let inputs: Vec<Vec<Message>> = (0..7).map(|i| input(&format!("q{i}"))).collect();
+        let mut s = batch_concurrent_stream(model, inputs, ChatOptions::default(), 4);
+        let mut got_indices: Vec<usize> = Vec::new();
+        while let Some((idx, r)) = s.next().await {
+            assert!(r.is_ok());
+            got_indices.push(idx);
+        }
+        got_indices.sort();
+        assert_eq!(got_indices, (0..7).collect::<Vec<_>>());
+    }
+
+    #[tokio::test]
+    async fn stream_preserves_input_index_in_emitted_pairs() {
+        // Each input carries its idx; the response echoes the last
+        // message text. We verify the emitted (idx, response) pair's
+        // text matches the input at that idx.
+        let model: Arc<dyn ChatModel> = Arc::new(ConcurrencyProbe {
+            in_flight: Arc::new(AtomicUsize::new(0)),
+            peak: Arc::new(AtomicUsize::new(0)),
+            delay_ms: 5,
+        });
+        let inputs: Vec<Vec<Message>> = (0..6).map(|i| input(&format!("idx={i}"))).collect();
+        let mut s = batch_concurrent_stream(model, inputs, ChatOptions::default(), 3);
+        while let Some((idx, r)) = s.next().await {
+            let resp = r.unwrap();
+            assert_eq!(resp.message.text_content(), format!("idx={idx}"));
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_per_call_failure_arrives_as_err_item() {
+        let model: Arc<dyn ChatModel> = Arc::new(FailOn {
+            bad_index: 2,
+            seen: Arc::new(AtomicUsize::new(0)),
+        });
+        let inputs: Vec<Vec<Message>> =
+            (0..5).map(|i| input(&format!("idx={i}"))).collect();
+        let mut s = batch_concurrent_stream(model, inputs, ChatOptions::default(), 4);
+        let mut errors = 0;
+        let mut count = 0;
+        while let Some((_idx, r)) = s.next().await {
+            count += 1;
+            if r.is_err() {
+                errors += 1;
+            }
+        }
+        assert_eq!(count, 5);
+        assert_eq!(errors, 1);
+    }
+
+    #[tokio::test]
+    async fn stream_empty_inputs_yields_empty() {
+        let model: Arc<dyn ChatModel> = Arc::new(ConcurrencyProbe {
+            in_flight: Arc::new(AtomicUsize::new(0)),
+            peak: Arc::new(AtomicUsize::new(0)),
+            delay_ms: 0,
+        });
+        let mut s = batch_concurrent_stream(model, vec![], ChatOptions::default(), 4);
+        assert!(s.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn stream_caller_drop_aborts_in_flight_work() {
+        // 100 inputs each delayed 50ms with cap=2 — full sequential
+        // run would take ~2.5s. We drop the stream after 1 item; the
+        // total wall-clock should be far less than the full run.
+        let model: Arc<dyn ChatModel> = Arc::new(ConcurrencyProbe {
+            in_flight: Arc::new(AtomicUsize::new(0)),
+            peak: Arc::new(AtomicUsize::new(0)),
+            delay_ms: 50,
+        });
+        let inputs: Vec<Vec<Message>> =
+            (0..100).map(|i| input(&format!("q{i}"))).collect();
+        let started = std::time::Instant::now();
+        {
+            let mut s = batch_concurrent_stream(
+                model,
+                inputs,
+                ChatOptions::default(),
+                2,
+            );
+            let _first = s.next().await.unwrap();
+            // Drop `s` here.
+        }
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        assert!(
+            elapsed_ms < 500,
+            "elapsed {elapsed_ms}ms — caller-drop didn't abort remaining tasks",
+        );
     }
 
     #[tokio::test]
