@@ -37,6 +37,7 @@ pub mod assistants;
 pub mod batch;
 pub mod embed_batch;
 pub mod semantic_store;
+pub mod stream_multiplex;
 pub mod table_parser;
 
 pub use error::{Error, Result};
@@ -88,6 +89,7 @@ pub use embed_batch::{
     embed_documents_concurrent, DEFAULT_EMBED_CHUNK_SIZE, DEFAULT_EMBED_CONCURRENCY,
 };
 pub use semantic_store::{SemanticHit, SemanticStore};
+pub use stream_multiplex::{multiplex_chat_streams, MultiplexEvent, MultiplexStream};
 pub use table_parser::{
     format_instructions as table_format_instructions, parse_table_csv, parse_table_json,
     parse_table_value, Table, TableQuery,
@@ -102,7 +104,7 @@ pub use memory::{
     TokenCounter, summarize_conversation,
 };
 pub use message::{Message, Role, ContentPart, ImageSource};
-pub use model::{ChatModel, Embeddings, ChatOptions, ChatResponse, TokenUsage, FinishReason};
+pub use model::{ChatModel, ChatOptions, ChatResponse, ChatStream, ChatStreamEvent, Embeddings, FinishReason, TokenUsage};
 pub use prompt::{ChatPromptTemplate, FewShotChatPromptTemplate, PromptValue};
 pub use tool::{Tool, ToolCall, ToolResult, ToolSchema};
 pub use document::Document;

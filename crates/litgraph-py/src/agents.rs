@@ -42,7 +42,176 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyTextReActAgent>()?;
     m.add_class::<PyTextReactEventStream>()?;
     m.add_function(wrap_pyfunction!(batch_chat, m)?)?;
+    m.add_class::<PyMultiplexStream>()?;
+    m.add_function(wrap_pyfunction!(multiplex_chat_streams, m)?)?;
     Ok(())
+}
+
+/// Run N chat-model streams concurrently, fan-in token deltas via a
+/// Tokio mpsc channel, return a Python iterator of tagged events.
+/// Each `__next__` yields a dict `{model_label, type, text?, error?,
+/// finish_reason?, ...}` — see the inner `ChatStreamEvent` discriminants.
+///
+/// `models` is a list of `(label_str, chat_model)` tuples. Each model
+/// receives the same `messages` + (temperature, max_tokens) options.
+///
+/// Distinct from `RaceChat` (iter 184) — race returns one winning
+/// response. Multiplex returns **all** models' streams interleaved
+/// in arrival order, useful for live side-by-side rendering.
+///
+/// ```python
+/// from litgraph.agents import multiplex_chat_streams
+/// for ev in multiplex_chat_streams(
+///     [("openai", openai_model), ("anthropic", anth_model)],
+///     [{"role": "user", "content": "hi"}],
+/// ):
+///     print(ev["model_label"], ev.get("text", ""))
+/// ```
+#[pyfunction]
+#[pyo3(signature = (models, messages, temperature=None, max_tokens=None))]
+fn multiplex_chat_streams(
+    py: Python<'_>,
+    models: Bound<'_, PyList>,
+    messages: Bound<'_, PyList>,
+    temperature: Option<f32>,
+    max_tokens: Option<u32>,
+) -> PyResult<Py<PyMultiplexStream>> {
+    if models.is_empty() {
+        return Err(PyValueError::new_err(
+            "multiplex_chat_streams: need at least one (label, model) pair",
+        ));
+    }
+    let mut parsed: Vec<(String, Arc<dyn ChatModel>)> = Vec::with_capacity(models.len());
+    for item in models.iter() {
+        // Accept either (label, model) tuple OR a 2-element list.
+        let pair: pyo3::Bound<pyo3::types::PyTuple> = match item.downcast::<pyo3::types::PyTuple>() {
+            Ok(t) => t.clone(),
+            Err(_) => {
+                return Err(PyValueError::new_err(
+                    "each model entry must be a (label, model) tuple",
+                ));
+            }
+        };
+        if pair.len() != 2 {
+            return Err(PyValueError::new_err(
+                "each tuple must be exactly (label, model)",
+            ));
+        }
+        let label: String = pair.get_item(0)?.extract()?;
+        let model_obj = pair.get_item(1)?;
+        let model = extract_chat_model(&model_obj)?;
+        parsed.push((label, model));
+    }
+
+    let msgs = crate::providers::parse_messages_from_pylist(&messages)?;
+    let opts = ChatOptions {
+        temperature,
+        max_tokens,
+        ..Default::default()
+    };
+
+    let cap = (parsed.len() * 16).max(8);
+    let (tx, rx) = mpsc::channel::<litgraph_core::Result<litgraph_core::MultiplexEvent>>(cap);
+    crate::runtime::rt().spawn(async move {
+        let mut s = litgraph_core::multiplex_chat_streams(parsed, msgs, opts);
+        while let Some(item) = s.next().await {
+            if tx.send(item).await.is_err() {
+                break;
+            }
+        }
+    });
+    Py::new(
+        py,
+        PyMultiplexStream {
+            rx: Arc::new(Mutex::new(Some(rx))),
+        },
+    )
+}
+
+/// Iterator over multiplexed chat-stream events. Each `__next__`
+/// returns a dict; iteration ends with `StopIteration` once every
+/// inner model has finished.
+#[pyclass(name = "MultiplexStream", module = "litgraph.agents")]
+pub struct PyMultiplexStream {
+    rx: Arc<Mutex<Option<mpsc::Receiver<litgraph_core::Result<litgraph_core::MultiplexEvent>>>>>,
+}
+
+#[pymethods]
+impl PyMultiplexStream {
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __next__<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let slot = self.rx.clone();
+        let item = py.allow_threads(|| {
+            let mut guard = slot.lock().expect("poisoned");
+            let mut rx = match guard.take() {
+                Some(r) => r,
+                None => return None,
+            };
+            let got = block_on_compat(async { rx.recv().await });
+            *guard = Some(rx);
+            got
+        });
+        match item {
+            Some(Ok(ev)) => multiplex_event_to_py(py, &ev),
+            Some(Err(e)) => {
+                // Per-model failure surfaces as a tagged-error dict so
+                // the iterator keeps going. Embedded label is in the
+                // error text (set by `multiplex_chat_streams`).
+                let d = PyDict::new_bound(py);
+                let msg = e.to_string();
+                // Try to recover the [label] tag; otherwise fall back.
+                let (label, body) = match (msg.find('['), msg.find(']')) {
+                    (Some(l), Some(r)) if r > l + 1 => {
+                        (msg[l + 1..r].to_string(), msg[r + 1..].trim().to_string())
+                    }
+                    _ => ("?".into(), msg.clone()),
+                };
+                d.set_item("type", "error")?;
+                d.set_item("model_label", label)?;
+                d.set_item("error", body)?;
+                Ok(d)
+            }
+            None => {
+                *self.rx.lock().expect("poisoned") = None;
+                Err(PyStopIteration::new_err("multiplex stream exhausted"))
+            }
+        }
+    }
+}
+
+fn multiplex_event_to_py<'py>(
+    py: Python<'py>,
+    ev: &litgraph_core::MultiplexEvent,
+) -> PyResult<Bound<'py, PyDict>> {
+    use litgraph_core::ChatStreamEvent;
+    let d = PyDict::new_bound(py);
+    d.set_item("model_label", &ev.model_label)?;
+    match &ev.event {
+        ChatStreamEvent::Delta { text } => {
+            d.set_item("type", "delta")?;
+            d.set_item("text", text)?;
+        }
+        ChatStreamEvent::ToolCallDelta { index, id, name, arguments_delta } => {
+            d.set_item("type", "tool_call_delta")?;
+            d.set_item("index", index)?;
+            d.set_item("id", id.clone())?;
+            d.set_item("name", name.clone())?;
+            d.set_item("arguments_delta", arguments_delta.clone())?;
+        }
+        ChatStreamEvent::Done { response } => {
+            d.set_item("type", "done")?;
+            d.set_item("text", response.message.text_content())?;
+            d.set_item(
+                "finish_reason",
+                format!("{:?}", response.finish_reason).to_lowercase(),
+            )?;
+            d.set_item("model", &response.model)?;
+        }
+    }
+    Ok(d)
 }
 
 /// Concurrent batched chat — fan out N invocations across a Tokio task

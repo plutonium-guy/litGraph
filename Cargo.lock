@@ -2221,6 +2221,7 @@ dependencies = [
 name = "litgraph-core"
 version = "0.1.0"
 dependencies = [
+ "async-stream",
  "async-trait",
  "blake3",
  "futures",

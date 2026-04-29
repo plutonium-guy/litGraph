@@ -25,6 +25,7 @@ parking_lot.workspace = true
 tokio = { workspace = true }
 blake3.workspace = true
 rayon.workspace = true
+async-stream.workspace = true
 
 [features]
 default = []

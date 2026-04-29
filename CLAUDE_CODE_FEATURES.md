@@ -51,6 +51,7 @@ long-term Store. Older (v0.3) features rolled in from prior audit.
 | Rate limiter | Per-key RPM/TPM caps | ✅ `RateLimitedChatModel` |
 | Fallback chain | Model A down → try B | ✅ `FallbackChatModel` |
 | Race / hedged requests | Latency-min: A and B in parallel, first wins | ✅ `litgraph_resilience::RaceChatModel` — Tokio `JoinSet` + `abort_all` cancels losers as soon as a winner emerges; aggregates errors only if every inner fails. Python: `litgraph.providers.RaceChat(models)`. (iter 184) |
+| Multiplexed live streaming | Render N model token streams side-by-side | ✅ `litgraph_core::multiplex_chat_streams` — Tokio `mpsc` channel-fan-in; per-event `model_label` tag; one slow / failing model never blocks the others. Python: `litgraph.agents.multiplex_chat_streams(models, messages)`. (iter 189) |
 | Token budget guard | Stop runaway prompts | ✅ `TokenBudgetChatModel` |
 | Cost cap | Hard $ ceiling per run | ✅ `CostCappedChatModel` |
 | PII scrubber (input/output) | Compliance | ✅ `PiiScrubbingChatModel` |
