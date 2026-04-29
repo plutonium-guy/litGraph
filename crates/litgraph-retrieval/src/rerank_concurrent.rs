@@ -37,7 +37,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use futures::Stream;
-use litgraph_core::{Document, Error, Progress, Result};
+use litgraph_core::{Document, Error, Progress, Result, ShutdownSignal};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, Semaphore};
 use tokio::task::JoinSet;
@@ -333,6 +333,80 @@ pub fn rerank_concurrent_stream_with_progress(
     Box::pin(ReceiverStream::new(rx))
 }
 
+/// `rerank_concurrent` plus graceful cancellation via
+/// [`ShutdownSignal`]. Output aligned 1:1 with `pairs`:
+///
+/// - `Ok(docs)` — pair completed before shutdown.
+/// - `Err(reranker error)` — pair completed with provider failure.
+/// - `Err("cancelled by shutdown")` — pair was still in flight when
+///   shutdown fired.
+///
+/// Mechanical extension of the bridge pattern (iters 227-230) to
+/// the reranker axis. Real prod use: a long eval-rerank run that
+/// scores hundreds of `(query, candidates)` pairs banks completed
+/// rows on Ctrl+C — the partial eval report is still useful.
+pub async fn rerank_concurrent_with_shutdown(
+    reranker: Arc<dyn Reranker>,
+    pairs: Vec<(String, Vec<Document>)>,
+    top_k: usize,
+    max_concurrency: usize,
+    shutdown: &ShutdownSignal,
+) -> Vec<Result<Vec<Document>>> {
+    if pairs.is_empty() {
+        return Vec::new();
+    }
+    if shutdown.is_signaled() {
+        return (0..pairs.len())
+            .map(|_| Err(Error::other("cancelled by shutdown")))
+            .collect();
+    }
+
+    let cap = max_concurrency.max(1);
+    let sem = Arc::new(Semaphore::new(cap));
+    let mut set: JoinSet<(usize, Result<Vec<Document>>)> = JoinSet::new();
+
+    for (idx, (query, candidates)) in pairs.into_iter().enumerate() {
+        let sem = sem.clone();
+        let reranker = reranker.clone();
+        set.spawn(async move {
+            let _permit = match sem.acquire_owned().await {
+                Ok(p) => p,
+                Err(_) => return (idx, Err(Error::other("rerank semaphore closed"))),
+            };
+            let r = reranker.rerank(&query, candidates, top_k).await;
+            (idx, r)
+        });
+    }
+
+    let n = set.len();
+    let mut results: Vec<Option<Result<Vec<Document>>>> = (0..n).map(|_| None).collect();
+
+    loop {
+        tokio::select! {
+            joined = set.join_next() => {
+                match joined {
+                    Some(Ok((idx, r))) => results[idx] = Some(r),
+                    Some(Err(e)) => {
+                        if let Some(slot) = results.iter_mut().find(|s| s.is_none()) {
+                            *slot = Some(Err(Error::other(format!("rerank task join: {e}"))));
+                        }
+                    }
+                    None => break,
+                }
+            }
+            _ = shutdown.wait() => {
+                set.abort_all();
+                break;
+            }
+        }
+    }
+
+    results
+        .into_iter()
+        .map(|s| s.unwrap_or_else(|| Err(Error::other("cancelled by shutdown"))))
+        .collect()
+}
+
 /// Fail-fast variant: returns `Err` on the first failed pair, drops
 /// the rest. Output aligned to input only on success.
 pub async fn rerank_concurrent_fail_fast(
@@ -540,6 +614,86 @@ mod tests {
         for r in &out {
             assert_eq!(r.as_ref().unwrap().len(), 2);
         }
+    }
+
+    // ---- rerank_concurrent_with_shutdown tests ------------------------
+
+    #[tokio::test]
+    async fn shutdown_no_signal_completes_normally() {
+        let (r, _peak) = probe(0);
+        let pairs: Vec<_> = (0..4)
+            .map(|i| (format!("q{i}"), vec![doc("a"), doc("b")]))
+            .collect();
+        let shutdown = ShutdownSignal::new();
+        let out =
+            rerank_concurrent_with_shutdown(r, pairs, 2, 4, &shutdown).await;
+        assert_eq!(out.len(), 4);
+        assert!(out.iter().all(|x| x.is_ok()));
+    }
+
+    #[tokio::test]
+    async fn shutdown_pre_fired_returns_all_cancelled() {
+        let (r, _peak) = probe(0);
+        let pairs: Vec<_> = (0..3)
+            .map(|i| (format!("q{i}"), vec![doc("x")]))
+            .collect();
+        let shutdown = ShutdownSignal::new();
+        shutdown.signal();
+        let out =
+            rerank_concurrent_with_shutdown(r, pairs, 1, 4, &shutdown).await;
+        assert_eq!(out.len(), 3);
+        for x in &out {
+            assert!(x
+                .as_ref()
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("cancelled by shutdown"));
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_mid_run_preserves_completed_pairs() {
+        let (r, _peak) = probe(50);
+        let pairs: Vec<_> = (0..20)
+            .map(|i| (format!("q{i}"), vec![doc("a"), doc("b")]))
+            .collect();
+        let shutdown = ShutdownSignal::new();
+        let s2 = shutdown.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+            s2.signal();
+        });
+        let started = std::time::Instant::now();
+        let out =
+            rerank_concurrent_with_shutdown(r, pairs, 2, 2, &shutdown).await;
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_millis(300),
+            "elapsed {elapsed:?} — shutdown didn't abort early",
+        );
+        assert_eq!(out.len(), 20);
+        let ok = out.iter().filter(|x| x.is_ok()).count();
+        let cancelled = out
+            .iter()
+            .filter(|x| {
+                x.as_ref()
+                    .err()
+                    .map(|e| e.to_string().contains("cancelled by shutdown"))
+                    .unwrap_or(false)
+            })
+            .count();
+        assert!(ok >= 1);
+        assert!(cancelled >= 1);
+    }
+
+    #[tokio::test]
+    async fn shutdown_empty_pairs_returns_empty() {
+        let (r, _peak) = probe(0);
+        let shutdown = ShutdownSignal::new();
+        let out =
+            rerank_concurrent_with_shutdown(r, vec![], 5, 4, &shutdown).await;
+        assert!(out.is_empty());
     }
 
     // ---- rerank_concurrent_with_progress tests ------------------------

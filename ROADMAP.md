@@ -246,6 +246,7 @@ patterns").
 | `embed_documents_concurrent_with_shutdown` (iter 228) | Composes iter 183 + iter 225 | Partial-progress preservation extended to the embeddings axis. Per-chunk granularity — bulk-indexer can flush only the `Ok` slots into a partial-but-valid embedding result on shutdown |
 | `retrieve_concurrent_with_shutdown` (iter 229) | Composes iter 190 + iter 225 | Partial-progress preservation extended to the retriever axis. Three of six axes (chat / embed / retrieve) now bridge to the coordination primitives; tool / rerank / loader remain |
 | `tool_dispatch_concurrent_with_shutdown` (iter 230) | Composes iter 191 + iter 225 | Partial-progress preservation extended to the heterogeneous tool axis. Four of six axes now bridge to coordination; rerank and loader remain. Real prod use: a Plan-and-Execute orchestrator with long-running tools banks completed tool results on cancel so agent context stays consistent |
+| `rerank_concurrent_with_shutdown` (iter 231) | Composes iter 197 + iter 225 | Partial-progress preservation extended to the rerank axis. Five of six axes now bridge to coordination; only the loader axis remains. Long ensemble rerank runs over many (query, candidates) pairs bank completed `Ok` rerankings on Ctrl+C — eval reports stay computable on the partial result, remaining slots fill with `Err("cancelled by shutdown")` |
 
 ---
 
