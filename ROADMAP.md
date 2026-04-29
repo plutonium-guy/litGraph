@@ -202,6 +202,7 @@ patterns").
 | `RerankingRetriever` batch  | one model call for N docs     | Tower of 1 vs N |
 | `EnsembleRetriever` (iter 181) | weighted RRF + `join_all`  | Per-child weights with parallel fan-out — LangChain serialises |
 | `batch_concurrent` (iter 182) | `Semaphore` + `JoinSet`     | Bounded-concurrency batch over any `ChatModel`; order-preserving, per-call `Result` |
+| `embed_documents_concurrent` (iter 183) | chunk + `JoinSet` | Splits inputs into chunks, fans chunks across `Semaphore`; aligned output, fail-fast |
 
 ---
 

@@ -227,6 +227,7 @@ long-term Store. Older (v0.3) features rolled in from prior audit.
 | Jina embeddings | OSS option | ✅ |
 | fastembed-rs (local, no network) | Air-gapped | ✅ `litgraph-embeddings-fastembed::FastembedEmbeddings` — ONNX-backed, default `bge-small-en-v1.5` 384-dim, batch `embed_documents`, all `EmbeddingModel` variants (BGE/E5/MiniLM/multilingual) selectable via `with_model`; CPU-bound calls run in `spawn_blocking` so async runtime stays free; rustls TLS so no openssl dep |
 | Embedding retry/fallback | Prod | ✅ |
+| Bounded-concurrency embed batch | Bulk ingestion | ✅ `litgraph_core::embed_documents_concurrent` — chunk-and-fan-out over Tokio + Semaphore, order-preserving, fail-fast. Python: `litgraph.embeddings.embed_documents_concurrent(emb, texts, chunk_size, max_concurrency)`. (iter 183) |
 | Zero-copy numpy interop | Speed | ✅ rust-numpy |
 
 ## 14. Document Loaders

@@ -37,7 +37,42 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyRateLimitedEmbeddings>()?;
     m.add_function(wrap_pyfunction!(tei_embeddings, m)?)?;
     m.add_function(wrap_pyfunction!(together_embeddings, m)?)?;
+    m.add_function(wrap_pyfunction!(embed_documents_concurrent, m)?)?;
     Ok(())
+}
+
+/// Embed `texts` in concurrent chunks. Splits the input into chunks of
+/// `chunk_size`, runs up to `max_concurrency` chunks in parallel via
+/// Tokio + Semaphore, returns a flat list of embeddings aligned 1:1
+/// with the input.
+///
+/// `chunk_size=0` is normalised to one chunk; `max_concurrency=0` to 1.
+/// Any chunk failure aborts the whole call.
+///
+/// ```python
+/// from litgraph.embeddings import OpenAIEmbeddings, embed_documents_concurrent
+/// emb = OpenAIEmbeddings(api_key="sk-...", model="text-embedding-3-small")
+/// vecs = embed_documents_concurrent(emb, big_corpus, chunk_size=512,
+///                                   max_concurrency=8)
+/// assert len(vecs) == len(big_corpus)
+/// ```
+#[pyfunction]
+#[pyo3(signature = (embedder, texts, chunk_size=1024, max_concurrency=4))]
+fn embed_documents_concurrent(
+    py: Python<'_>,
+    embedder: Bound<'_, PyAny>,
+    texts: Vec<String>,
+    chunk_size: usize,
+    max_concurrency: usize,
+) -> PyResult<Vec<Vec<f32>>> {
+    let inner = extract_embeddings(&embedder)?;
+    py.allow_threads(|| {
+        block_on_compat(async move {
+            litgraph_core::embed_documents_concurrent(inner, &texts, chunk_size, max_concurrency)
+                .await
+        })
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    })
 }
 
 /// Extract an `Arc<dyn Embeddings>` from any registered embedding pyclass.
