@@ -82,6 +82,8 @@ pub mod outlook;
 pub use outlook::OutlookMessagesLoader;
 pub mod concurrent;
 pub use concurrent::{load_concurrent, load_concurrent_flat, DEFAULT_LOAD_CONCURRENCY};
+pub mod ingest;
+pub use ingest::{ingest_to_stream, IngestBatch, IngestConfig};
 
 #[derive(Debug, thiserror::Error)]
 pub enum LoaderError {

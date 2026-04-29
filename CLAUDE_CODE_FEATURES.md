@@ -259,6 +259,7 @@ long-term Store. Older (v0.3) features rolled in from prior audit.
 | arXiv / Wikipedia / PubMed | ✅ `litgraph_loaders::ArxivLoader` (Atom), `WikipediaLoader` (MediaWiki Action API), `PubMedLoader` (NCBI E-utilities — esearch+efetch, structured-abstract section labels preserved, MeSH terms, DOI/PMCID, normalised pub_date, API-key support) |
 | Office365 / Outlook | ✅ `litgraph_loaders::OutlookMessagesLoader` — Microsoft Graph `/me/messages`, bearer auth, folder/search/filter narrowing, `@odata.nextLink` pagination, `Prefer: outlook.body-content-type="text"` header so embedders see prose not HTML, subject+body concatenated for content, full sender/recipient/conversation metadata |
 | Concurrent multi-loader fan-out | Parallel ingestion across many sources | ✅ `litgraph_loaders::load_concurrent` (+ `_flat`) — bounded-concurrency `Loader::load()` fan-out via Tokio `spawn_blocking` + `Semaphore`; aligned output, per-loader `Result`. Python: `litgraph.loaders.load_concurrent(loaders, max_concurrency, fail_fast=False)`. (iter 187) |
+| Backpressured ingestion pipeline | One call: load → split → embed → stream | ✅ `litgraph_loaders::ingest_to_stream` — three-stage Tokio pipeline (loaders, splitter closure, embedder) connected by bounded `mpsc` channels. Each stage runs concurrently — while loaders pull later sources, the splitter is already chopping earlier ones, and the embedder is batching the first chunks. Per-stage failures surface as `Err` items on the output stream without short-circuiting. (iter 196) |
 
 ## 15. Splitters
 
