@@ -259,6 +259,80 @@ pub fn rerank_concurrent_stream(
     Box::pin(ReceiverStream::new(rx))
 }
 
+/// Combined streaming + progress-watcher variant. Yields the same
+/// `(pair_idx, Result)` items as [`rerank_concurrent_stream`] AND
+/// updates the supplied [`Progress<RerankProgress>`] watcher as
+/// each pair completes.
+///
+/// Composition: extends the combined consumer shape from iters
+/// 216-219 to the rerank axis. Same consistency contract:
+/// `progress.update` runs before `tx.send`.
+pub fn rerank_concurrent_stream_with_progress(
+    reranker: Arc<dyn Reranker>,
+    pairs: Vec<(String, Vec<Document>)>,
+    top_k: usize,
+    max_concurrency: usize,
+    progress: Progress<RerankProgress>,
+) -> Pin<Box<dyn Stream<Item = RerankStreamItem> + Send>> {
+    if pairs.is_empty() {
+        return Box::pin(futures::stream::empty());
+    }
+    let total = pairs.len() as u64;
+    let total_candidates: u64 = pairs.iter().map(|(_, c)| c.len() as u64).sum();
+    let _ = progress.update(|p| RerankProgress {
+        total,
+        total_candidates,
+        ..p.clone()
+    });
+
+    let cap = max_concurrency.max(1);
+    let n = pairs.len();
+    let buf = n.min(cap.max(8));
+    let (tx, rx) = mpsc::channel::<RerankStreamItem>(buf);
+
+    tokio::spawn(async move {
+        let sem = Arc::new(Semaphore::new(cap));
+        let mut set: JoinSet<RerankStreamItem> = JoinSet::new();
+        for (idx, (query, candidates)) in pairs.into_iter().enumerate() {
+            let sem = sem.clone();
+            let reranker = reranker.clone();
+            set.spawn(async move {
+                let _permit = match sem.acquire_owned().await {
+                    Ok(p) => p,
+                    Err(_) => return (idx, Err(Error::other("rerank semaphore closed"))),
+                };
+                let r = reranker.rerank(&query, candidates, top_k).await;
+                (idx, r)
+            });
+        }
+        while let Some(joined) = set.join_next().await {
+            let item = match joined {
+                Ok(it) => it,
+                Err(e) => (
+                    usize::MAX,
+                    Err(Error::other(format!("rerank task join: {e}"))),
+                ),
+            };
+            let (n_docs, is_err) = match &item.1 {
+                Ok(docs) => (docs.len() as u64, false),
+                Err(_) => (0, true),
+            };
+            let _ = progress.update(|p| RerankProgress {
+                completed: p.completed + 1,
+                docs_returned: p.docs_returned + n_docs,
+                errors: p.errors + if is_err { 1 } else { 0 },
+                ..p.clone()
+            });
+            if tx.send(item).await.is_err() {
+                set.abort_all();
+                break;
+            }
+        }
+    });
+
+    Box::pin(ReceiverStream::new(rx))
+}
+
 /// Fail-fast variant: returns `Err` on the first failed pair, drops
 /// the rest. Output aligned to input only on success.
 pub async fn rerank_concurrent_fail_fast(
@@ -552,6 +626,110 @@ mod tests {
     // ---- rerank_concurrent_stream tests -------------------------------
 
     use futures::StreamExt;
+
+    // ---- rerank_concurrent_stream_with_progress tests -----------------
+
+    #[tokio::test]
+    async fn stream_with_progress_yields_items_and_advances_counters() {
+        let (r, _peak) = probe(2);
+        let pairs: Vec<_> = vec![
+            ("q0".into(), vec![doc("a"), doc("b")]),
+            ("q1".into(), vec![doc("c")]),
+            ("q2".into(), vec![doc("d"), doc("e")]),
+        ];
+        let progress = Progress::new(RerankProgress::default());
+        let obs = progress.observer();
+        let mut s = rerank_concurrent_stream_with_progress(
+            r, pairs, 5, 4, progress,
+        );
+        let mut count = 0;
+        while let Some((_idx, res)) = s.next().await {
+            assert!(res.is_ok());
+            count += 1;
+        }
+        assert_eq!(count, 3);
+        let snap = obs.snapshot();
+        assert_eq!(snap.total, 3);
+        assert_eq!(snap.total_candidates, 5); // 2 + 1 + 2
+        assert_eq!(snap.completed, 3);
+        assert_eq!(snap.docs_returned, 5); // reverser returns all under top_k=5
+    }
+
+    #[tokio::test]
+    async fn stream_with_progress_records_per_pair_errors() {
+        struct FailOnQ {
+            bad: String,
+        }
+        #[async_trait]
+        impl Reranker for FailOnQ {
+            async fn rerank(
+                &self,
+                query: &str,
+                docs: Vec<Document>,
+                top_k: usize,
+            ) -> Result<Vec<Document>> {
+                if query == self.bad {
+                    Err(Error::other("synthetic"))
+                } else {
+                    Ok(docs.into_iter().take(top_k).collect())
+                }
+            }
+        }
+        let r: Arc<dyn Reranker> = Arc::new(FailOnQ {
+            bad: "q2".into(),
+        });
+        let pairs: Vec<_> = (0..5)
+            .map(|i| (format!("q{i}"), vec![doc("x"), doc("y")]))
+            .collect();
+        let progress = Progress::new(RerankProgress::default());
+        let obs = progress.observer();
+        let mut s = rerank_concurrent_stream_with_progress(
+            r, pairs, 2, 4, progress,
+        );
+        let mut errors_in_stream = 0;
+        while let Some((_idx, res)) = s.next().await {
+            if res.is_err() {
+                errors_in_stream += 1;
+            }
+        }
+        let snap = obs.snapshot();
+        assert_eq!(snap.completed, 5);
+        assert_eq!(snap.errors, 1);
+        assert_eq!(errors_in_stream, snap.errors as usize);
+    }
+
+    #[tokio::test]
+    async fn stream_with_progress_total_set_at_start() {
+        let (r, _peak) = probe(0);
+        let pairs: Vec<_> = vec![
+            ("q1".into(), vec![doc("a"), doc("b"), doc("c")]),
+            ("q2".into(), vec![doc("d")]),
+        ];
+        let progress = Progress::new(RerankProgress::default());
+        let obs = progress.observer();
+        let _s = rerank_concurrent_stream_with_progress(
+            r, pairs, 5, 2, progress,
+        );
+        let snap = obs.snapshot();
+        assert_eq!(snap.total, 2);
+        assert_eq!(snap.total_candidates, 4);
+    }
+
+    #[tokio::test]
+    async fn stream_with_progress_empty_pairs_no_updates() {
+        let (r, _peak) = probe(0);
+        let progress = Progress::new(RerankProgress::default());
+        let obs = progress.observer();
+        let mut s = rerank_concurrent_stream_with_progress(
+            r,
+            vec![],
+            5,
+            4,
+            progress,
+        );
+        assert!(s.next().await.is_none());
+        assert_eq!(obs.snapshot(), RerankProgress::default());
+    }
 
     #[tokio::test]
     async fn stream_yields_one_item_per_pair() {

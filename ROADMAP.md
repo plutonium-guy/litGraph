@@ -235,6 +235,7 @@ patterns").
 | `embed_documents_concurrent_stream_with_progress` (iter 217) | Composes iter 206 + iter 211 | Combined consumer shape extended to the embed axis. Both chat-batch and embed-batch axes now ship all four quadrants. Same consistency contract as iter 216 (counter ticks before stream item) so observers and stream consumers see synchronized state |
 | `retrieve_concurrent_stream_with_progress` (iter 218) | Composes iter 207 + iter 212 | Combined consumer shape extended to the retriever axis. Three of six axes now ship the full four-quadrant matrix |
 | `tool_dispatch_concurrent_stream_with_progress` (iter 219) | Composes iter 208 + iter 213 | Combined consumer shape extended to the tool axis. Four of six axes now ship the full four-quadrant matrix. `unknown_tool_errors` bucketing carries over so observers see routing-vs-runtime breakdown live |
+| `rerank_concurrent_stream_with_progress` (iter 220) | Composes iter 209 + iter 214 | Combined consumer shape extended to the rerank axis. Five of six axes now ship the full four-quadrant matrix |
 
 ---
 
