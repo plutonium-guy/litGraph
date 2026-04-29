@@ -7,7 +7,7 @@ use litgraph_retrieval::store::VectorStore;
 use litgraph_retrieval::{
     embedding_redundant_filter, long_context_reorder, mmr_select, AttributeInfo, Bm25Index,
     ChildSplitter, Compressor, ContextualCompressionRetriever, DocStore,
-    EmbeddingsFilterCompressor, HybridRetriever, LlmExtractCompressor, MemoryDocStore,
+    EmbeddingsFilterCompressor, EnsembleRetriever, HybridRetriever, LlmExtractCompressor, MemoryDocStore,
     HydeRetriever, MaxMarginalRelevanceRetriever, MultiQueryRetriever, ParentDocumentRetriever,
     PipelineCompressor, Reranker,
     RerankingRetriever, Retriever, SelfQueryRetriever, TimeWeightedRetriever, VectorRetriever,
@@ -46,6 +46,7 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyJinaReranker>()?;
     m.add_class::<PyRerankingRetriever>()?;
     m.add_class::<PyHybridRetriever>()?;
+    m.add_class::<PyEnsembleRetriever>()?;
     m.add_class::<PyParentDocumentRetriever>()?;
     m.add_class::<PyMemoryDocStore>()?;
     m.add_class::<PyMultiQueryRetriever>()?;
@@ -1178,6 +1179,98 @@ impl PyHybridRetriever {
     fn __repr__(&self) -> String {
         format!("HybridRetriever(children={}, rrf_k={})",
             self.inner.children.len(), self.inner.rrf_k)
+    }
+}
+
+/// Weighted Reciprocal Rank Fusion across N child retrievers, fanned out
+/// concurrently. Like `HybridRetriever`, but each child has its own
+/// weight so a high-precision retriever can dominate a noisier one.
+///
+/// `weights` length must equal `children` length. Pass `weights=None` for
+/// equal weights (equivalent to `HybridRetriever`). A weight of `0.0`
+/// silences a branch entirely.
+///
+/// ```python
+/// from litgraph.retrieval import EnsembleRetriever
+/// # 70% weight on dense, 30% on BM25.
+/// r = EnsembleRetriever([dense_r, bm25], weights=[0.7, 0.3])
+/// docs = r.retrieve("how do transformers attend?", k=5)
+/// ```
+#[pyclass(name = "EnsembleRetriever", module = "litgraph.retrieval")]
+pub struct PyEnsembleRetriever {
+    pub(crate) inner: Arc<EnsembleRetriever>,
+}
+
+impl PyEnsembleRetriever {
+    pub(crate) fn as_retriever(&self) -> Arc<dyn Retriever> {
+        self.inner.clone() as Arc<dyn Retriever>
+    }
+}
+
+#[pymethods]
+impl PyEnsembleRetriever {
+    #[new]
+    #[pyo3(signature = (children, weights=None, rrf_k=60.0, per_child_k=None))]
+    fn new(
+        children: Bound<'_, PyList>,
+        weights: Option<Vec<f32>>,
+        rrf_k: f32,
+        per_child_k: Option<usize>,
+    ) -> PyResult<Self> {
+        if children.len() < 2 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "EnsembleRetriever needs at least 2 children",
+            ));
+        }
+        let mut child_arcs: Vec<Arc<dyn Retriever>> = Vec::with_capacity(children.len());
+        for item in children.iter() {
+            let r: Arc<dyn Retriever> = if let Ok(v) = item.extract::<PyRef<PyVectorRetriever>>() {
+                v.as_retriever()
+            } else if let Ok(rr) = item.extract::<PyRef<PyRerankingRetriever>>() {
+                rr.as_retriever()
+            } else if let Ok(b) = item.extract::<PyRef<PyBm25Index>>() {
+                b.as_retriever()
+            } else if let Ok(h) = item.extract::<PyRef<PyHybridRetriever>>() {
+                h.as_retriever()
+            } else {
+                return Err(pyo3::exceptions::PyTypeError::new_err(
+                    "each child must be VectorRetriever, RerankingRetriever, Bm25Index, or HybridRetriever",
+                ));
+            };
+            child_arcs.push(r);
+        }
+        let mut e = match weights {
+            Some(w) => EnsembleRetriever::with_weights(child_arcs, w)
+                .map_err(|err| pyo3::exceptions::PyValueError::new_err(err.to_string()))?,
+            None => EnsembleRetriever::new(child_arcs),
+        };
+        e = e.with_rrf_k(rrf_k);
+        if let Some(p) = per_child_k {
+            e = e.with_per_child_k(p);
+        }
+        Ok(Self { inner: Arc::new(e) })
+    }
+
+    fn retrieve<'py>(
+        &self,
+        py: Python<'py>,
+        query: String,
+        k: usize,
+    ) -> PyResult<Bound<'py, PyList>> {
+        let r = self.inner.clone();
+        let results = py.allow_threads(move || {
+            block_on_compat(async move { r.retrieve(&query, k).await })
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })?;
+        docs_to_pylist(py, results)
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "EnsembleRetriever(children={}, rrf_k={})",
+            self.inner.children.len(),
+            self.inner.rrf_k,
+        )
     }
 }
 

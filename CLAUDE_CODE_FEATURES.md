@@ -197,7 +197,7 @@ long-term Store. Older (v0.3) features rolled in from prior audit.
 | SelfQueryRetriever | LLM extracts metadata filter | ✅ |
 | TimeWeightedRetriever | Recent docs first | ✅ |
 | HyDE retriever | Hypothetical doc embed | ✅ |
-| EnsembleRetriever | Weighted fusion | 🟡 hybrid covers |
+| EnsembleRetriever | Weighted fusion | ✅ `litgraph_retrieval::EnsembleRetriever` — per-child weights, weighted RRF, `tokio::join_all` fan-out. Python: `litgraph.retrieval.EnsembleRetriever`. (iter 181) |
 | Doc transformers (MMR, redundant filter, long-context reorder) | Pre-LLM cleanup | ✅ |
 
 ## 12. Vector Stores

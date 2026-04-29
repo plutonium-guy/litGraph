@@ -5,6 +5,7 @@ pub mod store;
 pub mod retriever;
 pub mod bm25;
 pub mod hybrid;
+pub mod ensemble;
 pub mod rerank;
 pub mod eval;
 pub mod eval_gen;
@@ -21,6 +22,7 @@ pub use store::{VectorStore, Filter};
 pub use retriever::{Retriever, VectorRetriever};
 pub use bm25::Bm25Index;
 pub use hybrid::{HybridRetriever, rrf_fuse};
+pub use ensemble::{EnsembleRetriever, weighted_rrf_fuse};
 pub use rerank::{Reranker, RerankingRetriever};
 pub use parent::{
     ChildSplitter, DocStore, MemoryDocStore, ParentDocumentRetriever, PARENT_ID_META_KEY,
