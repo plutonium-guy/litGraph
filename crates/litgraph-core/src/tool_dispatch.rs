@@ -292,6 +292,102 @@ pub fn tool_dispatch_concurrent_stream(
     Box::pin(ReceiverStream::new(rx))
 }
 
+/// Streaming variant of [`tool_dispatch_concurrent_with_shutdown`].
+/// Yields `(call_idx, Result<Value>)` items in completion order
+/// until either every call finishes or `shutdown` fires. On
+/// shutdown the producer aborts in-flight tool calls and drops
+/// the channel — the consumer's stream ends cleanly.
+///
+/// Same producer-side / consumer-side distinction as iter 233:
+///
+/// - **Drop**: consumer-side end-of-interest (existing behavior of
+///   [`tool_dispatch_concurrent_stream`]).
+/// - **Shutdown**: producer-side / orchestrator end-of-interest.
+///   One central signal stops every parallel tool-dispatch stream
+///   without each consumer needing to drop its receiver.
+///
+/// Real prod use: a Plan-and-Execute orchestrator running a fan
+/// of tool calls per plan step — Ctrl+C fires the shared
+/// `ShutdownSignal`, every dispatch stream ends cleanly so the
+/// orchestrator's accumulated tool-result state stays consistent
+/// with what's actually been executed (no half-applied side
+/// effects from aborted-mid-call tools that the agent would
+/// otherwise think completed).
+///
+/// Pre-fired signal returns an empty stream (no work spawned).
+/// `max_concurrency = 0` normalised to 1. Unknown tool names
+/// produce per-call `Err` items the same way as the bare
+/// streaming variant.
+///
+/// Composition: combines iter 213
+/// (`tool_dispatch_concurrent_stream`) + iter 225
+/// (`ShutdownSignal`). Mirror of iters 233/234/235 on the tool
+/// axis — fourth of six stream axes bridged.
+pub fn tool_dispatch_concurrent_stream_with_shutdown(
+    tools: HashMap<String, Arc<dyn Tool>>,
+    calls: Vec<(String, Value)>,
+    max_concurrency: usize,
+    shutdown: ShutdownSignal,
+) -> Pin<Box<dyn Stream<Item = ToolDispatchStreamItem> + Send>> {
+    if calls.is_empty() || shutdown.is_signaled() {
+        return Box::pin(futures::stream::empty());
+    }
+    let cap = max_concurrency.max(1);
+    let n = calls.len();
+    let buf = n.min(cap.max(8));
+    let (tx, rx) = mpsc::channel::<ToolDispatchStreamItem>(buf);
+    let tools = Arc::new(tools);
+
+    tokio::spawn(async move {
+        let sem = Arc::new(Semaphore::new(cap));
+        let mut set: JoinSet<ToolDispatchStreamItem> = JoinSet::new();
+        for (idx, (name, args)) in calls.into_iter().enumerate() {
+            let sem = sem.clone();
+            let tools = tools.clone();
+            set.spawn(async move {
+                let _permit = match sem.acquire_owned().await {
+                    Ok(p) => p,
+                    Err(_) => {
+                        return (
+                            idx,
+                            Err(Error::other("tool dispatch semaphore closed")),
+                        )
+                    }
+                };
+                let r = match tools.get(&name) {
+                    Some(tool) => tool.run(args).await,
+                    None => Err(Error::other(format!("unknown tool `{name}`"))),
+                };
+                (idx, r)
+            });
+        }
+        loop {
+            tokio::select! {
+                joined = set.join_next() => {
+                    let item = match joined {
+                        Some(Ok(it)) => it,
+                        Some(Err(e)) => (
+                            usize::MAX,
+                            Err(Error::other(format!("tool task join: {e}"))),
+                        ),
+                        None => break,
+                    };
+                    if tx.send(item).await.is_err() {
+                        set.abort_all();
+                        break;
+                    }
+                }
+                _ = shutdown.wait() => {
+                    set.abort_all();
+                    break;
+                }
+            }
+        }
+    });
+
+    Box::pin(ReceiverStream::new(rx))
+}
+
 /// Combined streaming + progress-watcher variant. Yields the same
 /// `(call_idx, Result)` items as
 /// [`tool_dispatch_concurrent_stream`] AND updates the supplied
@@ -1033,5 +1129,68 @@ mod tests {
             tool_dispatch_concurrent_with_progress(tools, vec![], 4, progress).await;
         assert!(out.is_empty());
         assert_eq!(obs.snapshot(), ToolDispatchProgress::default());
+    }
+
+    // ---- tool_dispatch_concurrent_stream_with_shutdown tests ---------
+
+    #[tokio::test]
+    async fn stream_shutdown_no_signal_emits_full_set() {
+        let (tools, _peak) = build_registry(&["a"], 0);
+        let calls: Vec<_> = (0..6).map(|i| ("a".into(), json!({"i": i}))).collect();
+        let shutdown = ShutdownSignal::new();
+        let mut s = tool_dispatch_concurrent_stream_with_shutdown(tools, calls, 4, shutdown);
+        let mut count = 0;
+        while let Some((_idx, r)) = s.next().await {
+            assert!(r.is_ok());
+            count += 1;
+        }
+        assert_eq!(count, 6);
+    }
+
+    #[tokio::test]
+    async fn stream_shutdown_pre_fired_yields_empty_stream() {
+        let (tools, _peak) = build_registry(&["a"], 0);
+        let calls: Vec<_> = (0..4).map(|i| ("a".into(), json!({"i": i}))).collect();
+        let shutdown = ShutdownSignal::new();
+        shutdown.signal();
+        let mut s = tool_dispatch_concurrent_stream_with_shutdown(tools, calls, 4, shutdown);
+        assert!(s.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn stream_shutdown_mid_run_emits_prefix_then_ends() {
+        // 30 calls × 50ms × cap=2 ≈ 750ms sequential. Fire signal at
+        // 80ms; consumer should see a prefix and the stream ends well
+        // before the natural duration.
+        let (tools, _peak) = build_registry(&["a"], 50);
+        let calls: Vec<_> = (0..30).map(|i| ("a".into(), json!({"i": i}))).collect();
+        let shutdown = ShutdownSignal::new();
+        let s2 = shutdown.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+            s2.signal();
+        });
+        let started = std::time::Instant::now();
+        let mut s = tool_dispatch_concurrent_stream_with_shutdown(tools, calls, 2, shutdown);
+        let mut count = 0;
+        while let Some((_idx, r)) = s.next().await {
+            assert!(r.is_ok());
+            count += 1;
+        }
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_millis(400),
+            "elapsed {elapsed:?} — shutdown didn't terminate stream early",
+        );
+        assert!(count >= 1, "no items reached the consumer before shutdown");
+        assert!(count < 30, "stream emitted full set despite shutdown");
+    }
+
+    #[tokio::test]
+    async fn stream_shutdown_empty_calls_yields_empty() {
+        let (tools, _peak) = build_registry(&["a"], 0);
+        let shutdown = ShutdownSignal::new();
+        let mut s = tool_dispatch_concurrent_stream_with_shutdown(tools, vec![], 4, shutdown);
+        assert!(s.next().await.is_none());
     }
 }
