@@ -127,6 +127,31 @@ impl SemanticStore {
         self.inner.delete(namespace, key).await
     }
 
+    /// Bulk-delete N keys in one call. Pair to [`bulk_put`] from
+    /// iter 222; closes the LangGraph `BaseStore::mdelete` parity
+    /// gap. Real prod use: per-tenant namespace cleanup, retention
+    /// sweeps that drop stale memories on a TTL boundary.
+    ///
+    /// Output aligned 1:1 with `keys`: `Ok(true)` if the key was
+    /// present and removed, `Ok(false)` if it didn't exist,
+    /// `Err(_)` if the underlying store choked on that specific
+    /// key. A whole-store error (e.g. lock poison) returns the
+    /// outer `Err` and aborts the rest.
+    pub async fn bulk_delete(
+        &self,
+        namespace: &Namespace,
+        keys: Vec<String>,
+    ) -> Result<Vec<Result<bool>>> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut results = Vec::with_capacity(keys.len());
+        for key in keys {
+            results.push(self.inner.delete(namespace, &key).await);
+        }
+        Ok(results)
+    }
+
     /// Bulk-insert N items in one call. Embedding work is dispatched
     /// in concurrent chunks via [`embed_documents_concurrent`] (iter
     /// 183) — far cheaper than calling `put` N times serially since
@@ -509,6 +534,81 @@ mod tests {
         let hits = s.semantic_search(&ns, "rust performance", 3, None).await.unwrap();
         assert_eq!(hits.len(), 3);
         assert_eq!(hits[0].key, "a");
+    }
+
+    // ---- bulk_delete tests --------------------------------------------
+
+    #[tokio::test]
+    async fn bulk_delete_removes_existing_and_reports_missing() {
+        let s = fixture();
+        let ns = vec!["bd".to_string()];
+        let items = vec![
+            ("a".to_string(), "rust".to_string(), json!(0)),
+            ("b".to_string(), "memory".to_string(), json!(1)),
+            ("c".to_string(), "javascript".to_string(), json!(2)),
+        ];
+        s.bulk_put(&ns, items, None, 8, 4).await.unwrap();
+        // Delete 4 keys — one missing in the middle.
+        let r = s
+            .bulk_delete(&ns, vec!["a".into(), "missing".into(), "c".into()])
+            .await
+            .unwrap();
+        assert_eq!(r.len(), 3);
+        assert_eq!(r[0].as_ref().unwrap(), &true); // existed
+        assert_eq!(r[1].as_ref().unwrap(), &false); // missing
+        assert_eq!(r[2].as_ref().unwrap(), &true); // existed
+        // Surviving key still present.
+        assert!(s.get(&ns, "b").await.unwrap().is_some());
+        assert!(s.get(&ns, "a").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn bulk_delete_empty_returns_empty() {
+        let s = fixture();
+        let ns = vec!["bd_empty".to_string()];
+        let r = s.bulk_delete(&ns, vec![]).await.unwrap();
+        assert!(r.is_empty());
+    }
+
+    #[tokio::test]
+    async fn bulk_delete_results_aligned_to_input_order() {
+        let s = fixture();
+        let ns = vec!["bd_align".to_string()];
+        let items = (0..6)
+            .map(|i| (format!("k{i}"), format!("t{i}"), json!(i)))
+            .collect();
+        s.bulk_put(&ns, items, None, 4, 2).await.unwrap();
+        // Delete in scrambled order; expect aligned `true` for each.
+        let keys: Vec<String> = vec![
+            "k3".into(),
+            "missing".into(),
+            "k0".into(),
+            "k5".into(),
+            "k1".into(),
+        ];
+        let r = s.bulk_delete(&ns, keys).await.unwrap();
+        let bools: Vec<bool> =
+            r.into_iter().map(|x| x.unwrap()).collect();
+        assert_eq!(bools, vec![true, false, true, true, true]);
+    }
+
+    #[tokio::test]
+    async fn bulk_delete_then_search_skips_removed_keys() {
+        let s = fixture();
+        let ns = vec!["bd_search".to_string()];
+        let items = vec![
+            ("a".to_string(), "rust".to_string(), json!("a-val")),
+            ("b".to_string(), "rust".to_string(), json!("b-val")),
+            ("c".to_string(), "rust".to_string(), json!("c-val")),
+        ];
+        s.bulk_put(&ns, items, None, 8, 4).await.unwrap();
+        // Drop two of three.
+        s.bulk_delete(&ns, vec!["a".into(), "b".into()])
+            .await
+            .unwrap();
+        let hits = s.semantic_search(&ns, "rust", 5, None).await.unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].key, "c");
     }
 
     #[tokio::test]

@@ -238,6 +238,7 @@ patterns").
 | `rerank_concurrent_stream_with_progress` (iter 220) | Composes iter 209 + iter 214 | Combined consumer shape extended to the rerank axis. Five of six axes now ship the full four-quadrant matrix |
 | `load_concurrent_with_progress` + `load_concurrent_stream_with_progress` (iter 221) | Closes the loader axis | Two functions in one iter — the loader axis was missing the progress-aware variant since iter 187, so this iter retroactively ships it AND the combined stream-with-progress sibling. The four-quadrant consumer matrix now closes across all six parallel-batch axes |
 | `SemanticStore::bulk_put` (iter 222) | Composes iter 185 + iter 183 | Single-call bulk indexer over `SemanticStore`. Internally embeds the whole batch via `embed_documents_concurrent` (chunk-and-fan-out under Semaphore) and writes results to the underlying `Store` one at a time — far cheaper than calling `put` N times serially. Closes LangGraph's `BaseStore::mset` parity gap |
+| `SemanticStore::bulk_delete` (iter 223) | Pair to bulk_put | Aligned `Vec<Result<bool>>` over `Store::delete`. Per-tenant namespace cleanup, retention sweeps, TTL boundary drops. Closes LangGraph's `BaseStore::mdelete` parity gap |
 
 ---
 
