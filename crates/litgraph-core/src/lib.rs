@@ -112,7 +112,8 @@ pub use shutdown::{until_shutdown, ShutdownSignal};
 pub use tool_dispatch::{
     tool_dispatch_concurrent, tool_dispatch_concurrent_fail_fast,
     tool_dispatch_concurrent_stream, tool_dispatch_concurrent_stream_with_progress,
-    tool_dispatch_concurrent_with_progress, ToolDispatchProgress, ToolDispatchStreamItem,
+    tool_dispatch_concurrent_with_progress, tool_dispatch_concurrent_with_shutdown,
+    ToolDispatchProgress, ToolDispatchStreamItem,
 };
 pub use table_parser::{
     format_instructions as table_format_instructions, parse_table_csv, parse_table_json,

@@ -50,7 +50,7 @@ use tokio::task::JoinSet;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::tool::Tool;
-use crate::{Error, Progress, Result};
+use crate::{Error, Progress, Result, ShutdownSignal};
 
 /// Run `tools[name].run(args)` for every `(name, args)` in `calls`,
 /// capped at `max_concurrency` in flight. Output is aligned 1:1 with
@@ -378,6 +378,91 @@ pub fn tool_dispatch_concurrent_stream_with_progress(
     Box::pin(ReceiverStream::new(rx))
 }
 
+/// `tool_dispatch_concurrent` plus graceful cancellation via
+/// [`ShutdownSignal`]. Output aligned 1:1 with `calls`:
+///
+/// - `Ok(value)` — tool ran to completion before shutdown.
+/// - `Err(tool error / unknown tool)` — completed with the
+///   tool's own failure or an unknown-tool routing error.
+/// - `Err("cancelled by shutdown")` — call was still in flight
+///   when shutdown fired.
+///
+/// Mechanical extension of the bridge pattern from iters 227-229
+/// to the heterogeneous tool dispatch axis. Real prod use: a
+/// Plan-and-Execute orchestrator with dozens of long-running
+/// tools (DB queries, web fetches, shell commands) banks completed
+/// tool results on cancel so the agent's context stays consistent
+/// with what's actually been done.
+pub async fn tool_dispatch_concurrent_with_shutdown(
+    tools: HashMap<String, Arc<dyn Tool>>,
+    calls: Vec<(String, Value)>,
+    max_concurrency: usize,
+    shutdown: &ShutdownSignal,
+) -> Vec<Result<Value>> {
+    if calls.is_empty() {
+        return Vec::new();
+    }
+    if shutdown.is_signaled() {
+        return (0..calls.len())
+            .map(|_| Err(Error::other("cancelled by shutdown")))
+            .collect();
+    }
+
+    let cap = max_concurrency.max(1);
+    let sem = Arc::new(Semaphore::new(cap));
+    let tools = Arc::new(tools);
+    let mut set: JoinSet<(usize, Result<Value>)> = JoinSet::new();
+
+    for (idx, (name, args)) in calls.into_iter().enumerate() {
+        let sem = sem.clone();
+        let tools = tools.clone();
+        set.spawn(async move {
+            let _permit = match sem.acquire_owned().await {
+                Ok(p) => p,
+                Err(_) => {
+                    return (
+                        idx,
+                        Err(Error::other("tool dispatch semaphore closed")),
+                    )
+                }
+            };
+            let r = match tools.get(&name) {
+                Some(tool) => tool.run(args).await,
+                None => Err(Error::other(format!("unknown tool `{name}`"))),
+            };
+            (idx, r)
+        });
+    }
+
+    let n = set.len();
+    let mut results: Vec<Option<Result<Value>>> = (0..n).map(|_| None).collect();
+
+    loop {
+        tokio::select! {
+            joined = set.join_next() => {
+                match joined {
+                    Some(Ok((idx, r))) => results[idx] = Some(r),
+                    Some(Err(e)) => {
+                        if let Some(slot) = results.iter_mut().find(|s| s.is_none()) {
+                            *slot = Some(Err(Error::other(format!("tool task join: {e}"))));
+                        }
+                    }
+                    None => break,
+                }
+            }
+            _ = shutdown.wait() => {
+                set.abort_all();
+                break;
+            }
+        }
+    }
+
+    results
+        .into_iter()
+        .map(|s| s.unwrap_or_else(|| Err(Error::other("cancelled by shutdown"))))
+        .collect()
+}
+
 /// Like `tool_dispatch_concurrent` but fail-fast: returns `Err` on
 /// the first failed call. Output aligned to inputs only on success.
 pub async fn tool_dispatch_concurrent_fail_fast(
@@ -591,6 +676,88 @@ mod tests {
             .map(|r| r.as_ref().unwrap()["tool"].as_str().unwrap().into())
             .collect();
         assert_eq!(names, vec!["alpha", "beta", "gamma", "alpha"]);
+    }
+
+    // ---- tool_dispatch_concurrent_with_shutdown tests -----------------
+
+    #[tokio::test]
+    async fn shutdown_no_signal_completes_normally() {
+        let (tools, _peak) = build_registry(&["a", "b"], 0);
+        let calls: Vec<_> = vec![
+            ("a".into(), json!({"i": 0})),
+            ("b".into(), json!({"i": 1})),
+            ("a".into(), json!({"i": 2})),
+        ];
+        let shutdown = ShutdownSignal::new();
+        let out =
+            tool_dispatch_concurrent_with_shutdown(tools, calls, 4, &shutdown).await;
+        assert_eq!(out.len(), 3);
+        assert!(out.iter().all(|r| r.is_ok()));
+    }
+
+    #[tokio::test]
+    async fn shutdown_pre_fired_returns_all_cancelled() {
+        let (tools, _peak) = build_registry(&["a"], 0);
+        let calls: Vec<_> = (0..4)
+            .map(|i| ("a".into(), json!({"i": i})))
+            .collect();
+        let shutdown = ShutdownSignal::new();
+        shutdown.signal();
+        let out =
+            tool_dispatch_concurrent_with_shutdown(tools, calls, 4, &shutdown).await;
+        assert_eq!(out.len(), 4);
+        for r in &out {
+            assert!(r
+                .as_ref()
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("cancelled by shutdown"));
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_mid_run_preserves_completed_calls() {
+        let (tools, _peak) = build_registry(&["a"], 50);
+        let calls: Vec<_> = (0..20)
+            .map(|i| ("a".into(), json!({"i": i})))
+            .collect();
+        let shutdown = ShutdownSignal::new();
+        let s2 = shutdown.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+            s2.signal();
+        });
+        let started = std::time::Instant::now();
+        let out =
+            tool_dispatch_concurrent_with_shutdown(tools, calls, 2, &shutdown).await;
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_millis(300),
+            "elapsed {elapsed:?} — shutdown didn't abort early",
+        );
+        assert_eq!(out.len(), 20);
+        let ok = out.iter().filter(|r| r.is_ok()).count();
+        let cancelled = out
+            .iter()
+            .filter(|r| {
+                r.as_ref()
+                    .err()
+                    .map(|e| e.to_string().contains("cancelled by shutdown"))
+                    .unwrap_or(false)
+            })
+            .count();
+        assert!(ok >= 1);
+        assert!(cancelled >= 1);
+    }
+
+    #[tokio::test]
+    async fn shutdown_empty_calls_returns_empty() {
+        let (tools, _peak) = build_registry(&["a"], 0);
+        let shutdown = ShutdownSignal::new();
+        let out = tool_dispatch_concurrent_with_shutdown(tools, vec![], 4, &shutdown)
+            .await;
+        assert!(out.is_empty());
     }
 
     // ---- tool_dispatch_concurrent_with_progress tests ------------------

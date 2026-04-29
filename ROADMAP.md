@@ -245,6 +245,7 @@ patterns").
 | `batch_concurrent_with_shutdown` (iter 227) | Composes iter 182 + iter 225 | First parallel-batch ↔ coordination bridge. Distinct from wrapping `batch_concurrent` in `until_shutdown` (which discards everything if shutdown wins): preserves PARTIAL progress. Long eval batch finishes 60% before Ctrl+C → those 60% bank as `Ok`, remaining slots become `Err("cancelled by shutdown")`. Mechanical extension to the other 5 batch axes available |
 | `embed_documents_concurrent_with_shutdown` (iter 228) | Composes iter 183 + iter 225 | Partial-progress preservation extended to the embeddings axis. Per-chunk granularity — bulk-indexer can flush only the `Ok` slots into a partial-but-valid embedding result on shutdown |
 | `retrieve_concurrent_with_shutdown` (iter 229) | Composes iter 190 + iter 225 | Partial-progress preservation extended to the retriever axis. Three of six axes (chat / embed / retrieve) now bridge to the coordination primitives; tool / rerank / loader remain |
+| `tool_dispatch_concurrent_with_shutdown` (iter 230) | Composes iter 191 + iter 225 | Partial-progress preservation extended to the heterogeneous tool axis. Four of six axes now bridge to coordination; rerank and loader remain. Real prod use: a Plan-and-Execute orchestrator with long-running tools banks completed tool results on cancel so agent context stays consistent |
 
 ---
 
