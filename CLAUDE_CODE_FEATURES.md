@@ -178,7 +178,7 @@ long-term Store. Older (v0.3) features rolled in from prior audit.
 | `summarize_conversation` helper | One-shot summary | ✅ |
 | SQLite chat history | Single-host durable | ✅ |
 | Postgres chat history | Distributed durable | ✅ |
-| Redis chat history | Hot ephemeral | ❌ |
+| Redis chat history | Hot ephemeral | ✅ `litgraph-memory-redis::RedisChatHistory` — LIST per session + STRING pin + sessions SET; per-session TTL with `with_ttl`/`set_ttl`; auto-reconnect via `ConnectionManager`; symmetric API to `PostgresChatHistory` / `SqliteChatHistory` |
 | Entity memory / KG memory | Deprecated in LC | 🚫 |
 
 ## 11. RAG — Retrieval
@@ -454,7 +454,7 @@ Top gaps to close, ranked by user-impact for a no-code-glue path:
 9. ❌ **LangServe-style HTTP serve crate** — `litgraph serve graph.py` → REST + SSE one command.
 10. ✅ **Graph visualizer (Mermaid)** — `to_mermaid()` + `to_ascii()` on StateGraph + CompiledGraph (8 Rust + 9 Py tests). PNG render still pending (out-of-process via `mmdc` or `kroki`).
 11. ✅ **Eval coverage** — trajectory evaluator, `PairwiseEvaluator`, and `synthesize_eval_cases` shipped. Eval suite covers golden-set runs, trajectory grading, A/B judging, and seed-based dataset synthesis.
-12. ❌ **Redis chat history · Discord/YouTube/arXiv loaders** — long-tail integrations.
+12. 🟡 **Discord/YouTube/arXiv loaders** — long-tail integrations. (Redis chat history shipped iter 164.)
 
 ## Quick prod-ready agent recipe (uv, no venv)
 
