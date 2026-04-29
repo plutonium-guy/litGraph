@@ -243,6 +243,7 @@ patterns").
 | `ShutdownSignal` (iter 225) | `tokio::sync::Notify` + AtomicBool fired flag | Fifth distinct channel shape: N-waiter EDGE signal. Single `signal()` wakes every current and future waiter (idempotent); late `wait()` resolves instantly via the flag fast-path so no Notify-replay quirk. Channel-shape table now: mpsc / broadcast / watch / oneshot / Notify-edge |
 | `until_shutdown` (iter 226) | `tokio::select!` over fut + ShutdownSignal::wait | Composable future combinator: `until_shutdown(model.invoke(...), &shutdown).await` returns `Some(T)` if the future completed, `None` if shutdown won. Inner future is dropped on shutdown so HTTP / DB / sleep resources are released promptly — no orphan in-flight work. Fast-path `is_signaled()` check skips polling the inner entirely if signal already fired |
 | `batch_concurrent_with_shutdown` (iter 227) | Composes iter 182 + iter 225 | First parallel-batch ↔ coordination bridge. Distinct from wrapping `batch_concurrent` in `until_shutdown` (which discards everything if shutdown wins): preserves PARTIAL progress. Long eval batch finishes 60% before Ctrl+C → those 60% bank as `Ok`, remaining slots become `Err("cancelled by shutdown")`. Mechanical extension to the other 5 batch axes available |
+| `embed_documents_concurrent_with_shutdown` (iter 228) | Composes iter 183 + iter 225 | Partial-progress preservation extended to the embeddings axis. Per-chunk granularity — bulk-indexer can flush only the `Ok` slots into a partial-but-valid embedding result on shutdown |
 
 ---
 

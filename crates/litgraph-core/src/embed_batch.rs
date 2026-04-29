@@ -44,7 +44,7 @@ use tokio::sync::{mpsc, Semaphore};
 use tokio::task::JoinSet;
 use tokio_stream::wrappers::ReceiverStream;
 
-use crate::{Embeddings, Error, Progress, Result};
+use crate::{Embeddings, Error, Progress, Result, ShutdownSignal};
 
 /// Default chunk size — sized for OpenAI's per-request input cap with
 /// generous headroom. Override per-call if your provider is stricter
@@ -116,6 +116,94 @@ pub async fn embed_documents_concurrent(
         )));
     }
     Ok(out)
+}
+
+/// `embed_documents_concurrent` plus graceful cancellation via
+/// [`ShutdownSignal`]. Output is per-chunk: `Vec<Result<Vec<Vec<f32>>>>`
+/// aligned with the chunked input.
+///
+/// - `Ok(embeddings)` — chunk completed successfully before shutdown.
+/// - `Err(provider error)` — chunk completed with the provider's failure.
+/// - `Err("cancelled by shutdown")` — chunk was still in flight when
+///   shutdown fired.
+///
+/// Distinct from wrapping `embed_documents_concurrent` in
+/// `until_shutdown` (which would discard everything on shutdown):
+/// **partial progress preserved**. A long bulk-indexing run that
+/// embedded 60% of its chunks before Ctrl+C banks those 60% as
+/// `Ok` so they can be flushed to the vector store before exit.
+///
+/// Composition: extends iter 227's bridge pattern from the chat
+/// axis to the embeddings axis. Note the per-chunk granularity —
+/// caller can flatten only the `Ok` slots into a partial-but-valid
+/// embedding result.
+///
+/// `chunk_size = 0` is normalised to one chunk; `max_concurrency = 0`
+/// to 1 (sequential).
+pub async fn embed_documents_concurrent_with_shutdown(
+    embedder: Arc<dyn Embeddings>,
+    texts: &[String],
+    chunk_size: usize,
+    max_concurrency: usize,
+    shutdown: &ShutdownSignal,
+) -> Vec<Result<Vec<Vec<f32>>>> {
+    if texts.is_empty() {
+        return Vec::new();
+    }
+    let cap = max_concurrency.max(1);
+    let chunk = if chunk_size == 0 { texts.len() } else { chunk_size };
+    let n_chunks = texts.chunks(chunk).count();
+
+    if shutdown.is_signaled() {
+        return (0..n_chunks)
+            .map(|_| Err(Error::other("cancelled by shutdown")))
+            .collect();
+    }
+
+    let sem = Arc::new(Semaphore::new(cap));
+    let mut set: JoinSet<(usize, Result<Vec<Vec<f32>>>)> = JoinSet::new();
+
+    for (idx, slice) in texts.chunks(chunk).enumerate() {
+        let sem = sem.clone();
+        let embedder = embedder.clone();
+        let owned: Vec<String> = slice.to_vec();
+        set.spawn(async move {
+            let _permit = match sem.acquire_owned().await {
+                Ok(p) => p,
+                Err(_) => return (idx, Err(Error::other("embed semaphore closed"))),
+            };
+            let r = embedder.embed_documents(&owned).await;
+            (idx, r)
+        });
+    }
+
+    let mut results: Vec<Option<Result<Vec<Vec<f32>>>>> =
+        (0..n_chunks).map(|_| None).collect();
+
+    loop {
+        tokio::select! {
+            joined = set.join_next() => {
+                match joined {
+                    Some(Ok((idx, r))) => results[idx] = Some(r),
+                    Some(Err(e)) => {
+                        if let Some(slot) = results.iter_mut().find(|s| s.is_none()) {
+                            *slot = Some(Err(Error::other(format!("embed task join: {e}"))));
+                        }
+                    }
+                    None => break,
+                }
+            }
+            _ = shutdown.wait() => {
+                set.abort_all();
+                break;
+            }
+        }
+    }
+
+    results
+        .into_iter()
+        .map(|s| s.unwrap_or_else(|| Err(Error::other("cancelled by shutdown"))))
+        .collect()
 }
 
 /// One emitted result from [`embed_documents_concurrent_stream`] —
@@ -588,6 +676,83 @@ mod tests {
         embed_documents_concurrent(e, &texts, 1000, 4).await.unwrap();
         let sizes = seen.lock().unwrap().clone();
         assert_eq!(sizes, vec![3]);
+    }
+
+    // ---- embed_documents_concurrent_with_shutdown tests ---------------
+
+    #[tokio::test]
+    async fn shutdown_no_signal_completes_normally() {
+        let (e, _peak, _seen) = probe(0);
+        let texts = ts(11);
+        let shutdown = ShutdownSignal::new();
+        let out = embed_documents_concurrent_with_shutdown(e, &texts, 4, 4, &shutdown)
+            .await;
+        assert_eq!(out.len(), 3);
+        assert!(out.iter().all(|r| r.is_ok()));
+    }
+
+    #[tokio::test]
+    async fn shutdown_pre_fired_returns_all_cancelled() {
+        let (e, _peak, _seen) = probe(0);
+        let texts = ts(10); // chunk_size=4 → 3 chunks
+        let shutdown = ShutdownSignal::new();
+        shutdown.signal();
+        let out = embed_documents_concurrent_with_shutdown(e, &texts, 4, 4, &shutdown)
+            .await;
+        assert_eq!(out.len(), 3);
+        for r in &out {
+            assert!(r
+                .as_ref()
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("cancelled by shutdown"));
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_mid_run_preserves_completed_chunks() {
+        // 30 texts, chunk_size=2 → 15 chunks. delay_ms=30, cap=2 →
+        // sequential ~225ms. Fire shutdown after 80ms; some chunks
+        // complete, rest are cancelled.
+        let (e, _peak, _seen) = probe(30);
+        let texts = ts(30);
+        let shutdown = ShutdownSignal::new();
+        let s2 = shutdown.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+            s2.signal();
+        });
+        let started = std::time::Instant::now();
+        let out = embed_documents_concurrent_with_shutdown(e, &texts, 2, 2, &shutdown)
+            .await;
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_millis(250),
+            "elapsed {elapsed:?} — shutdown didn't abort early",
+        );
+        assert_eq!(out.len(), 15);
+        let ok_count = out.iter().filter(|r| r.is_ok()).count();
+        let cancelled = out
+            .iter()
+            .filter(|r| {
+                r.as_ref()
+                    .err()
+                    .map(|e| e.to_string().contains("cancelled by shutdown"))
+                    .unwrap_or(false)
+            })
+            .count();
+        assert!(ok_count >= 1, "expected at least one chunk to complete");
+        assert!(cancelled >= 1, "expected at least one chunk cancelled");
+    }
+
+    #[tokio::test]
+    async fn shutdown_empty_texts_returns_empty() {
+        let (e, _peak, _seen) = probe(0);
+        let shutdown = ShutdownSignal::new();
+        let out =
+            embed_documents_concurrent_with_shutdown(e, &[], 4, 4, &shutdown).await;
+        assert!(out.is_empty());
     }
 
     // ---- embed_documents_concurrent_with_progress tests ----------------
