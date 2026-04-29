@@ -13,6 +13,7 @@ use litgraph_tools_search::{
     BraveSearch, BraveSearchConfig, DuckDuckGoConfig, DuckDuckGoSearch, TavilyConfig, TavilyExtract,
     TavilySearch,
 };
+use litgraph_agents::SubagentTool;
 use litgraph_tools_utils::{
     CachedTool, CalculatorTool, DalleConfig, DalleImageTool, FsRoot, GmailSendConfig, GmailSendTool,
     HttpRequestConfig, HttpRequestTool, ListDirectoryTool, PlanningTool, PythonReplConfig,
@@ -51,6 +52,7 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyRetryTool>()?;
     m.add_class::<PyPlanningTool>()?;
     m.add_class::<PyVirtualFilesystemTool>()?;
+    m.add_class::<PySubagentTool>()?;
     m.add_function(pyo3::wrap_pyfunction!(tool, m)?)?;
     Ok(())
 }
@@ -129,6 +131,9 @@ pub(crate) fn extract_tool_arc(bound: &Bound<'_, PyAny>) -> PyResult<Arc<dyn Too
         return Ok(t.as_tool());
     }
     if let Ok(t) = bound.extract::<PyRef<PyVirtualFilesystemTool>>() {
+        return Ok(t.as_tool());
+    }
+    if let Ok(t) = bound.extract::<PyRef<PySubagentTool>>() {
         return Ok(t.as_tool());
     }
     Err(pyo3::exceptions::PyValueError::new_err(
@@ -1338,5 +1343,39 @@ impl PyVirtualFilesystemTool {
 }
 
 impl PyVirtualFilesystemTool {
+    pub(crate) fn as_tool(&self) -> Arc<dyn Tool> { self.inner.clone() as Arc<dyn Tool> }
+}
+
+/// Wrap a `ReactAgent` as a tool so a parent agent can spawn it dynamically.
+/// Each parent invocation runs the inner agent in a fresh, isolated context —
+/// the parent's prompt budget is unaffected by the subagent's intermediate
+/// steps. Mirrors the LangChain `deepagents` `task` primitive.
+///
+/// The first argument is the tool name the parent uses to invoke this
+/// subagent (pick something specific like `"research_agent"`); the second is
+/// the description the parent reads to decide *when* to delegate.
+#[pyclass(name = "SubagentTool", module = "litgraph.tools")]
+#[derive(Clone)]
+pub struct PySubagentTool { pub(crate) inner: Arc<SubagentTool> }
+
+#[pymethods]
+impl PySubagentTool {
+    #[new]
+    fn new(
+        name: String,
+        description: String,
+        agent: PyRef<'_, crate::agents::PyReactAgent>,
+    ) -> Self {
+        let st = SubagentTool::from_agent(name, description, agent.inner.clone());
+        Self { inner: Arc::new(st) }
+    }
+
+    #[getter] fn name(&self) -> String { self.inner.schema().name }
+    fn __repr__(&self) -> String {
+        format!("SubagentTool(name={:?})", self.inner.schema().name)
+    }
+}
+
+impl PySubagentTool {
     pub(crate) fn as_tool(&self) -> Arc<dyn Tool> { self.inner.clone() as Arc<dyn Tool> }
 }

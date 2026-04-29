@@ -121,6 +121,7 @@ long-term Store. Older (v0.3) features rolled in from prior audit.
 | Plan-and-Execute | Two-phase reasoning | ✅ `PlanAndExecuteAgent` |
 | Supervisor multi-agent | Router over specialists | ✅ `SupervisorAgent` |
 | Swarm/handoff (`Command(goto=)`) | Agent-to-agent jump | ✅ Command primitive |
+| Dynamic subagent spawn (tool-style) | Delegate w/ isolated context | ✅ `SubagentTool` |
 | Parallel ReAct tool calls | Speed | ✅ |
 | Recursion / max-step guard | Avoid infinite loops | ✅ |
 | Agent event stream | UI progress | ✅ `AgentEventStream` |
@@ -365,7 +366,7 @@ skills directory, prompt-caching middleware.
 |---|---|---|
 | Planning tool (todo write/read) | Agent self-organizes long tasks | ✅ `litgraph.tools.PlanningTool` (list/add/set_status/update/clear; status: pending/in_progress/done/cancelled) |
 | Virtual filesystem backend | Sandboxed scratch space across turns | ✅ `litgraph.tools.VirtualFilesystemTool` (read/write/append/list/delete/exists; size cap; `..` rejected) |
-| Subagent spawn primitive | Delegate to scoped sub-agent | 🟡 `SupervisorAgent` covers static fan-out, no dynamic spawn |
+| Subagent spawn primitive | Delegate to scoped sub-agent | ✅ `litgraph.tools.SubagentTool(name, desc, react_agent)` — parent gets a tool that runs the inner ReactAgent in isolated context per call |
 | AGENTS.md / memory files loader | Persistent system-prompt context | ✅ `litgraph.prompts.load_agents_md(path)` |
 | Skills directory loader | Domain-specific prompt packs | ✅ `litgraph.prompts.load_skills_dir(dir)` (YAML frontmatter for `name`/`description`, sorted, hidden + non-`.md` skipped) |
 | `SystemPromptBuilder` | Assemble base + AGENTS.md + skills into system prompt | ✅ `litgraph.prompts.SystemPromptBuilder` |
@@ -443,7 +444,7 @@ Top gaps to close, ranked by user-impact for a no-code-glue path:
 
 1. 🟡 **Long-term memory `Store`** — core trait + `InMemoryStore` shipped (`litgraph.store`, 17 Py tests). Postgres backend + vector-indexed semantic search on Store still pending.
 2. 🟡 **Middleware chain primitive** — `before/after_model` chain shipped (`litgraph.middleware`, 7 Py + 6 Rust tests). Built-ins: Logging, MessageWindow, SystemPrompt. `before/after_tool` hooks + tool-result offload still pending.
-3. 🟡 **Deep Agents harness** — `PlanningTool` + `VirtualFilesystemTool` + `load_agents_md` + `load_skills_dir` + `SystemPromptBuilder` all shipped (37 Rust + 25 Py tests across the four). Dynamic subagent spawn primitive still pending.
+3. ✅ **Deep Agents harness** — `PlanningTool` + `VirtualFilesystemTool` + `load_agents_md` + `load_skills_dir` + `SystemPromptBuilder` + `SubagentTool` all shipped (43 Rust + 29 Py tests across the six). Harness-level package (one-call `create_deep_agent`) still pending but all primitives are in place.
 4. ❌ **Functional API** (`@entrypoint` + `@task`) — Python decorator alternative to graph DSL. Trims LOC for simple workflows.
 5. ❌ **Pydantic-coerced state in Python** — type-safe stream chunks, IDE-narrow types. (Rust side already typed.)
 6. ❌ **`pyo3-stub-gen` auto-stubs** — manual stubs go stale. Pyright import warnings hurt agent-authored code.

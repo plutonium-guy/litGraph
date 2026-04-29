@@ -28,7 +28,7 @@ use crate::tools::{
     PyBraveSearchTool, PyCachedTool, PyCalculatorTool, PyDalleImageTool, PyDuckDuckGoSearchTool,
     PyFunctionTool, PyHttpRequestTool, PyListDirectoryTool, PyPythonReplTool, PyReadFileTool,
     PyGmailSendTool, PyPlanningTool, PyRetryTool, PyShellTool, PySqliteQueryTool,
-    PyTavilyExtractTool, PyTavilySearchTool, PyTimeoutTool, PyTtsAudioTool,
+    PySubagentTool, PyTavilyExtractTool, PyTavilySearchTool, PyTimeoutTool, PyTtsAudioTool,
     PyVirtualFilesystemTool, PyWebFetchTool, PyWebhookTool, PyWhisperTranscribeTool,
     PyWriteFileTool,
 };
@@ -97,6 +97,8 @@ fn extract_tools(tools: &Bound<'_, PyList>) -> PyResult<Vec<Arc<dyn litgraph_cor
             tool_vec.push(p.as_tool());
         } else if let Ok(v) = item.extract::<PyRef<PyVirtualFilesystemTool>>() {
             tool_vec.push(v.as_tool());
+        } else if let Ok(s) = item.extract::<PyRef<PySubagentTool>>() {
+            tool_vec.push(s.as_tool());
         } else {
             return Err(PyValueError::new_err(
                 "tools must be FunctionTool, BraveSearchTool, TavilySearchTool, \
@@ -220,6 +222,8 @@ impl PyReactAgent {
                 tool_vec.push(p.as_tool());
             } else if let Ok(v) = item.extract::<PyRef<PyVirtualFilesystemTool>>() {
                 tool_vec.push(v.as_tool());
+            } else if let Ok(s) = item.extract::<PyRef<PySubagentTool>>() {
+                tool_vec.push(s.as_tool());
             } else {
                 return Err(PyValueError::new_err(
                     "tools must be FunctionTool, BraveSearchTool, TavilySearchTool, \
