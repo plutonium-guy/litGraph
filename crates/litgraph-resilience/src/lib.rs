@@ -2477,6 +2477,112 @@ impl Embeddings for MetricsEmbeddings {
     }
 }
 
+/// Wrap any [`litgraph_core::tool::Tool`] with auto-instrumentation
+/// against an iter-260 [`MetricsRegistry`]. Same four metrics as
+/// [`MetricsChatModel`] / [`MetricsEmbeddings`]: `<prefix>_invocations_total`,
+/// `<prefix>_errors_total`, `<prefix>_in_flight`, `<prefix>_latency_seconds`.
+///
+/// Default prefix is the tool's own name (from its schema), with
+/// disallowed characters sanitized to `_`. So a tool named `"http.get"`
+/// produces metrics under `http_get_*`. Override with `with_prefix`
+/// for explicit per-call-site labeling.
+///
+/// Metric handles are pre-resolved at construction so the hot path is
+/// pure atomic ops — same design as iter 261.
+///
+/// Per-tool metrics are especially valuable for agent debugging: agents
+/// make many tool calls per session, and knowing which tools fail /
+/// are slow / are hot is the first thing you want from a `/metrics`
+/// dashboard.
+pub struct MetricsTool {
+    pub inner: Arc<dyn litgraph_core::tool::Tool>,
+    handles: MetricsHandles,
+}
+
+impl MetricsTool {
+    pub fn new(
+        inner: Arc<dyn litgraph_core::tool::Tool>,
+        registry: &MetricsRegistry,
+    ) -> Self {
+        let prefix = sanitize_metric_prefix(&inner.name());
+        Self {
+            inner,
+            handles: resolve_handles(registry, &prefix, DEFAULT_LATENCY_BUCKETS_SECS),
+        }
+    }
+
+    pub fn with_prefix(
+        inner: Arc<dyn litgraph_core::tool::Tool>,
+        registry: &MetricsRegistry,
+        prefix: &str,
+    ) -> Self {
+        Self {
+            inner,
+            handles: resolve_handles(registry, prefix, DEFAULT_LATENCY_BUCKETS_SECS),
+        }
+    }
+
+    pub fn with_buckets(
+        inner: Arc<dyn litgraph_core::tool::Tool>,
+        registry: &MetricsRegistry,
+        prefix: &str,
+        buckets: &[f64],
+    ) -> Self {
+        Self {
+            inner,
+            handles: resolve_handles(registry, prefix, buckets),
+        }
+    }
+}
+
+#[async_trait]
+impl litgraph_core::tool::Tool for MetricsTool {
+    fn schema(&self) -> litgraph_core::tool::ToolSchema {
+        self.inner.schema()
+    }
+
+    async fn run(
+        &self,
+        args: serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        self.handles.invocations.inc();
+        self.handles.in_flight.inc();
+        let _guard = InFlightGuard {
+            gauge: self.handles.in_flight.clone(),
+        };
+        let started = std::time::Instant::now();
+        let r = self.inner.run(args).await;
+        self.handles
+            .latency
+            .observe(started.elapsed().as_secs_f64());
+        if r.is_err() {
+            self.handles.errors.inc();
+        }
+        r
+    }
+}
+
+/// Sanitize a tool name into a Prometheus-compatible metric prefix.
+/// Mirrors the rules used by `MetricsRegistry::to_prometheus` so the
+/// same allowed-character set applies. Returns "tool" if the input
+/// produces an empty result (defensive default).
+fn sanitize_metric_prefix(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for (i, c) in name.chars().enumerate() {
+        let ok = if i == 0 {
+            c.is_ascii_alphabetic() || c == '_'
+        } else {
+            c.is_ascii_alphanumeric() || c == '_' || c == ':'
+        };
+        out.push(if ok { c } else { '_' });
+    }
+    if out.is_empty() {
+        "tool".into()
+    } else {
+        out
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // KeyedSerializedChatModel — per-key step lock for stateful agents
 // ─────────────────────────────────────────────────────────────────────────────
@@ -5976,6 +6082,124 @@ mod tests {
         let me = MetricsEmbeddings::new(inner as Arc<dyn Embeddings>, &registry);
         assert_eq!(me.dimensions(), 9);
         assert_eq!(me.name(), "flaky-embed");
+    }
+
+    #[tokio::test]
+    async fn metrics_tool_records_invocations_and_errors() {
+        let registry = MetricsRegistry::new();
+        let inner = Arc::new(EchoTool {
+            seen: AtomicU32::new(0),
+        });
+        let mt = MetricsTool::new(
+            inner as Arc<dyn litgraph_core::tool::Tool>,
+            &registry,
+        );
+        // Tool name is "echo" → prefix sanitizes to "echo".
+        for _ in 0..3 {
+            mt.run(serde_json::json!({"x": 1})).await.unwrap();
+        }
+        assert_eq!(registry.counter("echo_invocations_total").get(), 3);
+        assert_eq!(registry.counter("echo_errors_total").get(), 0);
+        assert_eq!(registry.gauge("echo_in_flight").get(), 0);
+        assert_eq!(
+            registry
+                .histogram("echo_latency_seconds", DEFAULT_LATENCY_BUCKETS_SECS)
+                .count(),
+            3,
+        );
+    }
+
+    /// Always-fails tool to verify error counter and in_flight RAII guard.
+    struct AlwaysFailTool;
+
+    #[async_trait]
+    impl litgraph_core::tool::Tool for AlwaysFailTool {
+        fn schema(&self) -> litgraph_core::tool::ToolSchema {
+            litgraph_core::tool::ToolSchema {
+                name: "fail".into(),
+                description: "always fails".into(),
+                parameters: serde_json::json!({"type":"object"}),
+            }
+        }
+        async fn run(
+            &self,
+            _args: serde_json::Value,
+        ) -> Result<serde_json::Value> {
+            Err(Error::other("synthetic"))
+        }
+    }
+
+    #[tokio::test]
+    async fn metrics_tool_counts_errors_and_decs_gauge() {
+        let registry = MetricsRegistry::new();
+        let inner: Arc<dyn litgraph_core::tool::Tool> = Arc::new(AlwaysFailTool);
+        let mt = MetricsTool::new(inner, &registry);
+        for _ in 0..4 {
+            let _ = mt.run(serde_json::json!({})).await;
+        }
+        assert_eq!(registry.counter("fail_invocations_total").get(), 4);
+        assert_eq!(registry.counter("fail_errors_total").get(), 4);
+        // RAII guard decremented on every error path.
+        assert_eq!(registry.gauge("fail_in_flight").get(), 0);
+    }
+
+    #[tokio::test]
+    async fn metrics_tool_with_prefix_uses_custom_name() {
+        let registry = MetricsRegistry::new();
+        let inner = Arc::new(EchoTool {
+            seen: AtomicU32::new(0),
+        });
+        let mt = MetricsTool::with_prefix(
+            inner as Arc<dyn litgraph_core::tool::Tool>,
+            &registry,
+            "google_search",
+        );
+        mt.run(serde_json::json!({"q": "test"})).await.unwrap();
+        assert_eq!(registry.counter("google_search_invocations_total").get(), 1);
+        // Default echo_* metric should NOT be present.
+        let prom = registry.to_prometheus();
+        assert!(prom.contains("google_search_invocations_total 1"));
+        assert!(!prom.contains("\necho_invocations_total "));
+    }
+
+    #[tokio::test]
+    async fn metrics_tool_sanitizes_tool_name_for_prefix() {
+        // A tool named with a dot (`http.get`) should produce metrics
+        // under `http_get_*` — Prometheus disallows dots in names.
+        struct DottedTool;
+        #[async_trait]
+        impl litgraph_core::tool::Tool for DottedTool {
+            fn schema(&self) -> litgraph_core::tool::ToolSchema {
+                litgraph_core::tool::ToolSchema {
+                    name: "http.get".into(),
+                    description: String::new(),
+                    parameters: serde_json::json!({"type":"object"}),
+                }
+            }
+            async fn run(
+                &self,
+                _args: serde_json::Value,
+            ) -> Result<serde_json::Value> {
+                Ok(serde_json::json!({}))
+            }
+        }
+        let registry = MetricsRegistry::new();
+        let mt = MetricsTool::new(
+            Arc::new(DottedTool) as Arc<dyn litgraph_core::tool::Tool>,
+            &registry,
+        );
+        mt.run(serde_json::json!({})).await.unwrap();
+        assert_eq!(registry.counter("http_get_invocations_total").get(), 1);
+    }
+
+    #[tokio::test]
+    async fn metrics_tool_schema_proxies_inner() {
+        let registry = MetricsRegistry::new();
+        let inner: Arc<dyn litgraph_core::tool::Tool> = Arc::new(EchoTool {
+            seen: AtomicU32::new(0),
+        });
+        let mt = MetricsTool::new(inner, &registry);
+        assert_eq!(mt.schema().name, "echo");
     }
 
     #[tokio::test]
