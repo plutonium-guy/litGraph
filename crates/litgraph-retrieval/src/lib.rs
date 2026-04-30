@@ -20,6 +20,7 @@ pub mod rag_fusion;
 pub mod step_back;
 pub mod sub_query;
 pub mod timeout;
+pub mod retrying;
 pub mod hyde;
 pub mod compression;
 pub mod self_query;
@@ -56,6 +57,7 @@ pub use rag_fusion::RagFusionRetriever;
 pub use step_back::StepBackRetriever;
 pub use sub_query::SubQueryRetriever;
 pub use timeout::TimeoutRetriever;
+pub use retrying::{RetryConfig as RetryRetrieverConfig, RetryingRetriever};
 pub use hyde::HydeRetriever;
 pub use compression::{
     Compressor, ContextualCompressionRetriever, EmbeddingsFilterCompressor,

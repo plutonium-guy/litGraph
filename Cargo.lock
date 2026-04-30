@@ -2660,6 +2660,7 @@ name = "litgraph-retrieval"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "backon",
  "blake3",
  "futures",
  "litgraph-core",
