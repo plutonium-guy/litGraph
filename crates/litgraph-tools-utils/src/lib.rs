@@ -24,6 +24,7 @@ mod planning;
 mod virtual_fs;
 mod current_time;
 mod regex_extract;
+mod json_extract;
 
 pub use calculator::CalculatorTool;
 pub use http_request::{HttpRequestTool, HttpRequestConfig};
@@ -43,3 +44,4 @@ pub use planning::{PlanningTool, TodoItem, TodoStatus};
 pub use virtual_fs::VirtualFilesystemTool;
 pub use current_time::CurrentTimeTool;
 pub use regex_extract::RegexExtractTool;
+pub use json_extract::JsonExtractTool;
