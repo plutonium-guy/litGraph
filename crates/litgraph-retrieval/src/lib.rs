@@ -22,6 +22,7 @@ pub mod sub_query;
 pub mod timeout;
 pub mod retrying;
 pub mod metrics;
+pub mod record_replay;
 pub mod hyde;
 pub mod compression;
 pub mod self_query;
@@ -60,6 +61,10 @@ pub use sub_query::SubQueryRetriever;
 pub use timeout::TimeoutRetriever;
 pub use retrying::{RetryConfig as RetryRetrieverConfig, RetryingRetriever};
 pub use metrics::{MetricsRetriever, DEFAULT_RETRIEVER_LATENCY_BUCKETS_SECS};
+pub use record_replay::{
+    retrieve_hash, RecordingRetriever, ReplayingRetriever, RetrieverCassette,
+    RetrieverExchange,
+};
 pub use hyde::HydeRetriever;
 pub use compression::{
     Compressor, ContextualCompressionRetriever, EmbeddingsFilterCompressor,
