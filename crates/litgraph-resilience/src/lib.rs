@@ -7997,3 +7997,367 @@ mod self_consistency_tests {
         assert_eq!(chat.name(), "scripted");
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CachedChatModel — live LLM-response cache for production cost reduction
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Cache entry for [`CachedChatModel`].
+#[derive(Clone)]
+struct CachedChatEntry {
+    response: ChatResponse,
+    inserted_at: std::time::Instant,
+}
+
+/// Wrap any [`ChatModel`] with an in-memory response cache keyed
+/// by canonical hash of `(messages, ChatOptions)`.
+///
+/// # Distinct from neighboring primitives
+///
+/// - **`RecordingChatModel` / `ReplayingChatModel`** (iter 254) are
+///   for *test workflows* — record once, replay forever in CI.
+///   `CachedChatModel` is for *production* — cache hits skip the
+///   provider call to save tokens / latency, with an LRU cap and
+///   optional TTL so the cache doesn't grow unbounded.
+/// - **`PromptCachingChatModel`** (iter 136) controls Anthropic's
+///   *server-side* prompt cache via cache_control headers — that
+///   reduces input-token cost on the provider side. This caches
+///   the entire response *client-side* — zero provider call on hit.
+///   The two compose: even with prompt caching enabled upstream,
+///   client-side caching is still a win because identical requests
+///   skip the network roundtrip entirely.
+/// - **`SingleflightChatModel`** doesn't exist (we have it for
+///   tools/embeddings/retrievers). If we add it, it'd coalesce
+///   *concurrent* identical calls; this caches *across* calls.
+///   The two compose: cache-outside / dedup-inside.
+///
+/// # When this is a win
+///
+/// - Eval harnesses that re-run the same dataset against the same
+///   model multiple times (parameter sweeps, scorer iteration).
+/// - Agents over a fixed FAQ where users phrase the same question
+///   identically (verbatim — for fuzzy matches use a semantic
+///   layer; this is exact-key only).
+/// - Demo / dev environments where the same prompt is replayed
+///   while iterating on downstream UI / parsing logic.
+/// - Multi-stage agent loops where the same upstream call gets
+///   re-invoked due to retry / control-flow restart — cache short-
+///   circuits the redundant work.
+///
+/// # When this is NOT a win
+///
+/// - Stochastic-output workflows (high temperature, creative
+///   generation) — cache-hit rate is near zero because each call
+///   has slightly different opts metadata or message wording.
+/// - Long-tail prompts where each user query is unique. The cache
+///   just adds memory pressure without earning hits.
+///
+/// # Streaming
+///
+/// `stream()` is NOT cached — token streams can't be replayed in
+/// a useful way without preserving inter-chunk timing, and the
+/// caller of `stream()` typically wants the streaming UX (otherwise
+/// they'd call `invoke()`). Stream calls pass through to inner.
+/// Tests verifying cache behavior should use `invoke()`.
+///
+/// # Hash determinism
+///
+/// Cache key uses [`exchange_hash`], the same blake3-over-canonical-
+/// JSON function as the cassette infrastructure. Reusing it ensures
+/// the cache and the cassette agree on what counts as "the same
+/// request" — same hash function, same canonicalization rules.
+pub struct CachedChatModel {
+    pub inner: Arc<dyn ChatModel>,
+    pub max_entries: usize,
+    pub ttl: Option<Duration>,
+    cache: parking_lot::Mutex<Vec<(String, CachedChatEntry)>>,
+}
+
+impl CachedChatModel {
+    pub fn new(inner: Arc<dyn ChatModel>) -> Self {
+        Self {
+            inner,
+            max_entries: 1000,
+            ttl: None,
+            cache: parking_lot::Mutex::new(Vec::new()),
+        }
+    }
+
+    pub fn with_max_entries(mut self, n: usize) -> Self {
+        self.max_entries = n.max(1);
+        self
+    }
+
+    pub fn with_ttl(mut self, ttl: Duration) -> Self {
+        self.ttl = Some(ttl);
+        self
+    }
+
+    /// Approximate cache size — for telemetry / tests.
+    pub fn cache_len(&self) -> usize {
+        self.cache.lock().len()
+    }
+
+    /// Drop all cached entries.
+    pub fn clear(&self) {
+        self.cache.lock().clear();
+    }
+}
+
+#[async_trait]
+impl ChatModel for CachedChatModel {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    async fn invoke(
+        &self,
+        messages: Vec<Message>,
+        opts: &ChatOptions,
+    ) -> Result<ChatResponse> {
+        let key = exchange_hash(&messages, opts);
+        let now = std::time::Instant::now();
+        // Lookup phase. Sweep TTL-expired entries while holding lock.
+        {
+            let mut cache = self.cache.lock();
+            if let Some(ttl) = self.ttl {
+                cache.retain(|(_, e)| now.duration_since(e.inserted_at) <= ttl);
+            }
+            if let Some((_, entry)) = cache.iter().find(|(k, _)| k == &key) {
+                debug!(target: "litgraph_resilience::cached_chat", "cache hit");
+                return Ok(entry.response.clone());
+            }
+        }
+        // Miss — call inner.
+        let response = self.inner.invoke(messages, opts).await?;
+        // Insert + evict.
+        {
+            let mut cache = self.cache.lock();
+            cache.push((
+                key,
+                CachedChatEntry {
+                    response: response.clone(),
+                    inserted_at: now,
+                },
+            ));
+            while cache.len() > self.max_entries {
+                cache.remove(0);
+            }
+        }
+        Ok(response)
+    }
+
+    async fn stream(
+        &self,
+        messages: Vec<Message>,
+        opts: &ChatOptions,
+    ) -> Result<ChatStream> {
+        // See module doc — streams pass through uncached.
+        self.inner.stream(messages, opts).await
+    }
+}
+
+#[cfg(test)]
+mod cached_chat_tests {
+    use super::*;
+    use async_trait::async_trait;
+    use litgraph_core::model::{ChatStream, FinishReason, TokenUsage};
+    use litgraph_core::{ChatResponse, Message};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Records call count + returns "resp-N" where N is the call index.
+    struct CountingModel {
+        calls: AtomicUsize,
+    }
+
+    impl CountingModel {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                calls: AtomicUsize::new(0),
+            })
+        }
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl ChatModel for CountingModel {
+        fn name(&self) -> &str {
+            "counting"
+        }
+        async fn invoke(
+            &self,
+            _messages: Vec<Message>,
+            _opts: &ChatOptions,
+        ) -> Result<ChatResponse> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(ChatResponse {
+                message: Message::assistant(format!("resp-{n}")),
+                finish_reason: FinishReason::Stop,
+                usage: TokenUsage {
+                    prompt: 10,
+                    completion: 5,
+                    total: 15,
+                    cache_creation: 0,
+                    cache_read: 0,
+                },
+                model: "counting".into(),
+            })
+        }
+        async fn stream(&self, _m: Vec<Message>, _o: &ChatOptions) -> Result<ChatStream> {
+            unimplemented!()
+        }
+    }
+
+    #[tokio::test]
+    async fn identical_calls_hit_cache() {
+        let inner = CountingModel::new();
+        let cached = CachedChatModel::new(inner.clone());
+        let opts = ChatOptions::default();
+        let msgs = vec![Message::user("hello")];
+
+        let r1 = cached.invoke(msgs.clone(), &opts).await.unwrap();
+        let r2 = cached.invoke(msgs.clone(), &opts).await.unwrap();
+        let r3 = cached.invoke(msgs, &opts).await.unwrap();
+
+        // Inner saw exactly one call; subsequent two were cache hits.
+        assert_eq!(inner.calls(), 1);
+        // All three responses are byte-identical (the cached value).
+        assert_eq!(r1.message.text_content(), "resp-0");
+        assert_eq!(r2.message.text_content(), "resp-0");
+        assert_eq!(r3.message.text_content(), "resp-0");
+        assert_eq!(cached.cache_len(), 1);
+    }
+
+    #[tokio::test]
+    async fn different_messages_miss_cache() {
+        let inner = CountingModel::new();
+        let cached = CachedChatModel::new(inner.clone());
+        let opts = ChatOptions::default();
+
+        cached
+            .invoke(vec![Message::user("a")], &opts)
+            .await
+            .unwrap();
+        cached
+            .invoke(vec![Message::user("b")], &opts)
+            .await
+            .unwrap();
+        cached
+            .invoke(vec![Message::user("c")], &opts)
+            .await
+            .unwrap();
+
+        assert_eq!(inner.calls(), 3);
+        assert_eq!(cached.cache_len(), 3);
+    }
+
+    #[tokio::test]
+    async fn different_opts_miss_cache() {
+        let inner = CountingModel::new();
+        let cached = CachedChatModel::new(inner.clone());
+        let msgs = vec![Message::user("same")];
+
+        let mut o1 = ChatOptions::default();
+        o1.temperature = Some(0.0);
+        let mut o2 = ChatOptions::default();
+        o2.temperature = Some(0.7);
+
+        cached.invoke(msgs.clone(), &o1).await.unwrap();
+        cached.invoke(msgs.clone(), &o2).await.unwrap();
+        // Same opts as o1 — cache hit.
+        cached.invoke(msgs, &o1).await.unwrap();
+
+        // Two distinct opt fingerprints → two inner calls; the third was a hit.
+        assert_eq!(inner.calls(), 2);
+    }
+
+    #[tokio::test]
+    async fn lru_eviction_caps_size() {
+        let inner = CountingModel::new();
+        let cached = CachedChatModel::new(inner.clone()).with_max_entries(2);
+        let opts = ChatOptions::default();
+
+        cached
+            .invoke(vec![Message::user("a")], &opts)
+            .await
+            .unwrap();
+        cached
+            .invoke(vec![Message::user("b")], &opts)
+            .await
+            .unwrap();
+        cached
+            .invoke(vec![Message::user("c")], &opts)
+            .await
+            .unwrap();
+
+        // Only the two most-recent entries remain; "a" was evicted.
+        assert_eq!(cached.cache_len(), 2);
+        // Now re-invoking "a" misses (it was evicted) → 4th inner call.
+        cached
+            .invoke(vec![Message::user("a")], &opts)
+            .await
+            .unwrap();
+        assert_eq!(inner.calls(), 4);
+    }
+
+    #[tokio::test]
+    async fn ttl_expires_entries() {
+        let inner = CountingModel::new();
+        let cached = CachedChatModel::new(inner.clone()).with_ttl(Duration::from_millis(50));
+        let opts = ChatOptions::default();
+        let msgs = vec![Message::user("ephemeral")];
+
+        cached.invoke(msgs.clone(), &opts).await.unwrap();
+        // Within TTL — cache hit.
+        cached.invoke(msgs.clone(), &opts).await.unwrap();
+        assert_eq!(inner.calls(), 1);
+
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        // After TTL — entry expired, re-invokes inner.
+        cached.invoke(msgs, &opts).await.unwrap();
+        assert_eq!(inner.calls(), 2);
+    }
+
+    #[tokio::test]
+    async fn clear_drops_all_entries() {
+        let inner = CountingModel::new();
+        let cached = CachedChatModel::new(inner.clone());
+        let opts = ChatOptions::default();
+
+        cached
+            .invoke(vec![Message::user("x")], &opts)
+            .await
+            .unwrap();
+        cached
+            .invoke(vec![Message::user("y")], &opts)
+            .await
+            .unwrap();
+        assert_eq!(cached.cache_len(), 2);
+
+        cached.clear();
+        assert_eq!(cached.cache_len(), 0);
+
+        // Post-clear: previously-cached call is now a miss.
+        cached
+            .invoke(vec![Message::user("x")], &opts)
+            .await
+            .unwrap();
+        assert_eq!(inner.calls(), 3);
+    }
+
+    #[tokio::test]
+    async fn name_delegates_to_inner() {
+        let inner = CountingModel::new();
+        let cached = CachedChatModel::new(inner);
+        assert_eq!(cached.name(), "counting");
+    }
+
+    #[tokio::test]
+    async fn with_max_entries_zero_clamps_to_one() {
+        let inner = CountingModel::new();
+        let cached = CachedChatModel::new(inner).with_max_entries(0);
+        assert_eq!(cached.max_entries, 1);
+    }
+}
