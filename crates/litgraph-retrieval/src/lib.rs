@@ -17,6 +17,7 @@ pub mod eval_gen;
 pub mod parent;
 pub mod multi_query;
 pub mod rag_fusion;
+pub mod step_back;
 pub mod hyde;
 pub mod compression;
 pub mod self_query;
@@ -50,6 +51,7 @@ pub use parent::{
 };
 pub use multi_query::MultiQueryRetriever;
 pub use rag_fusion::RagFusionRetriever;
+pub use step_back::StepBackRetriever;
 pub use hyde::HydeRetriever;
 pub use compression::{
     Compressor, ContextualCompressionRetriever, EmbeddingsFilterCompressor,
