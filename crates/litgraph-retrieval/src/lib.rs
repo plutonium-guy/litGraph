@@ -27,6 +27,7 @@ pub mod circuit_breaker;
 pub mod bulkhead;
 pub mod hedged;
 pub mod singleflight;
+pub mod semantic_cache;
 pub mod hyde;
 pub mod compression;
 pub mod self_query;
@@ -73,6 +74,7 @@ pub use circuit_breaker::CircuitBreakerRetriever;
 pub use bulkhead::{BulkheadMode as BulkheadRetrieverMode, BulkheadRetriever};
 pub use hedged::HedgedRetriever;
 pub use singleflight::SingleflightRetriever;
+pub use semantic_cache::SemanticCachedRetriever;
 pub use hyde::HydeRetriever;
 pub use compression::{
     Compressor, ContextualCompressionRetriever, EmbeddingsFilterCompressor,
