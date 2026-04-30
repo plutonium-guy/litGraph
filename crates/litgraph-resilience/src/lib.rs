@@ -1343,6 +1343,169 @@ impl litgraph_core::tool::Tool for SingleflightTool {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// CachedEmbeddings — exact-match TTL cache for embedding results
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// One cache entry: vector + insertion time (for TTL).
+struct CachedEmbedQueryEntry {
+    vec: Vec<f32>,
+    inserted_at: std::time::Instant,
+}
+
+struct CachedEmbedDocumentsEntry {
+    vecs: Vec<Vec<f32>>,
+    inserted_at: std::time::Instant,
+}
+
+/// Wrap any [`Embeddings`] with an exact-match string-key cache.
+/// Distinct from iter-253 `SingleflightEmbeddings`: that
+/// coalesces *concurrent* identical calls (same text arriving at
+/// the same time share one HTTP call). `CachedEmbeddings` caches
+/// *across* calls — once a query is embedded, subsequent calls
+/// with the exact same query string skip the upstream entirely
+/// until the entry expires or is evicted.
+///
+/// Real prod use:
+/// - Popular search queries embedded once per cache window.
+/// - Repeated agent runs over the same query corpus during
+///   eval / development.
+/// - Pre-warming cache from a known-popular query list at
+///   startup.
+///
+/// # Knobs
+///
+/// - `with_max_entries(n)` — LRU cap (per-method: query and
+///   documents have separate caps but share the bound). Default
+///   1000.
+/// - `with_ttl(d)` — entries expire after `d`. Default `None`
+///   (cache forever; useful when the embedding model is fixed).
+///
+/// # Composition
+///
+/// Stack on top of `SingleflightEmbeddings` for the full "cache
+/// + dedup-concurrent" stack:
+///
+/// ```ignore
+/// let inner = Arc::new(real_embeddings);
+/// let dedup = Arc::new(SingleflightEmbeddings::new(inner));
+/// let cached = Arc::new(CachedEmbeddings::new(dedup));
+/// ```
+///
+/// Order matters: cache outside, dedup inside. Cache hits skip
+/// even the dedup step; cache misses go through dedup so
+/// concurrent misses still coalesce.
+pub struct CachedEmbeddings {
+    pub inner: Arc<dyn Embeddings>,
+    pub max_entries: usize,
+    pub ttl: Option<Duration>,
+    query_cache: parking_lot::Mutex<Vec<(String, CachedEmbedQueryEntry)>>,
+    doc_cache: parking_lot::Mutex<Vec<(Vec<String>, CachedEmbedDocumentsEntry)>>,
+}
+
+impl CachedEmbeddings {
+    pub fn new(inner: Arc<dyn Embeddings>) -> Self {
+        Self {
+            inner,
+            max_entries: 1000,
+            ttl: None,
+            query_cache: parking_lot::Mutex::new(Vec::new()),
+            doc_cache: parking_lot::Mutex::new(Vec::new()),
+        }
+    }
+
+    pub fn with_max_entries(mut self, n: usize) -> Self {
+        self.max_entries = n.max(1);
+        self
+    }
+
+    pub fn with_ttl(mut self, ttl: Duration) -> Self {
+        self.ttl = Some(ttl);
+        self
+    }
+
+    /// Approximate query-cache size (for telemetry / tests).
+    pub fn query_cache_len(&self) -> usize {
+        self.query_cache.lock().len()
+    }
+
+    /// Drop all cached entries.
+    pub fn clear(&self) {
+        self.query_cache.lock().clear();
+        self.doc_cache.lock().clear();
+    }
+}
+
+#[async_trait]
+impl Embeddings for CachedEmbeddings {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+    fn dimensions(&self) -> usize {
+        self.inner.dimensions()
+    }
+
+    async fn embed_query(&self, text: &str) -> Result<Vec<f32>> {
+        let now = std::time::Instant::now();
+        // Lookup phase.
+        {
+            let mut cache = self.query_cache.lock();
+            if let Some(ttl) = self.ttl {
+                cache.retain(|(_, e)| now.duration_since(e.inserted_at) <= ttl);
+            }
+            if let Some((_, entry)) = cache.iter().find(|(k, _)| k == text) {
+                return Ok(entry.vec.clone());
+            }
+        }
+        // Miss — call inner.
+        let vec = self.inner.embed_query(text).await?;
+        // Insert.
+        {
+            let mut cache = self.query_cache.lock();
+            cache.push((
+                text.to_string(),
+                CachedEmbedQueryEntry {
+                    vec: vec.clone(),
+                    inserted_at: now,
+                },
+            ));
+            while cache.len() > self.max_entries {
+                cache.remove(0);
+            }
+        }
+        Ok(vec)
+    }
+
+    async fn embed_documents(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        let now = std::time::Instant::now();
+        // Lookup phase.
+        {
+            let mut cache = self.doc_cache.lock();
+            if let Some(ttl) = self.ttl {
+                cache.retain(|(_, e)| now.duration_since(e.inserted_at) <= ttl);
+            }
+            if let Some((_, entry)) = cache.iter().find(|(k, _)| k.as_slice() == texts) {
+                return Ok(entry.vecs.clone());
+            }
+        }
+        let vecs = self.inner.embed_documents(texts).await?;
+        {
+            let mut cache = self.doc_cache.lock();
+            cache.push((
+                texts.to_vec(),
+                CachedEmbedDocumentsEntry {
+                    vecs: vecs.clone(),
+                    inserted_at: now,
+                },
+            ));
+            while cache.len() > self.max_entries {
+                cache.remove(0);
+            }
+        }
+        Ok(vecs)
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // SingleflightEmbeddings — request-coalescing wrapper for embed_query
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -6575,6 +6738,138 @@ mod tests {
         );
         let s = player.schema();
         assert_eq!(s.name, "echo");
+    }
+
+    // ---- CachedEmbeddings tests ----------------------------------------
+
+    #[tokio::test]
+    async fn cached_embed_same_query_hits_cache() {
+        let inner = Arc::new(SfCountingEmbed {
+            delay_ms: 0,
+            seen: AtomicU32::new(0),
+            dim: 4,
+        });
+        let cached = CachedEmbeddings::new(inner.clone() as Arc<dyn Embeddings>);
+        let v1 = cached.embed_query("hello").await.unwrap();
+        let v2 = cached.embed_query("hello").await.unwrap();
+        assert_eq!(v1, v2);
+        // Inner called once; second call hit cache.
+        assert_eq!(inner.seen.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn cached_embed_different_query_misses_cache() {
+        let inner = Arc::new(SfCountingEmbed {
+            delay_ms: 0,
+            seen: AtomicU32::new(0),
+            dim: 3,
+        });
+        let cached = CachedEmbeddings::new(inner.clone() as Arc<dyn Embeddings>);
+        cached.embed_query("first").await.unwrap();
+        cached.embed_query("second").await.unwrap();
+        cached.embed_query("third").await.unwrap();
+        assert_eq!(inner.seen.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn cached_embed_documents_caches_by_full_vec() {
+        let inner = Arc::new(SfCountingEmbed {
+            delay_ms: 0,
+            seen: AtomicU32::new(0),
+            dim: 2,
+        });
+        let cached = CachedEmbeddings::new(inner.clone() as Arc<dyn Embeddings>);
+        cached
+            .embed_documents(&["a".into(), "b".into()])
+            .await
+            .unwrap();
+        cached
+            .embed_documents(&["a".into(), "b".into()])
+            .await
+            .unwrap();
+        // Same Vec → cache hit.
+        assert_eq!(inner.seen.load(Ordering::SeqCst), 1);
+        // Different Vec ordering → cache miss (Vec equality is
+        // ordered).
+        cached
+            .embed_documents(&["b".into(), "a".into()])
+            .await
+            .unwrap();
+        assert_eq!(inner.seen.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn cached_embed_query_and_documents_separate_caches() {
+        // embed_query "x" doesn't satisfy embed_documents(["x"]).
+        let inner = Arc::new(SfCountingEmbed {
+            delay_ms: 0,
+            seen: AtomicU32::new(0),
+            dim: 2,
+        });
+        let cached = CachedEmbeddings::new(inner.clone() as Arc<dyn Embeddings>);
+        cached.embed_query("x").await.unwrap();
+        cached.embed_documents(&["x".into()]).await.unwrap();
+        assert_eq!(inner.seen.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn cached_embed_ttl_expires_old_entries() {
+        let inner = Arc::new(SfCountingEmbed {
+            delay_ms: 0,
+            seen: AtomicU32::new(0),
+            dim: 2,
+        });
+        let cached = CachedEmbeddings::new(inner.clone() as Arc<dyn Embeddings>)
+            .with_ttl(Duration::from_millis(20));
+        cached.embed_query("q").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        cached.embed_query("q").await.unwrap();
+        assert_eq!(inner.seen.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn cached_embed_max_entries_evicts_oldest() {
+        let inner = Arc::new(SfCountingEmbed {
+            delay_ms: 0,
+            seen: AtomicU32::new(0),
+            dim: 2,
+        });
+        let cached = CachedEmbeddings::new(inner.clone() as Arc<dyn Embeddings>)
+            .with_max_entries(2);
+        cached.embed_query("a").await.unwrap();
+        cached.embed_query("b").await.unwrap();
+        cached.embed_query("c").await.unwrap();
+        assert_eq!(cached.query_cache_len(), 2);
+        // "a" was evicted; re-querying it misses cache.
+        let baseline = inner.seen.load(Ordering::SeqCst);
+        cached.embed_query("a").await.unwrap();
+        assert_eq!(inner.seen.load(Ordering::SeqCst), baseline + 1);
+    }
+
+    #[tokio::test]
+    async fn cached_embed_clear_drops_all() {
+        let inner = Arc::new(SfCountingEmbed {
+            delay_ms: 0,
+            seen: AtomicU32::new(0),
+            dim: 2,
+        });
+        let cached = CachedEmbeddings::new(inner.clone() as Arc<dyn Embeddings>);
+        cached.embed_query("q").await.unwrap();
+        cached.clear();
+        cached.embed_query("q").await.unwrap();
+        assert_eq!(inner.seen.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn cached_embed_dimensions_proxy_inner() {
+        let inner = Arc::new(SfCountingEmbed {
+            delay_ms: 0,
+            seen: AtomicU32::new(0),
+            dim: 9,
+        });
+        let cached = CachedEmbeddings::new(inner as Arc<dyn Embeddings>);
+        assert_eq!(cached.dimensions(), 9);
+        assert_eq!(cached.name(), "sf-counting-embed");
     }
 }
 
