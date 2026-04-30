@@ -30,6 +30,7 @@ mod hash;
 mod base64_tool;
 mod uuid_tool;
 mod text_diff;
+mod jwt_decode;
 
 pub use calculator::CalculatorTool;
 pub use http_request::{HttpRequestTool, HttpRequestConfig};
@@ -55,3 +56,4 @@ pub use hash::HashTool;
 pub use base64_tool::Base64Tool;
 pub use uuid_tool::UuidTool;
 pub use text_diff::TextDiffTool;
+pub use jwt_decode::JwtDecodeTool;
