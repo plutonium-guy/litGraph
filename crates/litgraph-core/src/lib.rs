@@ -149,7 +149,9 @@ pub use eval_harness::{
     ScoreResult, Scorer,
 };
 pub use eval_drift::{detect_drift, CaseDrift, DriftReport};
-pub use eval_significance::{mcnemar_test, McNemarResult};
+pub use eval_significance::{
+    mcnemar_test, wilcoxon_signed_rank_test, McNemarResult, WilcoxonResult,
+};
 pub use memory::{
     BufferMemory, ConversationMemory, MemorySnapshot, SummaryBufferMemory, TokenBufferMemory,
     TokenCounter, summarize_conversation,
