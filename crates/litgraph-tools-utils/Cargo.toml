@@ -29,6 +29,7 @@ sha2 = "0.10"
 md-5 = "0.10"
 hex = "0.4"
 uuid = { version = "1", features = ["v4", "v7"] }
+similar = "2"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }
