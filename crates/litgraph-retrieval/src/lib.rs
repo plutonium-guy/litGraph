@@ -19,6 +19,7 @@ pub mod multi_query;
 pub mod rag_fusion;
 pub mod step_back;
 pub mod sub_query;
+pub mod timeout;
 pub mod hyde;
 pub mod compression;
 pub mod self_query;
@@ -54,6 +55,7 @@ pub use multi_query::MultiQueryRetriever;
 pub use rag_fusion::RagFusionRetriever;
 pub use step_back::StepBackRetriever;
 pub use sub_query::SubQueryRetriever;
+pub use timeout::TimeoutRetriever;
 pub use hyde::HydeRetriever;
 pub use compression::{
     Compressor, ContextualCompressionRetriever, EmbeddingsFilterCompressor,
