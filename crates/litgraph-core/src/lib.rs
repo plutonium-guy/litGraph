@@ -21,6 +21,7 @@ pub mod llm_judge;
 pub mod pii;
 pub mod example_selector;
 pub mod eval_harness;
+pub mod eval_drift;
 pub mod markdown_table_parser;
 pub mod vector_store_memory;
 pub mod store;
@@ -146,6 +147,7 @@ pub use eval_harness::{
     EvalReport, ExactMatchScorer, JaccardScorer, LevenshteinScorer, LlmJudgeScorer, RegexScorer,
     ScoreResult, Scorer,
 };
+pub use eval_drift::{detect_drift, CaseDrift, DriftReport};
 pub use memory::{
     BufferMemory, ConversationMemory, MemorySnapshot, SummaryBufferMemory, TokenBufferMemory,
     TokenCounter, summarize_conversation,
