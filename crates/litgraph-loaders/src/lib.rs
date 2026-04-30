@@ -86,6 +86,8 @@ pub mod rss;
 pub use rss::{FeedItem, RssAtomLoader};
 pub mod hackernews;
 pub use hackernews::{HackerNewsLoader, HnFeed, HnItem};
+pub mod bitbucket;
+pub use bitbucket::BitbucketIssuesLoader;
 pub mod concurrent;
 pub use concurrent::{
     load_concurrent, load_concurrent_flat, load_concurrent_stream,
