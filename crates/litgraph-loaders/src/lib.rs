@@ -84,6 +84,8 @@ pub use outlook::OutlookMessagesLoader;
 pub mod rss;
 #[cfg(feature = "rss")]
 pub use rss::{FeedItem, RssAtomLoader};
+pub mod hackernews;
+pub use hackernews::{HackerNewsLoader, HnFeed, HnItem};
 pub mod concurrent;
 pub use concurrent::{
     load_concurrent, load_concurrent_flat, load_concurrent_stream,
