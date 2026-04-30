@@ -9,6 +9,7 @@ pub mod semantic;
 pub mod json;
 pub mod jsonl;
 pub mod html_header;
+pub mod html_section;
 pub mod code;
 pub mod token;
 pub mod csv_row;
@@ -23,6 +24,7 @@ pub use jsonl::JsonLinesSplitter;
 pub use semantic::SemanticChunker;
 pub use json::JsonSplitter;
 pub use html_header::HtmlHeaderSplitter;
+pub use html_section::{HtmlSectionSplitter, DEFAULT_SECTION_TAGS};
 pub use code::CodeSplitter;
 pub use token::TokenTextSplitter;
 
