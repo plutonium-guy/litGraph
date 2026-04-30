@@ -90,6 +90,8 @@ pub mod bitbucket;
 pub use bitbucket::BitbucketIssuesLoader;
 pub mod bitbucket_files;
 pub use bitbucket_files::BitbucketFilesLoader;
+pub mod stackexchange;
+pub use stackexchange::{Owner as StackExchangeOwner, Question as StackExchangeQuestion, StackExchangeLoader};
 pub mod concurrent;
 pub use concurrent::{
     load_concurrent, load_concurrent_flat, load_concurrent_stream,
