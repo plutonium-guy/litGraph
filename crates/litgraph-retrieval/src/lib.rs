@@ -24,6 +24,7 @@ pub mod retrying;
 pub mod metrics;
 pub mod record_replay;
 pub mod circuit_breaker;
+pub mod bulkhead;
 pub mod hyde;
 pub mod compression;
 pub mod self_query;
@@ -67,6 +68,7 @@ pub use record_replay::{
     RetrieverExchange,
 };
 pub use circuit_breaker::CircuitBreakerRetriever;
+pub use bulkhead::{BulkheadMode as BulkheadRetrieverMode, BulkheadRetriever};
 pub use hyde::HydeRetriever;
 pub use compression::{
     Compressor, ContextualCompressionRetriever, EmbeddingsFilterCompressor,
