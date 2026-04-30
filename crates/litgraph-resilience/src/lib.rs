@@ -25,8 +25,8 @@ use backon::{ExponentialBuilder, Retryable};
 use litgraph_core::model::ChatStream;
 use litgraph_core::{
     hedged_call, Bulkhead, ChatModel, ChatOptions, ChatResponse, CircuitBreaker, CircuitCallError,
-    ContentPart, Embeddings, Error, KeyedMutex, Message, PiiScrubber, RateLimiter, Result,
-    Singleflight,
+    ContentPart, Counter, Embeddings, Error, Gauge, Histogram, KeyedMutex, Message,
+    MetricsRegistry, PiiScrubber, RateLimiter, Result, Singleflight,
 };
 use tracing::{debug, warn};
 
@@ -2226,6 +2226,254 @@ impl Embeddings for BulkheadEmbeddings {
             None => return Err(Error::RateLimited { retry_after_ms: None }),
         };
         self.inner.embed_documents(texts).await
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MetricsChatModel + MetricsEmbeddings — auto-instrumentation wrappers
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Default histogram buckets in seconds. Geometric-ish spread
+/// covering the typical LLM/embed latency range from 5ms to 30s.
+pub const DEFAULT_LATENCY_BUCKETS_SECS: &[f64] = &[
+    0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0,
+];
+
+/// Pre-resolved metric handles so the hot path is pure atomic
+/// ops (no HashMap lookup).
+struct MetricsHandles {
+    invocations: Arc<Counter>,
+    errors: Arc<Counter>,
+    in_flight: Arc<Gauge>,
+    latency: Arc<Histogram>,
+}
+
+/// RAII guard that decrements the in-flight gauge on drop. This
+/// makes the gauge correct even if the inner future panics or is
+/// cancelled mid-await.
+struct InFlightGuard {
+    gauge: Arc<Gauge>,
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.gauge.dec();
+    }
+}
+
+fn resolve_handles(
+    registry: &MetricsRegistry,
+    prefix: &str,
+    buckets: &[f64],
+) -> MetricsHandles {
+    MetricsHandles {
+        invocations: registry.counter(&format!("{prefix}_invocations_total")),
+        errors: registry.counter(&format!("{prefix}_errors_total")),
+        in_flight: registry.gauge(&format!("{prefix}_in_flight")),
+        latency: registry.histogram(
+            &format!("{prefix}_latency_seconds"),
+            buckets,
+        ),
+    }
+}
+
+/// Wrap any [`ChatModel`] with auto-instrumentation against an
+/// iter-260 [`MetricsRegistry`]. Bumps the standard four
+/// metrics on every `invoke`:
+///
+/// - `<prefix>_invocations_total` — counter, every call.
+/// - `<prefix>_errors_total` — counter, calls that returned `Err`.
+/// - `<prefix>_in_flight` — gauge, current concurrent calls
+///   (incremented on entry, decremented on exit via RAII guard
+///   so it stays correct under cancellation/panic).
+/// - `<prefix>_latency_seconds` — histogram of `Instant::elapsed`
+///   across the inner call.
+///
+/// Default prefix: `"chat"`. Override with `with_prefix`.
+/// Default histogram buckets: [`DEFAULT_LATENCY_BUCKETS_SECS`].
+/// Override with `with_buckets`.
+///
+/// Metric handles are resolved once at construction via the
+/// registry's get-or-create lookup, so the hot path is pure
+/// atomic ops — no HashMap lookup per call.
+///
+/// # Streaming
+///
+/// `stream()` records the same metrics at the **handshake**:
+/// invocations / errors / latency reflect the time until
+/// `stream()` returns its outer Result, not the time the inner
+/// stream takes to drain. In-flight is incremented before
+/// handshake and decremented before stream() returns —
+/// per-token timing is the consumer's responsibility (typical
+/// patten: caller wraps `s.next()` with its own timing).
+pub struct MetricsChatModel {
+    pub inner: Arc<dyn ChatModel>,
+    handles: MetricsHandles,
+}
+
+impl MetricsChatModel {
+    pub fn new(inner: Arc<dyn ChatModel>, registry: &MetricsRegistry) -> Self {
+        Self {
+            inner,
+            handles: resolve_handles(registry, "chat", DEFAULT_LATENCY_BUCKETS_SECS),
+        }
+    }
+
+    pub fn with_prefix(
+        inner: Arc<dyn ChatModel>,
+        registry: &MetricsRegistry,
+        prefix: &str,
+    ) -> Self {
+        Self {
+            inner,
+            handles: resolve_handles(registry, prefix, DEFAULT_LATENCY_BUCKETS_SECS),
+        }
+    }
+
+    pub fn with_buckets(
+        inner: Arc<dyn ChatModel>,
+        registry: &MetricsRegistry,
+        prefix: &str,
+        buckets: &[f64],
+    ) -> Self {
+        Self {
+            inner,
+            handles: resolve_handles(registry, prefix, buckets),
+        }
+    }
+}
+
+#[async_trait]
+impl ChatModel for MetricsChatModel {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    async fn invoke(
+        &self,
+        messages: Vec<Message>,
+        opts: &ChatOptions,
+    ) -> Result<ChatResponse> {
+        self.handles.invocations.inc();
+        self.handles.in_flight.inc();
+        let _guard = InFlightGuard {
+            gauge: self.handles.in_flight.clone(),
+        };
+        let started = std::time::Instant::now();
+        let r = self.inner.invoke(messages, opts).await;
+        self.handles
+            .latency
+            .observe(started.elapsed().as_secs_f64());
+        if r.is_err() {
+            self.handles.errors.inc();
+        }
+        r
+    }
+
+    async fn stream(
+        &self,
+        messages: Vec<Message>,
+        opts: &ChatOptions,
+    ) -> Result<ChatStream> {
+        self.handles.invocations.inc();
+        self.handles.in_flight.inc();
+        let _guard = InFlightGuard {
+            gauge: self.handles.in_flight.clone(),
+        };
+        let started = std::time::Instant::now();
+        let r = self.inner.stream(messages, opts).await;
+        self.handles
+            .latency
+            .observe(started.elapsed().as_secs_f64());
+        if r.is_err() {
+            self.handles.errors.inc();
+        }
+        r
+    }
+}
+
+/// Embed-axis sibling. Same four-metric instrumentation; default
+/// prefix is `"embed"`. Both `embed_query` and `embed_documents`
+/// share the metrics — distinguish in caller code if you need
+/// per-method breakdown.
+pub struct MetricsEmbeddings {
+    pub inner: Arc<dyn Embeddings>,
+    handles: MetricsHandles,
+}
+
+impl MetricsEmbeddings {
+    pub fn new(inner: Arc<dyn Embeddings>, registry: &MetricsRegistry) -> Self {
+        Self {
+            inner,
+            handles: resolve_handles(registry, "embed", DEFAULT_LATENCY_BUCKETS_SECS),
+        }
+    }
+
+    pub fn with_prefix(
+        inner: Arc<dyn Embeddings>,
+        registry: &MetricsRegistry,
+        prefix: &str,
+    ) -> Self {
+        Self {
+            inner,
+            handles: resolve_handles(registry, prefix, DEFAULT_LATENCY_BUCKETS_SECS),
+        }
+    }
+
+    pub fn with_buckets(
+        inner: Arc<dyn Embeddings>,
+        registry: &MetricsRegistry,
+        prefix: &str,
+        buckets: &[f64],
+    ) -> Self {
+        Self {
+            inner,
+            handles: resolve_handles(registry, prefix, buckets),
+        }
+    }
+}
+
+#[async_trait]
+impl Embeddings for MetricsEmbeddings {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+    fn dimensions(&self) -> usize {
+        self.inner.dimensions()
+    }
+
+    async fn embed_query(&self, text: &str) -> Result<Vec<f32>> {
+        self.handles.invocations.inc();
+        self.handles.in_flight.inc();
+        let _guard = InFlightGuard {
+            gauge: self.handles.in_flight.clone(),
+        };
+        let started = std::time::Instant::now();
+        let r = self.inner.embed_query(text).await;
+        self.handles
+            .latency
+            .observe(started.elapsed().as_secs_f64());
+        if r.is_err() {
+            self.handles.errors.inc();
+        }
+        r
+    }
+
+    async fn embed_documents(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        self.handles.invocations.inc();
+        self.handles.in_flight.inc();
+        let _guard = InFlightGuard {
+            gauge: self.handles.in_flight.clone(),
+        };
+        let started = std::time::Instant::now();
+        let r = self.inner.embed_documents(texts).await;
+        self.handles
+            .latency
+            .observe(started.elapsed().as_secs_f64());
+        if r.is_err() {
+            self.handles.errors.inc();
+        }
+        r
     }
 }
 
@@ -5613,6 +5861,138 @@ mod tests {
     async fn embed_query_hash_is_deterministic() {
         assert_eq!(embed_query_hash("a"), embed_query_hash("a"));
         assert_ne!(embed_query_hash("a"), embed_query_hash("b"));
+    }
+
+    // ---- MetricsChatModel / MetricsEmbeddings tests --------------------
+
+    #[tokio::test]
+    async fn metrics_chat_records_invocations_and_latency() {
+        let registry = MetricsRegistry::new();
+        let inner: Arc<dyn ChatModel> = Arc::new(AlwaysOkModel);
+        let mc = MetricsChatModel::new(inner, &registry);
+        for _ in 0..3 {
+            mc.invoke(vec![Message::user("hi")], &ChatOptions::default())
+                .await
+                .unwrap();
+        }
+        assert_eq!(registry.counter("chat_invocations_total").get(), 3);
+        assert_eq!(registry.counter("chat_errors_total").get(), 0);
+        // in_flight should be 0 after all calls return.
+        assert_eq!(registry.gauge("chat_in_flight").get(), 0);
+        // Latency histogram observed 3 times.
+        assert_eq!(
+            registry.histogram("chat_latency_seconds", DEFAULT_LATENCY_BUCKETS_SECS).count(),
+            3,
+        );
+    }
+
+    #[tokio::test]
+    async fn metrics_chat_counts_errors() {
+        let registry = MetricsRegistry::new();
+        let inner: Arc<dyn ChatModel> = Arc::new(AlwaysFailModel {
+            seen: AtomicU32::new(0),
+        });
+        let mc = MetricsChatModel::new(inner, &registry);
+        for _ in 0..4 {
+            let _ = mc
+                .invoke(vec![Message::user("hi")], &ChatOptions::default())
+                .await;
+        }
+        assert_eq!(registry.counter("chat_invocations_total").get(), 4);
+        assert_eq!(registry.counter("chat_errors_total").get(), 4);
+    }
+
+    #[tokio::test]
+    async fn metrics_chat_in_flight_gauge_tracks_concurrent_calls() {
+        use std::sync::atomic::AtomicUsize;
+        let registry = Arc::new(MetricsRegistry::new());
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let inner: Arc<dyn ChatModel> = Arc::new(DelayChatModel {
+            delay_ms: 30,
+            in_flight: in_flight.clone(),
+            peak: peak.clone(),
+        });
+        let mc = Arc::new(MetricsChatModel::new(inner, registry.as_ref()));
+        // Spawn 3 concurrent invokes; capture the gauge mid-flight.
+        let mut handles = Vec::new();
+        for _ in 0..3 {
+            let mc = mc.clone();
+            handles.push(tokio::spawn(async move {
+                mc.invoke(vec![Message::user("hi")], &ChatOptions::default())
+                    .await
+            }));
+        }
+        // Sample mid-flight.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let mid = registry.gauge("chat_in_flight").get();
+        for h in handles {
+            h.await.unwrap().unwrap();
+        }
+        // Some workers were in flight at sample time.
+        assert!(mid >= 1, "in_flight gauge never observed concurrent work");
+        // After all complete, gauge is back to 0.
+        assert_eq!(registry.gauge("chat_in_flight").get(), 0);
+    }
+
+    #[tokio::test]
+    async fn metrics_chat_with_prefix_uses_custom_name() {
+        let registry = MetricsRegistry::new();
+        let inner: Arc<dyn ChatModel> = Arc::new(AlwaysOkModel);
+        let mc = MetricsChatModel::with_prefix(inner, &registry, "openai_gpt4");
+        mc.invoke(vec![Message::user("hi")], &ChatOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(registry.counter("openai_gpt4_invocations_total").get(), 1);
+        // Default chat_* counters should NOT be created.
+        let prom = registry.to_prometheus();
+        assert!(prom.contains("openai_gpt4_invocations_total 1"));
+        assert!(!prom.contains("\nchat_invocations_total "));
+    }
+
+    #[tokio::test]
+    async fn metrics_chat_name_proxies_inner() {
+        let registry = MetricsRegistry::new();
+        let inner: Arc<dyn ChatModel> = Arc::new(AlwaysOkModel);
+        let mc = MetricsChatModel::new(inner, &registry);
+        assert_eq!(mc.name(), "always-ok");
+    }
+
+    #[tokio::test]
+    async fn metrics_embed_records_both_methods() {
+        let registry = MetricsRegistry::new();
+        let inner = flaky_embed(0, EmbedFlakyKind::Provider5xx, 4);
+        let me = MetricsEmbeddings::new(inner as Arc<dyn Embeddings>, &registry);
+        me.embed_query("hi").await.unwrap();
+        me.embed_documents(&["a".into(), "b".into()]).await.unwrap();
+        assert_eq!(registry.counter("embed_invocations_total").get(), 2);
+        assert_eq!(registry.counter("embed_errors_total").get(), 0);
+    }
+
+    #[tokio::test]
+    async fn metrics_embed_dimensions_proxy_inner() {
+        let registry = MetricsRegistry::new();
+        let inner = flaky_embed(0, EmbedFlakyKind::Provider5xx, 9);
+        let me = MetricsEmbeddings::new(inner as Arc<dyn Embeddings>, &registry);
+        assert_eq!(me.dimensions(), 9);
+        assert_eq!(me.name(), "flaky-embed");
+    }
+
+    #[tokio::test]
+    async fn metrics_chat_in_flight_decrements_on_error_path() {
+        let registry = MetricsRegistry::new();
+        let inner: Arc<dyn ChatModel> = Arc::new(AlwaysFailModel {
+            seen: AtomicU32::new(0),
+        });
+        let mc = MetricsChatModel::new(inner, &registry);
+        // 5 errors back-to-back; gauge must end at 0 (RAII guard
+        // decs even on error).
+        for _ in 0..5 {
+            let _ = mc
+                .invoke(vec![Message::user("hi")], &ChatOptions::default())
+                .await;
+        }
+        assert_eq!(registry.gauge("chat_in_flight").get(), 0);
     }
 
     #[tokio::test]
