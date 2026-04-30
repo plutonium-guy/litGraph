@@ -25,6 +25,7 @@ mod virtual_fs;
 mod current_time;
 mod regex_extract;
 mod json_extract;
+mod url_parse;
 
 pub use calculator::CalculatorTool;
 pub use http_request::{HttpRequestTool, HttpRequestConfig};
@@ -45,3 +46,4 @@ pub use virtual_fs::VirtualFilesystemTool;
 pub use current_time::CurrentTimeTool;
 pub use regex_extract::RegexExtractTool;
 pub use json_extract::JsonExtractTool;
+pub use url_parse::UrlParseTool;
