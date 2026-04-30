@@ -80,6 +80,10 @@ pub mod discord;
 pub use discord::DiscordChannelLoader;
 pub mod outlook;
 pub use outlook::OutlookMessagesLoader;
+#[cfg(feature = "rss")]
+pub mod rss;
+#[cfg(feature = "rss")]
+pub use rss::{FeedItem, RssAtomLoader};
 pub mod concurrent;
 pub use concurrent::{
     load_concurrent, load_concurrent_flat, load_concurrent_stream,

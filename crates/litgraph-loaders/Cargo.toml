@@ -46,3 +46,4 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 default = []
 pdf = ["dep:lopdf"]
 docx = ["dep:zip", "dep:quick-xml"]
+rss = ["dep:quick-xml"]
