@@ -23,6 +23,7 @@ pub mod timeout;
 pub mod retrying;
 pub mod metrics;
 pub mod record_replay;
+pub mod circuit_breaker;
 pub mod hyde;
 pub mod compression;
 pub mod self_query;
@@ -65,6 +66,7 @@ pub use record_replay::{
     retrieve_hash, RecordingRetriever, ReplayingRetriever, RetrieverCassette,
     RetrieverExchange,
 };
+pub use circuit_breaker::CircuitBreakerRetriever;
 pub use hyde::HydeRetriever;
 pub use compression::{
     Compressor, ContextualCompressionRetriever, EmbeddingsFilterCompressor,
