@@ -291,6 +291,7 @@ long-term Store. Older (v0.3) features rolled in from prior audit.
 | SemanticChunker (embedding-based) | ✅ |
 | CodeSplitter (definition-boundary) | ✅ |
 | TokenTextSplitter (exact tokens) | ✅ |
+| MarkdownTableSplitter (preserve GFM tables) | ✅ `litgraph_splitters::MarkdownTableSplitter` (iter 269) — walks the markdown line-by-line, detects GFM table blocks (`| header |` row + `| --- |` separator + N data rows), emits each table as a SINGLE chunk regardless of size. Non-table prose passes through an inner splitter (default `RecursiveCharacterSplitter` with chunk_size 1000, overlap 200). Solves the embedding-comprehension problem where naive splitters fragment tables mid-row. Optional `with_max_table_chars(Some(n))` enables row-wise fragmentation for tables larger than `n` chars while preserving the header + separator on every fragment — graceful degradation for tables that exceed the embedding context window. Recognizes alignment separators (`:---`, `---:`, `:---:`). Borderless / non-GFM tables (without the `\|---\|` row) intentionally NOT recognized — that ambiguous case is left to `MarkdownHeaderSplitter`. |
 | Sentence/NLTK/SpaCy splitters | 🟡 recursive covers |
 
 ## 16. Caching
