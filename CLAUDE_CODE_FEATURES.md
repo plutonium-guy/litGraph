@@ -134,6 +134,7 @@ long-term Store. Older (v0.3) features rolled in from prior audit.
 | MCP tool client | Connect external MCP servers | ✅ `Mcp` |
 | MCP server (expose own tools) | Be a tool provider | ✅ resources + prompts |
 | Date/time grounding | Date-aware reasoning ("today", "next Tuesday") | ✅ `litgraph_tools_utils::CurrentTimeTool` (iter 279) — returns `iso8601`, `unix`, `weekday`, `date`, `time`, `tz` for the current moment. Optional `tz_offset_hours` arg (fractional, e.g. 5.5 for IST, -7 for PDT). Without this, LLMs have no reliable way to ground a "today" / "next Tuesday" / "two weeks from now" reasoning step — their training cutoff is in the past. Pure-Rust via `chrono` workspace dep (no `chrono-tz` so IANA-name resolution is not supported; explicit-offset is sufficient for most prod cases). |
+| Regex extraction | Pull structured fields from unstructured text | ✅ `litgraph_tools_utils::RegexExtractTool` (iter 280) — apply a regex to a string and return matches/captures. Three modes: `all` (every match string), `first` (first match or null), `captures` (each match + numbered capture groups). Universal: any agent that fetches unstructured text (web pages, API responses, log lines) can extract specific fields without writing a custom parsing tool. Uses the `regex` workspace dep (no new third-party). |
 | Streaming tool execution | Long-running tool stream | 🚫 deferred |
 | Zapier / N8N tool | Citizen-dev integrations | ❌ userland |
 
