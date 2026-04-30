@@ -1543,6 +1543,173 @@ impl ChatModel for ReplayingChatModel {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Tool record/replay — VCR-style for the tool axis
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// One captured tool call. Hash key: blake3 over canonical JSON
+/// of `args`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ToolExchange {
+    pub request_hash: String,
+    pub tool_name: String,
+    pub args: serde_json::Value,
+    pub response: serde_json::Value,
+}
+
+/// Persistable record of `Tool::run` calls. Same load/save shape
+/// as [`Cassette`] / [`EmbedCassette`].
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct ToolCassette {
+    #[serde(default = "default_version")]
+    pub version: u32,
+    pub exchanges: Vec<ToolExchange>,
+}
+
+impl ToolCassette {
+    pub fn load_from_file(path: impl AsRef<std::path::Path>) -> Result<Self> {
+        let path = path.as_ref();
+        let s = std::fs::read_to_string(path)
+            .map_err(|e| Error::other(format!("read tool cassette {path:?}: {e}")))?;
+        serde_json::from_str(&s)
+            .map_err(|e| Error::other(format!("parse tool cassette {path:?}: {e}")))
+    }
+
+    pub fn save_to_file(&self, path: impl AsRef<std::path::Path>) -> Result<()> {
+        let path = path.as_ref();
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    Error::other(format!("mkdir {parent:?}: {e}"))
+                })?;
+            }
+        }
+        let s = serde_json::to_string_pretty(self)
+            .map_err(|e| Error::other(format!("serialize tool cassette: {e}")))?;
+        std::fs::write(path, s)
+            .map_err(|e| Error::other(format!("write tool cassette {path:?}: {e}")))?;
+        Ok(())
+    }
+}
+
+/// blake3 over canonical JSON of `args` for tool exchange keys.
+pub fn tool_args_hash(args: &serde_json::Value) -> String {
+    let s = serde_json::to_string(args).unwrap_or_default();
+    blake3::hash(s.as_bytes()).to_hex().to_string()
+}
+
+/// Wrap any [`litgraph_core::tool::Tool`] to record every `run`
+/// call into a shared [`ToolCassette`]. Closes the third axis of
+/// the record/replay matrix (after iters 254 chat and 255 embed).
+///
+/// Real prod use: agent integration tests with deterministic
+/// tool side effects. Record real tool runs against a staging
+/// API; replay in CI without hitting the real service.
+pub struct RecordingTool {
+    pub inner: Arc<dyn litgraph_core::tool::Tool>,
+    cassette: Arc<parking_lot::Mutex<ToolCassette>>,
+}
+
+impl RecordingTool {
+    pub fn new(
+        inner: Arc<dyn litgraph_core::tool::Tool>,
+        cassette: Arc<parking_lot::Mutex<ToolCassette>>,
+    ) -> Self {
+        Self { inner, cassette }
+    }
+}
+
+#[async_trait]
+impl litgraph_core::tool::Tool for RecordingTool {
+    fn schema(&self) -> litgraph_core::tool::ToolSchema {
+        self.inner.schema()
+    }
+
+    async fn run(&self, args: serde_json::Value) -> Result<serde_json::Value> {
+        let response = self.inner.run(args.clone()).await?;
+        let exchange = ToolExchange {
+            request_hash: tool_args_hash(&args),
+            tool_name: self.inner.name(),
+            args,
+            response: response.clone(),
+        };
+        self.cassette.lock().exchanges.push(exchange);
+        Ok(response)
+    }
+}
+
+/// Replay recorded tool runs from a [`ToolCassette`]. Matches by
+/// args hash. On miss: returns an error or falls through to
+/// `passthrough` if set. Schema is inherited from `passthrough`
+/// when present, otherwise a synthesized schema with the
+/// configured `name` and an empty parameters object — sufficient
+/// to satisfy callers that only need the cassette's responses.
+pub struct ReplayingTool {
+    pub cassette: ToolCassette,
+    pub passthrough: Option<Arc<dyn litgraph_core::tool::Tool>>,
+    pub name: String,
+    pub description: String,
+}
+
+impl ReplayingTool {
+    pub fn new(
+        cassette: ToolCassette,
+        passthrough: Option<Arc<dyn litgraph_core::tool::Tool>>,
+    ) -> Self {
+        Self {
+            cassette,
+            passthrough,
+            name: "replaying-tool".into(),
+            description: "Replay-only tool backed by a ToolCassette".into(),
+        }
+    }
+
+    /// Override the tool's reported name (controls the synthesized
+    /// schema when no passthrough is configured).
+    pub fn with_name(mut self, name: impl Into<String>) -> Self {
+        self.name = name.into();
+        self
+    }
+
+    /// Override the tool's reported description.
+    pub fn with_description(mut self, description: impl Into<String>) -> Self {
+        self.description = description.into();
+        self
+    }
+}
+
+#[async_trait]
+impl litgraph_core::tool::Tool for ReplayingTool {
+    fn schema(&self) -> litgraph_core::tool::ToolSchema {
+        if let Some(pt) = &self.passthrough {
+            return pt.schema();
+        }
+        litgraph_core::tool::ToolSchema {
+            name: self.name.clone(),
+            description: self.description.clone(),
+            parameters: serde_json::json!({"type": "object", "properties": {}}),
+        }
+    }
+
+    async fn run(&self, args: serde_json::Value) -> Result<serde_json::Value> {
+        let hash = tool_args_hash(&args);
+        if let Some(ex) = self
+            .cassette
+            .exchanges
+            .iter()
+            .find(|e| e.request_hash == hash)
+        {
+            return Ok(ex.response.clone());
+        }
+        if let Some(pt) = &self.passthrough {
+            return pt.run(args).await;
+        }
+        Err(Error::Provider(format!(
+            "no recorded tool response for hash {hash}",
+        )))
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Embeddings record/replay — VCR-style for the embed axis
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -2515,6 +2682,7 @@ impl ChatModel for PiiScrubbingChatModel {
 mod tests {
     use super::*;
     use litgraph_core::model::{ChatStream, FinishReason, TokenUsage};
+    use litgraph_core::tool::Tool as _;
     use litgraph_core::{ContentPart, Message, Role};
     use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -5455,6 +5623,148 @@ mod tests {
         let h1 = embed_documents_hash(&["a".into(), "b".into()]);
         let h2 = embed_documents_hash(&["b".into(), "a".into()]);
         assert_ne!(h1, h2);
+    }
+
+    // ---- Tool record/replay tests --------------------------------------
+
+    /// Echo tool: returns args under {"echo": ...}. Counts invocations.
+    struct EchoTool {
+        seen: AtomicU32,
+    }
+
+    #[async_trait]
+    impl litgraph_core::tool::Tool for EchoTool {
+        fn schema(&self) -> litgraph_core::tool::ToolSchema {
+            litgraph_core::tool::ToolSchema {
+                name: "echo".into(),
+                description: "Echo args".into(),
+                parameters: serde_json::json!({"type": "object"}),
+            }
+        }
+        async fn run(
+            &self,
+            args: serde_json::Value,
+        ) -> Result<serde_json::Value> {
+            self.seen.fetch_add(1, Ordering::SeqCst);
+            Ok(serde_json::json!({"echo": args}))
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_record_then_replay_round_trip() {
+        let inner = Arc::new(EchoTool {
+            seen: AtomicU32::new(0),
+        });
+        let cass = Arc::new(parking_lot::Mutex::new(ToolCassette::default()));
+        let recorder = RecordingTool::new(
+            inner.clone() as Arc<dyn litgraph_core::tool::Tool>,
+            cass.clone(),
+        );
+        // Record 3 calls.
+        let r1 = recorder.run(serde_json::json!({"x": 1})).await.unwrap();
+        let _ = recorder.run(serde_json::json!({"x": 2})).await.unwrap();
+        let _ = recorder.run(serde_json::json!({"x": 1})).await.unwrap();
+        assert_eq!(r1, serde_json::json!({"echo": {"x": 1}}));
+        let snap = cass.lock().clone();
+        assert_eq!(snap.exchanges.len(), 3);
+        assert_eq!(inner.seen.load(Ordering::SeqCst), 3);
+        // Replay.
+        let player = ReplayingTool::new(snap, None);
+        let r1b = player.run(serde_json::json!({"x": 1})).await.unwrap();
+        assert_eq!(r1b, serde_json::json!({"echo": {"x": 1}}));
+        let r2b = player.run(serde_json::json!({"x": 2})).await.unwrap();
+        assert_eq!(r2b, serde_json::json!({"echo": {"x": 2}}));
+        // Replay didn't bump inner.seen.
+        assert_eq!(inner.seen.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn tool_replay_miss_returns_error_when_no_passthrough() {
+        let cass = ToolCassette::default();
+        let player = ReplayingTool::new(cass, None);
+        let r = player.run(serde_json::json!({"q": "nope"})).await;
+        match r {
+            Err(Error::Provider(msg)) => {
+                assert!(msg.contains("no recorded tool response"));
+            }
+            other => panic!("expected Provider error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_replay_miss_falls_through_to_passthrough() {
+        let cass = ToolCassette::default();
+        let live = Arc::new(EchoTool {
+            seen: AtomicU32::new(0),
+        });
+        let player = ReplayingTool::new(
+            cass,
+            Some(live.clone() as Arc<dyn litgraph_core::tool::Tool>),
+        );
+        let r = player.run(serde_json::json!({"x": 7})).await.unwrap();
+        assert_eq!(r, serde_json::json!({"echo": {"x": 7}}));
+        assert_eq!(live.seen.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn tool_cassette_save_and_load_through_disk() {
+        let inner = Arc::new(EchoTool {
+            seen: AtomicU32::new(0),
+        });
+        let cass = Arc::new(parking_lot::Mutex::new(ToolCassette::default()));
+        let recorder = RecordingTool::new(
+            inner as Arc<dyn litgraph_core::tool::Tool>,
+            cass.clone(),
+        );
+        recorder
+            .run(serde_json::json!({"disk": "test"}))
+            .await
+            .unwrap();
+        let snap = cass.lock().clone();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        snap.save_to_file(tmp.path()).unwrap();
+        let restored = ToolCassette::load_from_file(tmp.path()).unwrap();
+        let player = ReplayingTool::new(restored, None);
+        let r = player
+            .run(serde_json::json!({"disk": "test"}))
+            .await
+            .unwrap();
+        assert_eq!(r, serde_json::json!({"echo": {"disk": "test"}}));
+    }
+
+    #[tokio::test]
+    async fn tool_args_hash_is_deterministic() {
+        let h1 = tool_args_hash(&serde_json::json!({"x": 1, "y": 2}));
+        let h2 = tool_args_hash(&serde_json::json!({"x": 1, "y": 2}));
+        assert_eq!(h1, h2);
+        let h3 = tool_args_hash(&serde_json::json!({"x": 1, "y": 3}));
+        assert_ne!(h1, h3);
+    }
+
+    #[tokio::test]
+    async fn tool_replay_schema_synthesized_when_no_passthrough() {
+        let cass = ToolCassette::default();
+        let player = ReplayingTool::new(cass, None)
+            .with_name("custom_tool")
+            .with_description("desc");
+        let s = player.schema();
+        assert_eq!(s.name, "custom_tool");
+        assert_eq!(s.description, "desc");
+        assert!(s.parameters.is_object());
+    }
+
+    #[tokio::test]
+    async fn tool_replay_schema_proxied_to_passthrough() {
+        let live = Arc::new(EchoTool {
+            seen: AtomicU32::new(0),
+        });
+        let cass = ToolCassette::default();
+        let player = ReplayingTool::new(
+            cass,
+            Some(live as Arc<dyn litgraph_core::tool::Tool>),
+        );
+        let s = player.schema();
+        assert_eq!(s.name, "echo");
     }
 }
 
