@@ -11,11 +11,13 @@ pub mod html_header;
 pub mod code;
 pub mod token;
 pub mod csv_row;
+pub mod sentence;
 
 pub use recursive::{Language, RecursiveCharacterSplitter};
 pub use markdown::MarkdownHeaderSplitter;
 pub use markdown_table::MarkdownTableSplitter;
 pub use csv_row::CsvRowSplitter;
+pub use sentence::SentenceSplitter;
 pub use semantic::SemanticChunker;
 pub use json::JsonSplitter;
 pub use html_header::HtmlHeaderSplitter;
