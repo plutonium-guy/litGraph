@@ -215,6 +215,7 @@ long-term Store. Older (v0.3) features rolled in from prior audit.
 | ParentDocumentRetriever | Small-chunk match, big-chunk return | ✅ |
 | MultiVectorRetriever | N caller-supplied perspectives per parent | ✅ `litgraph_retrieval::MultiVectorRetriever` — caller supplies summaries / hypothetical Qs / chunks per parent; indexing fans out via `embed_documents_concurrent` (iter 183), retrieval dedups by parent_id and returns the parent. Python: `litgraph.retrieval.MultiVectorRetriever(vector_store, embeddings, parent_store)`. (iter 188) |
 | MultiQueryRetriever | Query rewriting | ✅ |
+| RagFusionRetriever | Query expansion + reciprocal-rank fusion | ✅ `litgraph_retrieval::RagFusionRetriever` — same paraphrase-generation pattern as `MultiQueryRetriever` but fuses via RRF instead of dedup-with-first-wins. Doc that ranks #2 in query A and #1 in query B beats a doc that ranks #1 in query A but isn't found in B. Cormack 2009 RRF (k=60 default), Raudaschl 2023 popularization for retrieval-augmented generation. `with_branch_k(n)` controls per-query depth (default 10) so RRF has more candidates to score across. Use over MultiQuery when cross-paraphrase consistency matters more than the original query's exact ranking. (iter 266) |
 | ContextualCompressionRetriever | Chunk filtering | ✅ |
 | SelfQueryRetriever | LLM extracts metadata filter | ✅ |
 | TimeWeightedRetriever | Recent docs first | ✅ |
