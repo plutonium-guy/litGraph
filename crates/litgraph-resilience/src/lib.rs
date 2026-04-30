@@ -1255,6 +1255,94 @@ impl Embeddings for RateLimitedEmbeddings {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// SingleflightTool — request-coalescing wrapper for Tool::run
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Wrap any [`litgraph_core::tool::Tool`] so concurrent calls
+/// with identical args share ONE upstream `run`. Bridges the
+/// iter-252 [`Singleflight`] primitive into the tool family —
+/// closes the request-coalescing matrix across chat (intentionally
+/// not coalesced), embed (iter 253), and tool (this iter).
+///
+/// # Hash key
+///
+/// blake3 over canonical JSON of `args` (same hash function as
+/// iter 256 `tool_args_hash`). Identical args → identical hash
+/// → coalesced call.
+///
+/// # Error handling
+///
+/// Errors broadcast as `Arc<String>` (the inner `Error`'s
+/// `to_string()`) — same lossy-by-design tradeoff as
+/// `SingleflightEmbeddings`. Variant info collapses to
+/// `Error::Provider(s)` on the caller side.
+///
+/// # Real prod use
+///
+/// - **Idempotent expensive lookups**: `lookup_user("alice")`
+///   called 10× concurrently from different agent steps → 1
+///   DB round-trip.
+/// - **Hot search query coalescing**: a popular search-tool
+///   query embedded by 50 concurrent eval rows → 1 SerpAPI call.
+/// - **Stable function tools**: tools whose output is a pure
+///   function of args benefit; tools with side effects MUST
+///   NOT be coalesced (would deduplicate the side effects).
+///
+/// # When NOT to coalesce
+///
+/// Tools with side effects (writes, sends, mutations) must NOT
+/// be wrapped — coalescing collapses N intent-distinct calls
+/// into one execution. Use only for idempotent reads /
+/// pure-function tools.
+pub struct SingleflightTool {
+    pub inner: Arc<dyn litgraph_core::tool::Tool>,
+    sf: Arc<Singleflight<String, Arc<std::result::Result<serde_json::Value, String>>>>,
+}
+
+impl SingleflightTool {
+    pub fn new(inner: Arc<dyn litgraph_core::tool::Tool>) -> Self {
+        Self {
+            inner,
+            sf: Arc::new(Singleflight::new()),
+        }
+    }
+}
+
+#[async_trait]
+impl litgraph_core::tool::Tool for SingleflightTool {
+    fn schema(&self) -> litgraph_core::tool::ToolSchema {
+        self.inner.schema()
+    }
+
+    async fn run(
+        &self,
+        args: serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let key = blake3::hash(
+            serde_json::to_string(&args).unwrap_or_default().as_bytes(),
+        )
+        .to_hex()
+        .to_string();
+        let inner = self.inner.clone();
+        let args_for_compute = args.clone();
+        let r = self
+            .sf
+            .get_or_compute(key, move || async move {
+                let res = inner.run(args_for_compute).await;
+                Arc::new(match res {
+                    Ok(v) => Ok(v),
+                    Err(e) => Err(e.to_string()),
+                })
+            })
+            .await;
+        match &*r {
+            Ok(v) => Ok(v.clone()),
+            Err(s) => Err(Error::Provider(s.clone())),
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // SingleflightEmbeddings — request-coalescing wrapper for embed_query
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -6082,6 +6170,124 @@ mod tests {
         let me = MetricsEmbeddings::new(inner as Arc<dyn Embeddings>, &registry);
         assert_eq!(me.dimensions(), 9);
         assert_eq!(me.name(), "flaky-embed");
+    }
+
+    // ---- SingleflightTool tests ----------------------------------------
+
+    /// Slow echo tool: sleeps `delay_ms` then echoes args. Counts
+    /// inner invocations so tests verify dedup happened.
+    struct SlowEchoTool {
+        seen: AtomicU32,
+        delay_ms: u64,
+    }
+
+    #[async_trait]
+    impl litgraph_core::tool::Tool for SlowEchoTool {
+        fn schema(&self) -> litgraph_core::tool::ToolSchema {
+            litgraph_core::tool::ToolSchema {
+                name: "slow_echo".into(),
+                description: "echo with delay".into(),
+                parameters: serde_json::json!({"type":"object"}),
+            }
+        }
+        async fn run(
+            &self,
+            args: serde_json::Value,
+        ) -> Result<serde_json::Value> {
+            self.seen.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(self.delay_ms)).await;
+            Ok(serde_json::json!({"echo": args}))
+        }
+    }
+
+    #[tokio::test]
+    async fn singleflight_tool_concurrent_same_args_one_call() {
+        let inner = Arc::new(SlowEchoTool {
+            seen: AtomicU32::new(0),
+            delay_ms: 30,
+        });
+        let sf = Arc::new(SingleflightTool::new(
+            inner.clone() as Arc<dyn litgraph_core::tool::Tool>,
+        ));
+        let mut handles = Vec::new();
+        for _ in 0..10 {
+            let sf = sf.clone();
+            handles.push(tokio::spawn(async move {
+                sf.run(serde_json::json!({"key": "shared"})).await
+            }));
+        }
+        for h in handles {
+            let v = h.await.unwrap().unwrap();
+            assert_eq!(v, serde_json::json!({"echo": {"key": "shared"}}));
+        }
+        // Single inner call despite 10 concurrent identical args.
+        assert_eq!(
+            inner.seen.load(Ordering::SeqCst),
+            1,
+            "inner ran more than once",
+        );
+    }
+
+    #[tokio::test]
+    async fn singleflight_tool_different_args_run_independently() {
+        let inner = Arc::new(SlowEchoTool {
+            seen: AtomicU32::new(0),
+            delay_ms: 5,
+        });
+        let sf = Arc::new(SingleflightTool::new(
+            inner.clone() as Arc<dyn litgraph_core::tool::Tool>,
+        ));
+        let mut handles = Vec::new();
+        for i in 0..5 {
+            let sf = sf.clone();
+            handles.push(tokio::spawn(async move {
+                sf.run(serde_json::json!({"i": i})).await
+            }));
+        }
+        for h in handles {
+            let _ = h.await.unwrap().unwrap();
+        }
+        assert_eq!(inner.seen.load(Ordering::SeqCst), 5);
+    }
+
+    #[tokio::test]
+    async fn singleflight_tool_propagates_errors_as_provider_error() {
+        let inner: Arc<dyn litgraph_core::tool::Tool> = Arc::new(AlwaysFailTool);
+        let sf = SingleflightTool::new(inner);
+        let r = sf.run(serde_json::json!({"q": "bad"})).await;
+        match r {
+            Err(Error::Provider(msg)) => {
+                assert!(msg.contains("synthetic"));
+            }
+            other => panic!("expected Provider error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn singleflight_tool_window_closes_after_completion() {
+        // First call runs compute; second call after the in-flight
+        // window closes runs compute again.
+        let inner = Arc::new(SlowEchoTool {
+            seen: AtomicU32::new(0),
+            delay_ms: 0,
+        });
+        let sf = SingleflightTool::new(
+            inner.clone() as Arc<dyn litgraph_core::tool::Tool>,
+        );
+        let _ = sf.run(serde_json::json!({"q": "a"})).await.unwrap();
+        let _ = sf.run(serde_json::json!({"q": "a"})).await.unwrap();
+        // Both calls ran independently — coalescing only inside an
+        // in-flight window.
+        assert_eq!(inner.seen.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn singleflight_tool_schema_proxies_inner() {
+        let inner: Arc<dyn litgraph_core::tool::Tool> = Arc::new(EchoTool {
+            seen: AtomicU32::new(0),
+        });
+        let sf = SingleflightTool::new(inner);
+        assert_eq!(sf.schema().name, "echo");
     }
 
     #[tokio::test]
