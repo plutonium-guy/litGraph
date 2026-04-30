@@ -26,6 +26,7 @@ pub mod record_replay;
 pub mod circuit_breaker;
 pub mod bulkhead;
 pub mod hedged;
+pub mod singleflight;
 pub mod hyde;
 pub mod compression;
 pub mod self_query;
@@ -71,6 +72,7 @@ pub use record_replay::{
 pub use circuit_breaker::CircuitBreakerRetriever;
 pub use bulkhead::{BulkheadMode as BulkheadRetrieverMode, BulkheadRetriever};
 pub use hedged::HedgedRetriever;
+pub use singleflight::SingleflightRetriever;
 pub use hyde::HydeRetriever;
 pub use compression::{
     Compressor, ContextualCompressionRetriever, EmbeddingsFilterCompressor,
