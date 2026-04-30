@@ -325,6 +325,7 @@ long-term Store. Older (v0.3) features rolled in from prior audit.
 | Token usage events | Per-call accounting | ✅ |
 | Datadog / NewRelic native | OTLP covers it | ✅ via OTLP |
 | Phoenix (Arize) integration | Trace UI | ✅ via OTLP |
+| In-process metrics aggregation | Cheap counters/gauges/histograms for `/metrics` endpoint | ✅ `litgraph_core::MetricsRegistry` (iter 260) — atomic Counter / Gauge / Histogram primitives keyed by name. Lock-free hot-path updates (AtomicU64 / AtomicI64 / per-bucket atomics + f64-bits CAS for histogram sum). Get-or-create lookup so multiple call sites share one underlying instrument. `to_prometheus()` renders text exposition format suitable for direct response from a Prometheus scrape endpoint. Distinct from the tracing/OTel layer (per-request span propagation): metrics is for "rate of X across the whole process right now" aggregates that don't need per-request correlation. Real prod use: agent loop counters (`tool_calls_total{name="…"}`), in-flight gauges via wrapper inc-on-entry/dec-on-exit, latency histograms with configurable buckets. |
 
 ## 19. Deployment / Serve
 

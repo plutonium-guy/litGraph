@@ -51,6 +51,7 @@ pub mod bulkhead;
 pub mod hedged;
 pub mod singleflight;
 pub mod priority_queue;
+pub mod metrics;
 pub mod tool_dispatch;
 pub mod table_parser;
 
@@ -129,6 +130,7 @@ pub use bulkhead::{Bulkhead, BulkheadGuard};
 pub use hedged::hedged_call;
 pub use singleflight::Singleflight;
 pub use priority_queue::PriorityQueue;
+pub use metrics::{Counter, Gauge, Histogram, MetricsRegistry};
 pub use tool_dispatch::{
     tool_dispatch_concurrent, tool_dispatch_concurrent_fail_fast,
     tool_dispatch_concurrent_stream, tool_dispatch_concurrent_stream_with_progress,
