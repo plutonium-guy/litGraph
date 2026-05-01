@@ -13,6 +13,7 @@ pub mod plan_execute;
 pub mod subagent;
 pub mod map_reduce;
 pub mod refine;
+pub mod critique_revise;
 
 pub use react::{AgentEvent, AgentEventStream, AgentState, ReactAgent, ReactAgentConfig};
 pub use supervisor::{SupervisorAgent, SupervisorConfig};
@@ -26,3 +27,6 @@ pub use plan_execute::{
 pub use subagent::SubagentTool;
 pub use map_reduce::MapReduceSummarizer;
 pub use refine::RefineSummarizer;
+pub use critique_revise::{
+    CritiqueReviseAgent, CritiqueReviseIteration, CritiqueReviseResult,
+};
