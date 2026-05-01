@@ -73,7 +73,8 @@ pub use format_instructions::{
 };
 pub use evaluators::{
     contains_all, contains_any, embedding_cosine, exact_match, exact_match_strict,
-    jaccard_similarity, json_validity, levenshtein, levenshtein_ratio, regex_match,
+    jaccard_similarity, json_validity, levenshtein, levenshtein_ratio, regex_match, rouge_1,
+    rouge_2, rouge_l, rouge_n, RougeScore,
 };
 pub use output_fixer::{fix_with_llm, parse_with_retry};
 pub use partial_json::{parse_partial_json, repair_partial_json};
