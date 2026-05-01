@@ -306,6 +306,139 @@ impl RougeScore {
     }
 }
 
+/// BLEU-N score (Papineni et al. 2002) — clipped n-gram precision
+/// with brevity penalty. The de-facto translation-eval metric;
+/// pairs with iter-304 ROUGE for the precision-vs-recall tradeoff.
+///
+/// # Distinct from ROUGE
+///
+/// - **ROUGE** is recall-emphasizing → "did the candidate cover the
+///   reference's content?" — fits summarization where missing facts
+///   is worse than adding extras.
+/// - **BLEU** is precision-weighted → "is the candidate's content
+///   actually in the reference?" — fits translation where extra
+///   content is hallucination, not bonus.
+///
+/// Different shapes of the same n-gram-overlap problem; ship both
+/// because different tasks need different bias.
+///
+/// # The score
+///
+/// 1. Tokenize both via lowercase + whitespace split.
+/// 2. For each n in `1..=max_n`: compute clipped n-gram precision
+///    `p_n = overlap / cand-total-grams` (same clipped-count rule
+///    as ROUGE-N).
+/// 3. Geometric mean of the precisions:
+///    `gm = exp(Σ log(p_n) / max_n)`. With strict semantics, ANY
+///    zero precision sends gm to 0 (and therefore BLEU to 0). With
+///    smoothing (`smooth = true`), zero overlaps are replaced with
+///    `1 / (cand_total + 1)` per Chen & Cherry (2014) method 1 lite
+///    — keeps short-sentence scores informative without inflating.
+/// 4. Brevity penalty `BP = 1` if `cand_len ≥ ref_len`, else
+///    `exp(1 - ref_len / cand_len)`. Penalizes abridged candidates
+///    that "cheat" by hitting high precision on a short prefix.
+/// 5. `BLEU = BP · gm`.
+///
+/// # Convention shortcuts
+///
+/// - `bleu(ref, cand)` → BLEU-4 (standard, what every paper reports).
+/// - `bleu_smoothed(ref, cand)` → BLEU-4 with Chen & Cherry smoothing.
+///   Use this for sentence-level evals where strict zeros are common.
+pub fn bleu_n(reference: &str, candidate: &str, max_n: usize, smooth: bool) -> BleuScore {
+    let ref_tokens: Vec<String> = tokenize_lower(reference).collect();
+    let cand_tokens: Vec<String> = tokenize_lower(candidate).collect();
+    let r = ref_tokens.len();
+    let c = cand_tokens.len();
+    if max_n == 0 || c == 0 || r == 0 {
+        return BleuScore {
+            score: 0.0,
+            brevity_penalty: 0.0,
+            precisions: Vec::new(),
+            ref_len: r,
+            cand_len: c,
+        };
+    }
+    let mut precisions = Vec::with_capacity(max_n);
+    for n in 1..=max_n {
+        let ref_grams = ngrams(&ref_tokens, n);
+        let cand_grams = ngrams(&cand_tokens, n);
+        if cand_grams.is_empty() {
+            // Cand too short for this n — treat as 0 (will zero-out
+            // strict score, smoothing handles below).
+            precisions.push(0.0);
+            continue;
+        }
+        let ref_counts = count_map(&ref_grams);
+        let cand_counts = count_map(&cand_grams);
+        let mut overlap: usize = 0;
+        for (g, &cc) in &cand_counts {
+            if let Some(&rc) = ref_counts.get(g) {
+                overlap += rc.min(cc);
+            }
+        }
+        let p = if smooth && overlap == 0 {
+            // Chen & Cherry (2014) method-1 lite — replace zero
+            // overlap with `1 / (cand_total + 1)`. Avoids -inf
+            // in log-domain and keeps the contribution small but
+            // nonzero (penalizing missed n-grams without erasing
+            // the score entirely).
+            1.0 / (cand_grams.len() + 1) as f32
+        } else {
+            overlap as f32 / cand_grams.len() as f32
+        };
+        precisions.push(p);
+    }
+    // Brevity penalty: penalize candidates shorter than the reference.
+    let bp = if c >= r {
+        1.0
+    } else {
+        (1.0 - r as f32 / c as f32).exp()
+    };
+    // Geometric mean. Any zero precision in strict mode → score 0.
+    let any_zero = precisions.iter().any(|&p| p == 0.0);
+    let geo_mean = if any_zero {
+        0.0
+    } else {
+        let log_sum: f32 = precisions.iter().map(|p| p.ln()).sum();
+        (log_sum / precisions.len() as f32).exp()
+    };
+    BleuScore {
+        score: bp * geo_mean,
+        brevity_penalty: bp,
+        precisions,
+        ref_len: r,
+        cand_len: c,
+    }
+}
+
+/// BLEU-4 (the standard reported variant). Strict semantics — any
+/// zero n-gram precision yields a score of 0.
+pub fn bleu(reference: &str, candidate: &str) -> f32 {
+    bleu_n(reference, candidate, 4, false).score
+}
+
+/// BLEU-4 with Chen & Cherry (2014) method-1 lite smoothing. Use
+/// when comparing short sentences where strict BLEU often degenerates
+/// to 0 due to sparse 3-grams / 4-grams (statistically uninformative).
+pub fn bleu_smoothed(reference: &str, candidate: &str) -> f32 {
+    bleu_n(reference, candidate, 4, true).score
+}
+
+/// Full BLEU result with diagnostic breakdown.
+///
+/// `precisions` is the per-n vector (length `max_n`); `brevity_penalty`
+/// surfaces whether the score was attenuated for being too short
+/// (helpful for debugging "why is BLEU so low?" — often the answer
+/// is "your candidate is half the length of the reference").
+#[derive(Debug, Clone, PartialEq)]
+pub struct BleuScore {
+    pub score: f32,
+    pub brevity_penalty: f32,
+    pub precisions: Vec<f32>,
+    pub ref_len: usize,
+    pub cand_len: usize,
+}
+
 fn ngrams(tokens: &[String], n: usize) -> Vec<Vec<String>> {
     if tokens.len() < n || n == 0 {
         return Vec::new();
@@ -606,5 +739,128 @@ mod tests {
         // Case differences must NOT affect scores.
         let a = rouge_1("Hello World", "hello world");
         assert!((a.f1 - 1.0).abs() < 1e-6);
+    }
+
+    // ─── BLEU ─────────────────────────────────────────────────────
+
+    #[test]
+    fn bleu_identical_strings_one() {
+        // Identical strings (≥ 4 tokens so all n-grams exist) → 1.0.
+        let s = bleu("the cat sat on the mat", "the cat sat on the mat");
+        assert!((s - 1.0).abs() < 1e-5, "got {s}");
+    }
+
+    #[test]
+    fn bleu_known_5_of_6_fixture() {
+        // ref:  the cat sat on the mat (6)
+        // cand: the cat sat on the floor (6)
+        // p1 = 5/6, p2 = 4/5, p3 = 3/4, p4 = 2/3
+        // BP = 1 (lengths equal)
+        // BLEU = exp((ln(5/6) + ln(4/5) + ln(3/4) + ln(2/3)) / 4) ≈ 0.7598
+        let s = bleu("the cat sat on the mat", "the cat sat on the floor");
+        let expected = ((5.0_f32 / 6.0).ln()
+            + (4.0_f32 / 5.0).ln()
+            + (3.0_f32 / 4.0).ln()
+            + (2.0_f32 / 3.0).ln())
+            / 4.0;
+        let expected = expected.exp();
+        assert!((s - expected).abs() < 1e-5, "got {s}, expected {expected}");
+    }
+
+    #[test]
+    fn bleu_empty_inputs_zero() {
+        assert_eq!(bleu("", "x y z w"), 0.0);
+        assert_eq!(bleu("x y z w", ""), 0.0);
+        assert_eq!(bleu("", ""), 0.0);
+    }
+
+    #[test]
+    fn bleu_brevity_penalty_short_candidate() {
+        // ref = 7 tokens, cand = 2. BP = exp(1 - 7/2) = exp(-2.5) ≈ 0.0821.
+        // Strict BLEU-4 would be 0 (cand too short for trigrams/4-grams),
+        // so we use bleu_n with max_n=1 to isolate the BP effect:
+        // p1 = 2/2 = 1.0, BP * 1.0 = exp(-2.5).
+        let res = bleu_n("the cat is sitting on the mat", "the cat", 1, false);
+        let expected_bp = (-2.5_f32).exp();
+        assert!(
+            (res.brevity_penalty - expected_bp).abs() < 1e-5,
+            "bp={}",
+            res.brevity_penalty
+        );
+        assert!((res.score - expected_bp).abs() < 1e-5, "score={}", res.score);
+    }
+
+    #[test]
+    fn bleu_no_brevity_penalty_when_cand_longer() {
+        // cand longer than ref → BP = 1.
+        let res = bleu_n("the cat", "the cat is cute and fluffy", 1, false);
+        assert!((res.brevity_penalty - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn bleu_strict_zero_precision_zeros_score() {
+        // ref:  the cat sat on the mat
+        // cand: dogs run quickly daily here  (5 tokens, completely disjoint)
+        // ALL p_n are 0 → score is 0.
+        let s = bleu("the cat sat on the mat", "dogs run quickly daily here");
+        assert_eq!(s, 0.0);
+    }
+
+    #[test]
+    fn bleu_smoothed_avoids_zero_for_short_match() {
+        // 4-token cand against an 8-token ref; cand has 1 unigram match.
+        // Strict BLEU-4: p_2/p_3/p_4 are likely 0 → score 0.
+        // Smoothed: zeros replaced with 1/(cand_grams + 1) → small but
+        // nonzero score.
+        let strict = bleu("the cat sat on the mat over there", "the dog ran fast");
+        let smoothed = bleu_smoothed("the cat sat on the mat over there", "the dog ran fast");
+        assert_eq!(strict, 0.0);
+        assert!(smoothed > 0.0, "smoothed should be > 0");
+        // Smoothed score should still be small (penalizing the misses)
+        // — sanity check it didn't explode upward.
+        assert!(smoothed < 0.5, "smoothed should be < 0.5, got {smoothed}");
+    }
+
+    #[test]
+    fn bleu_clipped_overlap_repeats() {
+        // Same trap as ROUGE: cand has "the" 5 times; ref has 1.
+        // p_1 should be 1/5, NOT 5/5. BLEU-1 with that:
+        // BP = exp(1 - 2/5) = exp(0.6)... wait, ref=2 tokens, cand=5 → cand longer → BP=1.
+        // score = 1.0 * 1/5 = 0.2.
+        let res = bleu_n("the cat", "the the the the the", 1, false);
+        assert!((res.precisions[0] - 0.2).abs() < 1e-5, "p1={}", res.precisions[0]);
+        assert!((res.score - 0.2).abs() < 1e-5);
+    }
+
+    #[test]
+    fn bleu_max_n_zero_returns_zero() {
+        let res = bleu_n("the cat", "the cat", 0, false);
+        assert_eq!(res.score, 0.0);
+        assert!(res.precisions.is_empty());
+    }
+
+    #[test]
+    fn bleu_max_n_one_isolates_unigrams() {
+        let res = bleu_n("the cat sat", "the cat sat", 1, false);
+        assert_eq!(res.precisions.len(), 1);
+        assert!((res.score - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn bleu_lowercase_normalization() {
+        let s = bleu("The Cat Sat On The Mat", "the cat sat on the mat");
+        assert!((s - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn bleu_score_struct_carries_diagnostics() {
+        let res = bleu_n("the cat sat on the mat", "the cat sat on the floor", 4, false);
+        assert_eq!(res.ref_len, 6);
+        assert_eq!(res.cand_len, 6);
+        assert_eq!(res.precisions.len(), 4);
+        assert!((res.brevity_penalty - 1.0).abs() < 1e-6);
+        // p1 should be the highest, p4 the lowest (since the mismatch
+        // is in the last token).
+        assert!(res.precisions[0] >= res.precisions[3]);
     }
 }
