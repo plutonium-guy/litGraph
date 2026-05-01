@@ -439,6 +439,174 @@ pub struct BleuScore {
     pub cand_len: usize,
 }
 
+/// chrF score (Popović 2015) — character-level F-score over n-gram
+/// precision and recall, averaged across `n = 1..=max_n`. The third
+/// leg of the NLG-eval triad alongside iter-304 ROUGE and iter-305
+/// BLEU.
+///
+/// # Why character n-grams
+///
+/// Word-level metrics (ROUGE, BLEU) treat "running" and "runs" as
+/// completely different tokens — zero overlap — even though they
+/// share the morphological root. chrF's character n-grams catch
+/// the shared substring, giving partial credit for inflectional
+/// variants. Especially load-bearing for morphologically rich
+/// languages (German compound words, Slavic case endings, Arabic
+/// roots) but improves correlation with human judgment in English
+/// too where paraphrases swap word forms.
+///
+/// # The score
+///
+/// 1. Strip whitespace from both strings (chrF's standard
+///    preprocessing — character n-grams within and across word
+///    boundaries are equally informative for short n).
+/// 2. For each n in `1..=max_n`: compute clipped character-n-gram
+///    precision `p_n` and recall `r_n` (same clipped-count rule
+///    as ROUGE-N / BLEU).
+/// 3. Macro-average: `chrP = (1/N) · Σ p_n`, `chrR = (1/N) · Σ r_n`.
+/// 4. F-beta combination: `F = (1+β²) · chrP · chrR / (β² · chrP + chrR)`.
+///
+/// # Standard parameters
+///
+/// `chrf(reference, candidate)` defaults to `max_n = 6`, `β = 2.0`
+/// (recall-weighted), matching Popović 2015's empirically-best
+/// settings for translation eval. Use `chrf_n` to override either.
+///
+/// # Case folding
+///
+/// This implementation lowercases both inputs for consistency with
+/// the rest of the evaluator family (ROUGE, BLEU). Strict case-
+/// sensitive chrF (matching the original Popović reference impl)
+/// is one `to_lowercase` call away in user code if needed; case-
+/// folded was chosen as the default because most agent-facing
+/// evals don't want "the cat" / "The cat" to score below 1.0.
+pub fn chrf_n(
+    reference: &str,
+    candidate: &str,
+    max_n: usize,
+    beta: f32,
+) -> ChrfScore {
+    if max_n == 0 || reference.is_empty() || candidate.is_empty() {
+        return ChrfScore::zero(beta);
+    }
+    // Lowercase + strip whitespace.
+    let ref_chars: Vec<char> = reference
+        .to_lowercase()
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    let cand_chars: Vec<char> = candidate
+        .to_lowercase()
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    if ref_chars.is_empty() || cand_chars.is_empty() {
+        return ChrfScore::zero(beta);
+    }
+    let mut sum_p = 0.0_f32;
+    let mut sum_r = 0.0_f32;
+    let mut count = 0_f32;
+    for n in 1..=max_n {
+        if ref_chars.len() < n || cand_chars.len() < n {
+            // No n-grams of this length on one side — skip rather
+            // than push a zero (a zero would drag the macro average
+            // down for input that's just shorter than n).
+            continue;
+        }
+        let (p, r) = char_ngram_pr(&ref_chars, &cand_chars, n);
+        sum_p += p;
+        sum_r += r;
+        count += 1.0;
+    }
+    if count == 0.0 {
+        return ChrfScore::zero(beta);
+    }
+    let chr_p = sum_p / count;
+    let chr_r = sum_r / count;
+    let beta_sq = beta * beta;
+    let denom = beta_sq * chr_p + chr_r;
+    let f_beta = if denom == 0.0 {
+        0.0
+    } else {
+        (1.0 + beta_sq) * chr_p * chr_r / denom
+    };
+    ChrfScore {
+        precision: chr_p,
+        recall: chr_r,
+        f_beta,
+        beta,
+    }
+}
+
+/// Standard chrF — `max_n = 6`, `β = 2.0`. Returns the headline
+/// F-beta score directly; use `chrf_n` for the full struct or
+/// non-standard parameters.
+pub fn chrf(reference: &str, candidate: &str) -> f32 {
+    chrf_n(reference, candidate, 6, 2.0).f_beta
+}
+
+/// chrF result with diagnostic breakdown.
+///
+/// `f_beta` is the headline number (β-weighted F-score over the
+/// macro-averaged character n-gram precision and recall);
+/// `precision` and `recall` are exposed for over/under-generation
+/// debugging; `beta` is echoed so callers comparing cross-
+/// configuration results know which weighting was used.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ChrfScore {
+    pub precision: f32,
+    pub recall: f32,
+    pub f_beta: f32,
+    pub beta: f32,
+}
+
+impl ChrfScore {
+    fn zero(beta: f32) -> Self {
+        Self {
+            precision: 0.0,
+            recall: 0.0,
+            f_beta: 0.0,
+            beta,
+        }
+    }
+}
+
+/// Compute clipped char-n-gram precision and recall for a single n.
+fn char_ngram_pr(ref_chars: &[char], cand_chars: &[char], n: usize) -> (f32, f32) {
+    let ref_grams = char_ngrams(ref_chars, n);
+    let cand_grams = char_ngrams(cand_chars, n);
+    if ref_grams.is_empty() || cand_grams.is_empty() {
+        return (0.0, 0.0);
+    }
+    use std::collections::HashMap;
+    let mut ref_counts: HashMap<&[char], usize> = HashMap::new();
+    for g in &ref_grams {
+        *ref_counts.entry(g.as_slice()).or_insert(0) += 1;
+    }
+    let mut cand_counts: HashMap<&[char], usize> = HashMap::new();
+    for g in &cand_grams {
+        *cand_counts.entry(g.as_slice()).or_insert(0) += 1;
+    }
+    let mut overlap: usize = 0;
+    for (g, &cc) in &cand_counts {
+        if let Some(&rc) = ref_counts.get(g) {
+            overlap += rc.min(cc);
+        }
+    }
+    let p = overlap as f32 / cand_grams.len() as f32;
+    let r = overlap as f32 / ref_grams.len() as f32;
+    (p, r)
+}
+
+fn char_ngrams(chars: &[char], n: usize) -> Vec<Vec<char>> {
+    if chars.len() < n || n == 0 {
+        return Vec::new();
+    }
+    (0..=chars.len() - n)
+        .map(|i| chars[i..i + n].to_vec())
+        .collect()
+}
+
 fn ngrams(tokens: &[String], n: usize) -> Vec<Vec<String>> {
     if tokens.len() < n || n == 0 {
         return Vec::new();
@@ -862,5 +1030,109 @@ mod tests {
         // p1 should be the highest, p4 the lowest (since the mismatch
         // is in the last token).
         assert!(res.precisions[0] >= res.precisions[3]);
+    }
+
+    // ─── chrF ────────────────────────────────────────────────────
+
+    #[test]
+    fn chrf_identical_strings_one() {
+        let s = chrf("the cat sat on the mat", "the cat sat on the mat");
+        assert!((s - 1.0).abs() < 1e-5, "got {s}");
+    }
+
+    #[test]
+    fn chrf_empty_inputs_zero() {
+        assert_eq!(chrf("", "anything"), 0.0);
+        assert_eq!(chrf("anything", ""), 0.0);
+        assert_eq!(chrf("", ""), 0.0);
+    }
+
+    #[test]
+    fn chrf_disjoint_chars_yields_zero() {
+        // All characters disjoint after lowercase + whitespace strip.
+        let s = chrf("abc", "xyz");
+        assert_eq!(s, 0.0);
+    }
+
+    #[test]
+    fn chrf_morphological_variants_score_above_zero() {
+        // The marquee feature: word-level metrics give 0 for "running"
+        // vs "runs" (different tokens). chrF gives partial credit for
+        // the shared substring "run".
+        let r = rouge_1("running", "runs");
+        assert_eq!(r.f1, 0.0);
+        let c = chrf("running", "runs");
+        assert!(c > 0.0, "chrf got {c}, expected > 0 for morphological match");
+    }
+
+    #[test]
+    fn chrf_n_max_n_zero_returns_zero() {
+        let r = chrf_n("hello", "hello", 0, 2.0);
+        assert_eq!(r.f_beta, 0.0);
+        assert_eq!(r.precision, 0.0);
+        assert_eq!(r.recall, 0.0);
+    }
+
+    #[test]
+    fn chrf_clipped_overlap_repeats() {
+        // ref="aa" (1 unigram 'a' with count 2), cand="aaaaaa" (1 unigram 'a' with count 6).
+        // n=1: clipped overlap = min(2, 6) = 2. p1 = 2/6, r1 = 2/2 = 1.0.
+        // n=2: ref bigrams = [aa] (1), cand bigrams = [aa]*5 (5). overlap = min(1,5) = 1.
+        //   p2 = 1/5 = 0.2, r2 = 1/1 = 1.0.
+        // Macro avg: chrP = (1/3 + 1/5) / 2, chrR = 1.0.
+        let r = chrf_n("aa", "aaaaaa", 2, 2.0);
+        let expected_p = (1.0 / 3.0 + 0.2) / 2.0;
+        assert!(
+            (r.precision - expected_p).abs() < 1e-5,
+            "p={}, expected {expected_p}",
+            r.precision
+        );
+        assert!((r.recall - 1.0).abs() < 1e-5, "r={}", r.recall);
+    }
+
+    #[test]
+    fn chrf_higher_beta_weights_recall() {
+        // cand has all ref chars + many extras (high recall, low precision).
+        // β=2 should rank this higher than β=0.5 (which weights precision more).
+        let f_high_beta = chrf_n("ab", "abcdefghij", 1, 2.0).f_beta;
+        let f_low_beta = chrf_n("ab", "abcdefghij", 1, 0.5).f_beta;
+        assert!(
+            f_high_beta > f_low_beta,
+            "β=2 ({f_high_beta}) should outrank β=0.5 ({f_low_beta}) on recall-heavy match"
+        );
+    }
+
+    #[test]
+    fn chrf_whitespace_stripped() {
+        // Strings differing only in whitespace score 1.0.
+        let s = chrf("hello world", "helloworld");
+        assert!((s - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn chrf_lowercase_normalization() {
+        let s = chrf("Hello World", "hello world");
+        assert!((s - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn chrf_struct_carries_beta() {
+        let r = chrf_n("the cat", "the dog", 6, 2.0);
+        assert_eq!(r.beta, 2.0);
+        let r2 = chrf_n("the cat", "the dog", 6, 1.0);
+        assert_eq!(r2.beta, 1.0);
+    }
+
+    #[test]
+    fn chrf_skip_n_when_too_short_doesnt_zero_score() {
+        // After lowercase + whitespace strip, "Hi!" → "hi!" = 3 chars.
+        // With max_n=6, n=4..6 have no grams → SKIP rather than zero.
+        // n=1..3 contribute → final score ~1 for identical inputs.
+        let r = chrf_n("Hi!", "Hi!", 6, 2.0);
+        assert!(
+            r.f_beta > 0.99,
+            "got {} — short identical inputs should score ~1",
+            r.f_beta
+        );
     }
 }
