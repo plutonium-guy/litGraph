@@ -33,6 +33,7 @@ mod text_diff;
 mod jwt_decode;
 mod datetime_parse;
 mod html_to_text;
+mod slugify;
 
 pub use calculator::CalculatorTool;
 pub use http_request::{HttpRequestTool, HttpRequestConfig};
@@ -61,3 +62,4 @@ pub use text_diff::TextDiffTool;
 pub use jwt_decode::JwtDecodeTool;
 pub use datetime_parse::DatetimeParseTool;
 pub use html_to_text::{html_to_text, HtmlToTextTool};
+pub use slugify::{slugify, slugify_with, SlugifyTool};
