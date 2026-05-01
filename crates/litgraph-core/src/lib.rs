@@ -25,6 +25,7 @@ pub mod eval_drift;
 pub mod eval_significance;
 pub mod eval_effect_size;
 pub mod eval_bootstrap;
+pub mod eval_correlation;
 pub mod markdown_table_parser;
 pub mod vector_store_memory;
 pub mod store;
@@ -158,6 +159,9 @@ pub use eval_significance::{
 };
 pub use eval_effect_size::{paired_effect_size, PairedEffectSizeResult};
 pub use eval_bootstrap::{bootstrap_eval_ci, bootstrap_mean_ci, ConfidenceInterval};
+pub use eval_correlation::{
+    correlate_scorers, pearson_correlation, spearman_correlation, ScorerCorrelation,
+};
 pub use memory::{
     BufferMemory, ConversationMemory, MemorySnapshot, SummaryBufferMemory, TokenBufferMemory,
     TokenCounter, summarize_conversation,
