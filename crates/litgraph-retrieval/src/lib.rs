@@ -91,3 +91,6 @@ pub use eval_gen::{
     evaluate_generation, GenEvalConfig, GenReport, GenerationCase, PerCaseGenMetrics,
 };
 pub use transformers::{embedding_redundant_filter, long_context_reorder, mmr_select};
+
+pub mod dedup;
+pub use dedup::{DedupResult, SemanticDeduplicator};
