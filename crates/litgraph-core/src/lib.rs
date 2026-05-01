@@ -155,7 +155,8 @@ pub use eval_harness::{
 };
 pub use eval_drift::{detect_drift, CaseDrift, DriftReport};
 pub use eval_significance::{
-    mcnemar_test, wilcoxon_signed_rank_test, McNemarResult, WilcoxonResult,
+    mcnemar_test, permutation_test, wilcoxon_signed_rank_test, McNemarResult, PermutationResult,
+    WilcoxonResult,
 };
 pub use eval_effect_size::{paired_effect_size, PairedEffectSizeResult};
 pub use eval_bootstrap::{bootstrap_eval_ci, bootstrap_mean_ci, ConfidenceInterval};

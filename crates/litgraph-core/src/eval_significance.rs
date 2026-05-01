@@ -389,6 +389,182 @@ pub fn wilcoxon_signed_rank_test(
     out
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Paired permutation test (sign-flip) — exact significance for any sample size
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// One paired-permutation-test result for a (scorer, paired-cases) pair.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PermutationResult {
+    pub scorer: String,
+    /// Number of paired cases (zeros NOT dropped — they contribute to
+    /// the mean and to the permutation distribution where their
+    /// sign-flip has no effect).
+    pub n: u64,
+    /// Observed test statistic — `mean(current - baseline)`.
+    pub observed_mean_diff: f64,
+    /// Number of permutations actually run (clamped to `>= 1`).
+    pub n_permutations: u64,
+    /// Two-tailed p-value: fraction of permutations where the
+    /// permuted mean's absolute value `>= |observed_mean_diff|`.
+    pub p_value: f64,
+    /// `true` if `p_value < 0.05`.
+    pub significant_at_05: bool,
+}
+
+/// Paired permutation test (sign-flip variant) for every scorer that
+/// appears in both reports. Returns one result per scorer, sorted by
+/// scorer name.
+///
+/// # Why this not Wilcoxon
+///
+/// Wilcoxon (iter 297) uses a normal approximation to the rank-sum
+/// distribution. That approximation is unreliable for `n < 20`
+/// (Wilcoxon's `small_sample` flag warns users when this happens).
+/// The permutation test is *exact* — under the null hypothesis (no
+/// systematic difference between baseline and current), the sign of
+/// each diff is equally likely to be positive or negative, so we can
+/// directly Monte-Carlo-sample the null distribution by sign-flipping
+/// random subsets of the diffs and counting how often the permuted
+/// mean is at least as extreme as the observed one.
+///
+/// # Algorithm
+///
+/// 1. Pair (baseline, current) cases by input.
+/// 2. Compute diffs `d_i = current_i - baseline_i`.
+/// 3. Compute observed statistic `T_obs = mean(d_i)`.
+/// 4. For `n_permutations` Monte Carlo iterations: independently
+///    flip each diff's sign with probability 0.5, compute the
+///    permuted mean, count how many permutations have
+///    `|permuted_mean| >= |T_obs|`.
+/// 5. p-value = `count / n_permutations`.
+///
+/// # Recommended `n_permutations`
+///
+/// 1000 for snapshot-test-fast (sufficient for sub-0.05 boundary
+/// determination); 10000 for production CI gates (tighter
+/// estimate near the 0.01 boundary).
+///
+/// # Reproducibility
+///
+/// Seed-based. Same `(reports, n_permutations, seed)` → bit-identical
+/// p-values. Reuses iter-299's xorshift64 PRNG (no `rand` dep).
+pub fn permutation_test(
+    baseline: &EvalReport,
+    current: &EvalReport,
+    n_permutations: usize,
+    seed: u64,
+) -> Vec<PermutationResult> {
+    let n_permutations = n_permutations.max(1);
+    // Index baseline by input.
+    let baseline_by_input: HashMap<&str, &crate::eval_harness::EvalCaseResult> = baseline
+        .per_case
+        .iter()
+        .map(|c| (c.input.as_str(), c))
+        .collect();
+    // Collect per-scorer paired diffs.
+    let mut per_scorer: HashMap<String, Vec<f64>> = HashMap::new();
+    for cur_case in &current.per_case {
+        let Some(base_case) = baseline_by_input.get(cur_case.input.as_str()) else {
+            continue;
+        };
+        for (scorer, cur_val) in &cur_case.scores {
+            let cur_score = score_to_f64(cur_val);
+            let base_score = base_case
+                .scores
+                .get(scorer)
+                .map(score_to_f64)
+                .unwrap_or(0.0);
+            per_scorer
+                .entry(scorer.clone())
+                .or_default()
+                .push(cur_score - base_score);
+        }
+    }
+    let mut out = Vec::with_capacity(per_scorer.len());
+    for (scorer, diffs) in per_scorer {
+        let n = diffs.len();
+        if n == 0 {
+            out.push(PermutationResult {
+                scorer,
+                n: 0,
+                observed_mean_diff: 0.0,
+                n_permutations: n_permutations as u64,
+                p_value: 1.0,
+                significant_at_05: false,
+            });
+            continue;
+        }
+        let observed = diffs.iter().sum::<f64>() / n as f64;
+        let observed_abs = observed.abs();
+        // Each scorer gets its own seed-derived RNG so adding scorers
+        // doesn't shift the per-scorer permutation sequence.
+        let scorer_seed = seed.wrapping_add(scorer_seed_offset(&scorer));
+        let mut rng = PermXorshift64::new(scorer_seed);
+        let mut at_least_as_extreme: u64 = 0;
+        for _ in 0..n_permutations {
+            let mut sum = 0.0_f64;
+            for &d in &diffs {
+                // Sign-flip with p=0.5 via lowest bit of next random u64.
+                let bit = rng.next_u64() & 1;
+                let signed = if bit == 0 { d } else { -d };
+                sum += signed;
+            }
+            let perm_mean = sum / n as f64;
+            if perm_mean.abs() >= observed_abs {
+                at_least_as_extreme += 1;
+            }
+        }
+        let p_value = at_least_as_extreme as f64 / n_permutations as f64;
+        out.push(PermutationResult {
+            scorer,
+            n: n as u64,
+            observed_mean_diff: observed,
+            n_permutations: n_permutations as u64,
+            p_value,
+            significant_at_05: p_value < 0.05,
+        });
+    }
+    out.sort_by(|x, y| x.scorer.cmp(&y.scorer));
+    out
+}
+
+/// Per-scorer seed offset so adding/removing a scorer doesn't shift
+/// the permutation sequence used for OTHER scorers — each scorer's
+/// p-value stays stable across runs that change the scorer set.
+fn scorer_seed_offset(scorer: &str) -> u64 {
+    // FNV-1a hash, 64-bit. Tiny, deterministic, no extra dep.
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in scorer.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100_0000_01b3);
+    }
+    h
+}
+
+/// Same xorshift64 as iter-299 bootstrap, duplicated here to avoid
+/// making the eval_bootstrap PRNG `pub`. Two-line maintenance cost vs
+/// API surface contamination.
+struct PermXorshift64(u64);
+
+impl PermXorshift64 {
+    fn new(seed: u64) -> Self {
+        Self(if seed == 0 {
+            0x9E37_79B9_7F4A_7C15
+        } else {
+            seed
+        })
+    }
+    fn next_u64(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.0 = x;
+        x
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -785,5 +961,183 @@ mod tests {
         assert_eq!(res[1].scorer, "beta");
         assert!(res[0].mean_diff > 0.0); // alpha improved
         assert!(res[1].mean_diff < 0.0); // beta regressed
+    }
+
+    // ─── Permutation test ─────────────────────────────────────────
+
+    #[test]
+    fn permutation_no_diffs_p_one() {
+        // 5 cases identical → all diffs 0 → every permutation has
+        // permuted_mean == 0 == |observed| → p = 1.
+        let cases: Vec<EvalCaseResult> = (0..5)
+            .map(|i| make_case(&format!("q{i}"), &[("cosine", 0.5)]))
+            .collect();
+        let baseline = make_report(cases);
+        let current = baseline.clone();
+        let res = permutation_test(&baseline, &current, 1000, 42);
+        assert_eq!(res.len(), 1);
+        assert_eq!(res[0].n, 5);
+        assert_eq!(res[0].observed_mean_diff, 0.0);
+        // All permutations satisfy |0| >= |0| → p = 1.0.
+        assert_eq!(res[0].p_value, 1.0);
+        assert!(!res[0].significant_at_05);
+    }
+
+    #[test]
+    fn permutation_uniform_improvement_significant() {
+        // 25 cases all +0.1. observed mean = +0.1. Permuted means
+        // are always less extreme (any sign flip reduces |mean|),
+        // so p << 0.05.
+        let mut base = Vec::new();
+        let mut cur = Vec::new();
+        for i in 0..25 {
+            base.push(make_case(&format!("q{i}"), &[("cosine", 0.5)]));
+            cur.push(make_case(&format!("q{i}"), &[("cosine", 0.6)]));
+        }
+        let res = permutation_test(&make_report(base), &make_report(cur), 1000, 42);
+        let r = &res[0];
+        assert!((r.observed_mean_diff - 0.1).abs() < 1e-9);
+        assert!(r.significant_at_05, "expected significant, got p={}", r.p_value);
+        assert!(r.p_value < 0.01, "p should be tiny, got {}", r.p_value);
+    }
+
+    #[test]
+    fn permutation_uniform_regression_significant() {
+        // Mirror — all -0.1. Significant in the negative direction.
+        let mut base = Vec::new();
+        let mut cur = Vec::new();
+        for i in 0..25 {
+            base.push(make_case(&format!("q{i}"), &[("cosine", 0.6)]));
+            cur.push(make_case(&format!("q{i}"), &[("cosine", 0.5)]));
+        }
+        let res = permutation_test(&make_report(base), &make_report(cur), 1000, 42);
+        assert!(res[0].observed_mean_diff < 0.0);
+        assert!(res[0].significant_at_05);
+    }
+
+    #[test]
+    fn permutation_balanced_change_not_significant() {
+        // 10 +0.1 + 10 -0.1 → observed mean = 0. Every permutation also
+        // has mean ~0 → p ≈ 1.
+        let mut base = Vec::new();
+        let mut cur = Vec::new();
+        for i in 0..10 {
+            base.push(make_case(&format!("q{i}"), &[("cosine", 0.5)]));
+            cur.push(make_case(&format!("q{i}"), &[("cosine", 0.6)]));
+        }
+        for i in 10..20 {
+            base.push(make_case(&format!("q{i}"), &[("cosine", 0.7)]));
+            cur.push(make_case(&format!("q{i}"), &[("cosine", 0.6)]));
+        }
+        let res = permutation_test(&make_report(base), &make_report(cur), 1000, 42);
+        assert!(!res[0].significant_at_05);
+    }
+
+    #[test]
+    fn permutation_small_n_works_where_wilcoxon_warns() {
+        // n=8 — Wilcoxon would set small_sample=true. Permutation is
+        // exact. With all +0.1, p should still be near tiny since
+        // the only ways to get |perm_mean| >= 0.1 are: keep all
+        // signs (1 permutation) or flip everything (also has mean
+        // -0.1, |.|=0.1) — so 2 of 256 permutations match → p ≈ 2/256.
+        // With Monte Carlo at 10000 samples, we should see p ≈ 0.008.
+        let mut base = Vec::new();
+        let mut cur = Vec::new();
+        for i in 0..8 {
+            base.push(make_case(&format!("q{i}"), &[("cosine", 0.5)]));
+            cur.push(make_case(&format!("q{i}"), &[("cosine", 0.6)]));
+        }
+        let res = permutation_test(&make_report(base), &make_report(cur), 10000, 42);
+        let r = &res[0];
+        assert_eq!(r.n, 8);
+        // Theoretical p = 2/256 = 0.0078. Allow tolerance for
+        // Monte Carlo noise at 10k samples.
+        assert!(r.p_value < 0.02, "p={}", r.p_value);
+        assert!(r.p_value > 0.001, "p={}", r.p_value);
+        assert!(r.significant_at_05);
+    }
+
+    #[test]
+    fn permutation_reproducible_same_seed() {
+        let mut base = Vec::new();
+        let mut cur = Vec::new();
+        for i in 0..20 {
+            base.push(make_case(&format!("q{i}"), &[("cosine", 0.5)]));
+            cur.push(
+                make_case(&format!("q{i}"), &[("cosine", 0.5 + (i as f64) * 0.001)]),
+            );
+        }
+        let baseline = make_report(base);
+        let current = make_report(cur);
+        let r1 = permutation_test(&baseline, &current, 500, 42);
+        let r2 = permutation_test(&baseline, &current, 500, 42);
+        assert_eq!(r1[0].p_value, r2[0].p_value);
+    }
+
+    #[test]
+    fn permutation_n_permutations_zero_clamps_to_one() {
+        let mut base = Vec::new();
+        let mut cur = Vec::new();
+        for i in 0..3 {
+            base.push(make_case(&format!("q{i}"), &[("cosine", 0.5)]));
+            cur.push(make_case(&format!("q{i}"), &[("cosine", 0.6)]));
+        }
+        let res = permutation_test(&make_report(base), &make_report(cur), 0, 1);
+        assert_eq!(res[0].n_permutations, 1);
+    }
+
+    #[test]
+    fn permutation_per_scorer_sorted() {
+        let baseline = make_report(vec![
+            make_case("q1", &[("alpha", 0.5), ("beta", 0.5)]),
+            make_case("q2", &[("alpha", 0.5), ("beta", 0.5)]),
+        ]);
+        let current = make_report(vec![
+            make_case("q1", &[("alpha", 0.6), ("beta", 0.4)]),
+            make_case("q2", &[("alpha", 0.7), ("beta", 0.3)]),
+        ]);
+        let res = permutation_test(&baseline, &current, 100, 7);
+        assert_eq!(res.len(), 2);
+        assert_eq!(res[0].scorer, "alpha");
+        assert_eq!(res[1].scorer, "beta");
+        // alpha improved, beta regressed → opposite signs in observed.
+        assert!(res[0].observed_mean_diff > 0.0);
+        assert!(res[1].observed_mean_diff < 0.0);
+    }
+
+    #[test]
+    fn permutation_per_scorer_seed_isolated() {
+        // Adding scorer "y" should NOT change scorer "x"'s p-value
+        // (the per-scorer FNV-1a seed offset isolates them).
+        let mut base_x_only = Vec::new();
+        let mut cur_x_only = Vec::new();
+        for i in 0..15 {
+            base_x_only.push(make_case(&format!("q{i}"), &[("x", 0.5)]));
+            cur_x_only.push(make_case(&format!("q{i}"), &[("x", 0.6)]));
+        }
+        let res_x_only = permutation_test(
+            &make_report(base_x_only),
+            &make_report(cur_x_only),
+            500,
+            42,
+        );
+
+        let mut base_x_and_y = Vec::new();
+        let mut cur_x_and_y = Vec::new();
+        for i in 0..15 {
+            base_x_and_y.push(make_case(&format!("q{i}"), &[("x", 0.5), ("y", 0.7)]));
+            cur_x_and_y.push(make_case(&format!("q{i}"), &[("x", 0.6), ("y", 0.65)]));
+        }
+        let res_with_y = permutation_test(
+            &make_report(base_x_and_y),
+            &make_report(cur_x_and_y),
+            500,
+            42,
+        );
+
+        // "x"'s p-value must be the same in both reports.
+        let p_x_only = res_x_only.iter().find(|r| r.scorer == "x").unwrap().p_value;
+        let p_x_with_y = res_with_y.iter().find(|r| r.scorer == "x").unwrap().p_value;
+        assert_eq!(p_x_only, p_x_with_y);
     }
 }
