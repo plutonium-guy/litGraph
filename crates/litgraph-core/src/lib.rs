@@ -23,6 +23,7 @@ pub mod example_selector;
 pub mod eval_harness;
 pub mod eval_drift;
 pub mod eval_significance;
+pub mod eval_effect_size;
 pub mod markdown_table_parser;
 pub mod vector_store_memory;
 pub mod store;
@@ -152,6 +153,7 @@ pub use eval_drift::{detect_drift, CaseDrift, DriftReport};
 pub use eval_significance::{
     mcnemar_test, wilcoxon_signed_rank_test, McNemarResult, WilcoxonResult,
 };
+pub use eval_effect_size::{paired_effect_size, PairedEffectSizeResult};
 pub use memory::{
     BufferMemory, ConversationMemory, MemorySnapshot, SummaryBufferMemory, TokenBufferMemory,
     TokenCounter, summarize_conversation,
