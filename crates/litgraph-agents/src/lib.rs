@@ -11,6 +11,7 @@ pub mod supervisor;
 pub mod text_react;
 pub mod plan_execute;
 pub mod subagent;
+pub mod map_reduce;
 
 pub use react::{AgentEvent, AgentEventStream, AgentState, ReactAgent, ReactAgentConfig};
 pub use supervisor::{SupervisorAgent, SupervisorConfig};
@@ -22,3 +23,4 @@ pub use plan_execute::{
     PlanAndExecuteAgent, PlanAndExecuteConfig, PlanAndExecuteResult, StepOutcome,
 };
 pub use subagent::SubagentTool;
+pub use map_reduce::MapReduceSummarizer;
