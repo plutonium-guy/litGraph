@@ -32,6 +32,7 @@ mod uuid_tool;
 mod text_diff;
 mod jwt_decode;
 mod datetime_parse;
+mod html_to_text;
 
 pub use calculator::CalculatorTool;
 pub use http_request::{HttpRequestTool, HttpRequestConfig};
@@ -59,3 +60,4 @@ pub use uuid_tool::UuidTool;
 pub use text_diff::TextDiffTool;
 pub use jwt_decode::JwtDecodeTool;
 pub use datetime_parse::DatetimeParseTool;
+pub use html_to_text::{html_to_text, HtmlToTextTool};
