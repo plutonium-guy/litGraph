@@ -14,6 +14,7 @@ pub mod subagent;
 pub mod map_reduce;
 pub mod refine;
 pub mod critique_revise;
+pub mod debate;
 
 pub use react::{AgentEvent, AgentEventStream, AgentState, ReactAgent, ReactAgentConfig};
 pub use supervisor::{SupervisorAgent, SupervisorConfig};
@@ -30,3 +31,4 @@ pub use refine::RefineSummarizer;
 pub use critique_revise::{
     CritiqueReviseAgent, CritiqueReviseIteration, CritiqueReviseResult,
 };
+pub use debate::{DebateAgent, DebateResult, DebateRound};
