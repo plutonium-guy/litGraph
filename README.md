@@ -14,7 +14,8 @@ Hot paths (HTTP, SSE parsing, tokenization, vector math, graph scheduling, JSON 
 | Doc | What it answers |
 |-----|-----------------|
 | [USAGE.md](USAGE.md) | how to use every subsystem |
-| [COMPARISON.md](COMPARISON.md) | litGraph vs LangGraph — feature-by-feature |
+| [COMPARISON.md](COMPARISON.md) | litGraph vs LangChain vs LangGraph — feature-by-feature |
+| [AGENT_DX.md](AGENT_DX.md) | features that make Claude Code / Cursor / Cline build with litGraph easily |
 | [FEATURES.md](FEATURES.md) | what's done, with status legend |
 | [MISSING_FEATURES.md](MISSING_FEATURES.md) | gaps + nice-to-haves (next ~10 iters) |
 | [ROADMAP.md](ROADMAP.md) | long-form prioritisation rubric |
