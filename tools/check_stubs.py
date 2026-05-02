@@ -67,18 +67,38 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 STUB_DIR = REPO_ROOT / "litgraph-stubs" / "litgraph-stubs"
 
 
+_KEPT_DUNDERS = {"__version__", "__all__"}
+# A package's own name appears as `litgraph.litgraph` (the native
+# extension submodule). The package surface is already captured by
+# walking the package directly, and the native submodule's contents
+# are checked when collect_runtime_attrs is called with native=...
+# Skip the self-import to avoid expecting a `litgraph.pyi`.
+_SELF_NAMES = {"litgraph"}
+
+
 def collect_runtime_attrs(module: object) -> Set[str]:
     """Return a set of "qualified" attribute names from a native module.
 
     Top-level functions: `funcname`.
     Top-level classes: `ClassName` and each method as `ClassName.method`.
+    Submodules are reported as a single name (`submodname`) — their
+    contents live in their own .pyi file and are checked separately
+    via the stub-file basenames.
     """
+    import types
+
     out: Set[str] = set()
     for name in dir(module):
-        if name.startswith("_"):
+        if name.startswith("_") and name not in _KEPT_DUNDERS:
+            continue
+        if name in _SELF_NAMES and getattr(module, "__name__", "") == "litgraph":
+            # `litgraph.litgraph` — the native submodule — is checked
+            # separately. Don't expect a top-level stub for it.
             continue
         obj = getattr(module, name)
-        if isinstance(obj, type):
+        if isinstance(obj, types.ModuleType):
+            out.add(name)
+        elif isinstance(obj, type):
             out.add(name)
             for member in dir(obj):
                 if member.startswith("_"):
@@ -91,11 +111,25 @@ def collect_runtime_attrs(module: object) -> Set[str]:
 
 def collect_stub_attrs(stub_dir: Path) -> Set[str]:
     """Parse all .pyi files in `stub_dir` and return the set of names
-    they declare. Same shape as `collect_runtime_attrs`."""
+    they declare. Same shape as `collect_runtime_attrs`.
+
+    A `.pyi` file at top level is treated as a stub for a submodule
+    of the same basename — so `agents.pyi` covers `litgraph.agents`
+    (the runtime submodule), and the basename is added to the
+    declared-names set."""
     out: Set[str] = set()
     if not stub_dir.is_dir():
         return out
     for pyi in stub_dir.glob("*.pyi"):
+        # Skip macOS AppleDouble sidecars (`._foo.pyi`) that appear
+        # when working off external drives. They're not real stubs
+        # and the binary metadata blows up `ast.parse`.
+        if pyi.name.startswith("._"):
+            continue
+        # Filename minus extension is itself a covered name (the
+        # submodule). Skip `__init__` which represents the package.
+        if pyi.stem != "__init__":
+            out.add(pyi.stem)
         try:
             tree = ast.parse(pyi.read_text(encoding="utf-8"))
         except SyntaxError:
@@ -132,9 +166,10 @@ def main() -> int:
         # The native module is an attribute of the outer Python
         # package — `litgraph.litgraph`.
         sys.path.insert(0, str(REPO_ROOT / "python"))
-        import litgraph
+        import litgraph as _pkg
 
-        if not hasattr(litgraph, "litgraph"):
+        native = getattr(_pkg, "litgraph", None)
+        if native is None:
             print(
                 "stub-drift: native module `litgraph.litgraph` not built. "
                 "Run `maturin develop` to build, or skip this check on "
@@ -142,16 +177,38 @@ def main() -> int:
                 file=sys.stderr,
             )
             return 0
-        native = litgraph.litgraph
     except ImportError as e:
         print(f"stub-drift: cannot import litgraph package: {e}", file=sys.stderr)
         return 0
 
-    runtime = collect_runtime_attrs(native)
+    # Runtime: union of (a) native PyO3 module attrs and (b) the
+    # outer Python package's attrs. The two together represent
+    # everything an IDE will see when the user types `litgraph.X`.
+    runtime = collect_runtime_attrs(native) | collect_runtime_attrs(_pkg)
+    # Stubs: every name declared by any .pyi in the stub dir, plus
+    # the basename of each .pyi (which covers submodule presence).
     stubs = collect_stub_attrs(STUB_DIR)
 
+    # We only flag drift on names that *should* exist on the package
+    # surface. Stub-side names from per-feature .pyi files (e.g.,
+    # `AnthropicChat` in `providers.pyi`) describe attributes of the
+    # `litgraph.providers` submodule — checking them against the
+    # top-level `litgraph` namespace is structurally wrong and
+    # produces false positives. Limit `missing_in_runtime` to
+    # `__init__.pyi`-declared names plus .pyi basenames.
+    init_pyi = STUB_DIR / "__init__.pyi"
+    init_names: Set[str] = set()
+    if init_pyi.is_file():
+        try:
+            for node in ast.parse(init_pyi.read_text(encoding="utf-8")).body:
+                _walk_top(node, init_names)
+        except SyntaxError:
+            pass
+    submodule_names = {p.stem for p in STUB_DIR.glob("*.pyi") if p.stem != "__init__"}
+    relevant_stub_side = init_names | submodule_names
+
     missing_in_stubs = sorted(runtime - stubs)
-    missing_in_runtime = sorted(stubs - runtime)
+    missing_in_runtime = sorted(relevant_stub_side - runtime)
 
     if not missing_in_stubs and not missing_in_runtime:
         print(f"stub-drift: in sync ({len(runtime)} runtime attrs, {len(stubs)} stub attrs)")

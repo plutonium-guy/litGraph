@@ -459,14 +459,27 @@ mod tests {
         assert!(parse_extracts(&body, "en").is_empty());
     }
 
+    // Serialise tests that touch `LITGRAPH_WIKIPEDIA_ENDPOINT` —
+    // process env is shared across threads, so cargo's default
+    // multi-threaded test runner will race set/unset against the
+    // language-code test that relies on the var being absent.
+    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        use std::sync::Mutex;
+        static GUARD: Mutex<()> = Mutex::new(());
+        GUARD.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     #[test]
     fn endpoint_uses_language_code() {
+        let _g = env_guard();
+        std::env::remove_var("LITGRAPH_WIKIPEDIA_ENDPOINT");
         let l = WikipediaLoader::titles(vec!["X".into()]).with_language("de");
         assert_eq!(l.endpoint(), "https://de.wikipedia.org/w/api.php");
     }
 
     #[test]
     fn endpoint_env_override_works() {
+        let _g = env_guard();
         std::env::set_var("LITGRAPH_WIKIPEDIA_ENDPOINT", "http://localhost:9/api");
         let l = WikipediaLoader::titles(vec!["X".into()]);
         assert_eq!(l.endpoint(), "http://localhost:9/api");

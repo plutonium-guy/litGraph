@@ -244,4 +244,8 @@ def test_in_sync_case_no_drift(tmp_path):
     )
     stubs = collect_stub_attrs(stub_dir)
 
-    assert runtime == stubs
+    # Runtime sees only what the fake module declares; stubs additionally
+    # carry the file's basename ("mod") to mark the submodule itself as
+    # covered. So runtime must be a subset of stubs.
+    assert runtime <= stubs
+    assert stubs - runtime == {"mod"}
