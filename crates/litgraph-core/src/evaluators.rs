@@ -971,6 +971,167 @@ pub fn cer(reference: &str, candidate: &str) -> f32 {
     dist as f32 / denom as f32
 }
 
+/// Translation Edit Rate (Snover et al. 2006) — edit count counting
+/// SHIFTS as single edits in addition to substitutions / insertions /
+/// deletions, divided by reference length. **Lower is better.**
+///
+/// # Why TER over WER
+///
+/// `wer` counts a phrase-reorder ("the cat sat" → "sat the cat") as
+/// 3 substitutions even though semantically the candidate has the
+/// same content in a different order. TER counts that as 1 shift
+/// — a more accurate edit-distance for translation eval where
+/// block-reordering is common.
+///
+/// # Algorithm
+///
+/// Snover 2006 greedy shift loop:
+/// 1. Compute baseline edit distance (Levenshtein over tokens).
+/// 2. Search for the shift that reduces edit distance the most:
+///    for each contiguous cand span (length 1..N) that matches a
+///    contiguous ref span at a different position, simulate the
+///    shift (remove the span from cand, re-insert at the ref-aligned
+///    position), recompute edit distance.
+/// 3. If best shift saves at least 1 edit, apply it; increment shift
+///    count by 1; repeat.
+/// 4. Final TER = (substitutions + insertions + deletions + shifts) / ref_len.
+///
+/// Shifts longer than 1 token save more edits per shift, so the
+/// loop preferentially applies large shifts first (search loops
+/// from longest span down). Capped at 50 iterations to bound
+/// pathological inputs.
+///
+/// # TerResult
+///
+/// Returns full breakdown — `substitutions / insertions / deletions /
+/// shifts / ref_len / cand_len` plus `ter` rate. Composes naturally
+/// with iter-323 `EditBreakdown` for cross-metric reports.
+pub fn ter(reference: &str, candidate: &str) -> TerResult {
+    let ref_tokens: Vec<String> = tokenize_lower(reference).collect();
+    let mut cand_tokens: Vec<String> = tokenize_lower(candidate).collect();
+    let ref_len = ref_tokens.len() as u32;
+    let cand_len_initial = cand_tokens.len() as u32;
+    if ref_tokens.is_empty() && cand_tokens.is_empty() {
+        return TerResult {
+            ter: 0.0,
+            edits: 0,
+            substitutions: 0,
+            insertions: 0,
+            deletions: 0,
+            shifts: 0,
+            ref_len,
+            cand_len: cand_len_initial,
+        };
+    }
+    let mut shifts: u32 = 0;
+    let mut current_edits = token_levenshtein(&ref_tokens, &cand_tokens);
+    const MAX_SHIFT_ITERATIONS: usize = 50;
+    for _ in 0..MAX_SHIFT_ITERATIONS {
+        match find_best_shift(&ref_tokens, &cand_tokens, current_edits) {
+            Some((src_start, src_len, dst_pos, new_edits)) => {
+                cand_tokens = apply_shift(&cand_tokens, src_start, src_len, dst_pos);
+                shifts += 1;
+                current_edits = new_edits;
+            }
+            None => break,
+        }
+    }
+    let (sub, ins, del) = traceback_edits(&ref_tokens, &cand_tokens);
+    let total_edits = sub + ins + del + shifts;
+    let denom = ref_len.max(1) as f32;
+    TerResult {
+        ter: total_edits as f32 / denom,
+        edits: total_edits,
+        substitutions: sub,
+        insertions: ins,
+        deletions: del,
+        shifts,
+        ref_len,
+        cand_len: cand_len_initial,
+    }
+}
+
+/// TER result with full edit breakdown.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TerResult {
+    pub ter: f32,
+    pub edits: u32,
+    pub substitutions: u32,
+    pub insertions: u32,
+    pub deletions: u32,
+    pub shifts: u32,
+    pub ref_len: u32,
+    pub cand_len: u32,
+}
+
+/// Search for the shift that reduces edit distance most. Returns
+/// `(src_start, src_len, dst_pos, new_edits)` if any shift saves
+/// at least 1 edit, else `None`. Searches longest spans first so
+/// the largest savings get applied first (Snover greedy heuristic).
+fn find_best_shift(
+    ref_tokens: &[String],
+    cand_tokens: &[String],
+    current_edits: usize,
+) -> Option<(usize, usize, usize, usize)> {
+    if cand_tokens.is_empty() || ref_tokens.is_empty() {
+        return None;
+    }
+    let max_span = cand_tokens.len().min(ref_tokens.len());
+    let mut best: Option<(usize, usize, usize, usize)> = None;
+    let mut best_savings: usize = 0;
+    // Try longest span first — largest potential savings.
+    for src_len in (1..=max_span).rev() {
+        for src_start in 0..=cand_tokens.len() - src_len {
+            let span = &cand_tokens[src_start..src_start + src_len];
+            // Quick filter: span must appear in ref somewhere.
+            for ref_pos in 0..=ref_tokens.len() - src_len {
+                if ref_tokens[ref_pos..ref_pos + src_len] != *span {
+                    continue;
+                }
+                if ref_pos == src_start {
+                    // Already at the right position — no shift would help.
+                    continue;
+                }
+                let shifted = apply_shift(cand_tokens, src_start, src_len, ref_pos);
+                let new_edits = token_levenshtein(ref_tokens, &shifted);
+                if new_edits + 1 <= current_edits {
+                    // Net savings = current - new - 1 (1 = the shift cost itself).
+                    let savings = current_edits - new_edits;
+                    if savings > best_savings {
+                        best_savings = savings;
+                        best = Some((src_start, src_len, ref_pos, new_edits));
+                    }
+                }
+            }
+        }
+    }
+    best
+}
+
+/// Apply a shift: remove `cand[src_start..src_start+src_len]` and
+/// re-insert at `dst_pos` (relative to the ORIGINAL `cand` indexing —
+/// after removal, the insertion point shifts left by `src_len` if
+/// `dst_pos > src_start`).
+fn apply_shift(
+    cand: &[String],
+    src_start: usize,
+    src_len: usize,
+    dst_pos: usize,
+) -> Vec<String> {
+    let mut out: Vec<String> = cand.to_vec();
+    let span: Vec<String> = out.drain(src_start..src_start + src_len).collect();
+    let insert_at = if dst_pos > src_start {
+        dst_pos - src_len
+    } else {
+        dst_pos
+    };
+    let insert_at = insert_at.min(out.len());
+    for (i, tok) in span.into_iter().enumerate() {
+        out.insert(insert_at + i, tok);
+    }
+    out
+}
+
 /// Stratified edit-operation counts — diagnostic complement to
 /// raw `wer` / `cer` rates. Answers "are most errors substitutions
 /// or insertions?" — common ASR/MT debugging question.
@@ -2142,6 +2303,102 @@ mod tests {
         let c = cer("running", "runs");
         assert!((w - 1.0).abs() < 1e-5);
         assert!(c < w, "CER ({c}) should be < WER ({w}) on a morphological diff");
+    }
+
+    // ─── TER ──────────────────────────────────────────────────────
+
+    #[test]
+    fn ter_identical_zero() {
+        let r = ter("the cat sat", "the cat sat");
+        assert_eq!(r.ter, 0.0);
+        assert_eq!(r.edits, 0);
+        assert_eq!(r.shifts, 0);
+    }
+
+    #[test]
+    fn ter_pure_substitution_no_shift() {
+        // 1-word change, no reorder → 1 sub, 0 shifts.
+        let r = ter("the cat sat", "the cat ran");
+        assert_eq!(r.substitutions, 1);
+        assert_eq!(r.shifts, 0);
+        assert!((r.ter - 1.0 / 3.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn ter_block_shift_counted_as_one_edit() {
+        // Reorder a block. WER would count 6 edits; TER should
+        // count 1 shift + small remaining → total < WER.
+        // ref = "the cat sat on the mat"
+        // cand = "on the mat the cat sat" — entire phrase order flipped
+        // The block "the cat sat" appears in both, just at different
+        // positions. TER should detect this as 1 shift.
+        let r = ter("the cat sat on the mat", "on the mat the cat sat");
+        let w = wer("the cat sat on the mat", "on the mat the cat sat");
+        assert!(r.shifts >= 1, "expected >=1 shift, got {}", r.shifts);
+        // TER should be substantially lower than WER on a pure-reorder
+        // (TER credits the shift; WER counts every misaligned position
+        // as an edit).
+        assert!(
+            r.ter < w,
+            "TER ({}) should < WER ({}) on pure block reorder",
+            r.ter,
+            w
+        );
+    }
+
+    #[test]
+    fn ter_empty_inputs_zero_when_both_empty() {
+        let r = ter("", "");
+        assert_eq!(r.ter, 0.0);
+        assert_eq!(r.edits, 0);
+    }
+
+    #[test]
+    fn ter_empty_cand_is_full_deletion() {
+        // ref=3, cand=0 → 3 deletions. TER = 3/3 = 1.0.
+        let r = ter("the cat sat", "");
+        assert_eq!(r.deletions, 3);
+        assert_eq!(r.insertions, 0);
+        assert_eq!(r.substitutions, 0);
+        assert_eq!(r.shifts, 0);
+        assert!((r.ter - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn ter_empty_ref_all_insertions() {
+        // ref=0, cand=3 → 3 insertions. TER = 3/max(1,0) = 3/1 = 3.0.
+        let r = ter("", "extra extra extra");
+        assert_eq!(r.insertions, 3);
+        assert_eq!(r.deletions, 0);
+        assert!((r.ter - 3.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn ter_lowercase_normalization() {
+        let r = ter("The Cat Sat", "the cat sat");
+        assert_eq!(r.edits, 0);
+        assert_eq!(r.ter, 0.0);
+    }
+
+    #[test]
+    fn ter_at_most_wer() {
+        // Sanity: TER should never exceed WER on the same input
+        // (shifts only REDUCE edit count vs raw Levenshtein).
+        let cases: Vec<(&str, &str)> = vec![
+            ("the cat sat", "the cat ran"),
+            ("the cat sat on the mat", "the cat ran on the floor"),
+            ("a b c d e f", "f e d c b a"),
+            ("hello", "world"),
+        ];
+        for (r, c) in cases {
+            let t = ter(r, c).ter;
+            let w = wer(r, c);
+            assert!(
+                t <= w + 1e-5,
+                "ref={r:?} cand={c:?}: TER {t} should <= WER {w}",
+
+            );
+        }
     }
 
     // ─── WER / CER breakdown ──────────────────────────────────────

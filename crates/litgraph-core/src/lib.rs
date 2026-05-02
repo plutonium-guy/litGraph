@@ -78,8 +78,8 @@ pub use evaluators::{
     chrf_pp_default, contains_all, contains_any, embedding_cosine, exact_match,
     exact_match_strict, jaccard_similarity, json_validity, levenshtein, levenshtein_ratio,
     meteor_exact, meteor_lite, regex_match, rouge_1, rouge_2, rouge_l, rouge_l_multi, rouge_n,
-    rouge_n_multi, wer, wer_breakdown, BleuScore, ChrfScore, EditBreakdown, MeteorScore,
-    RougeScore,
+    rouge_n_multi, ter, wer, wer_breakdown, BleuScore, ChrfScore, EditBreakdown, MeteorScore,
+    RougeScore, TerResult,
 };
 pub use output_fixer::{fix_with_llm, parse_with_retry};
 pub use partial_json::{parse_partial_json, repair_partial_json};
