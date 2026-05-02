@@ -157,7 +157,7 @@ impl Retriever for MultiQueryRetriever {
 
         // Fan out base.retrieve(q, k) for each variation in parallel.
         let mut set: JoinSet<Result<Vec<Document>>> = JoinSet::new();
-        for q in queries.iter().cloned() {
+        for q in queries {
             let base = self.base.clone();
             set.spawn(async move { base.retrieve(&q, k).await });
         }

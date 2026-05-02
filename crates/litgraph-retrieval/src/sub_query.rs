@@ -138,7 +138,7 @@ impl Retriever for SubQueryRetriever {
 
         let branch_k = self.branch_k.max(k);
         let mut set: JoinSet<Result<Vec<Document>>> = JoinSet::new();
-        for q in sub_queries.iter().cloned() {
+        for q in sub_queries {
             let base = self.base.clone();
             set.spawn(async move { base.retrieve(&q, branch_k).await });
         }

@@ -1228,8 +1228,8 @@ fn traceback_edits(a: &[String], b: &[String]) -> (u32, u32, u32) {
     }
     // Full matrix (not rolling) — needed for traceback.
     let mut dp: Vec<Vec<usize>> = vec![vec![0; n + 1]; m + 1];
-    for i in 0..=m {
-        dp[i][0] = i;
+    for (i, row) in dp.iter_mut().enumerate() {
+        row[0] = i;
     }
     for j in 0..=n {
         dp[0][j] = j;
@@ -1277,8 +1277,8 @@ fn traceback_edits_chars(a: &[char], b: &[char]) -> (u32, u32, u32) {
         return (0, 0, m as u32);
     }
     let mut dp: Vec<Vec<usize>> = vec![vec![0; n + 1]; m + 1];
-    for i in 0..=m {
-        dp[i][0] = i;
+    for (i, row) in dp.iter_mut().enumerate() {
+        row[0] = i;
     }
     for j in 0..=n {
         dp[0][j] = j;

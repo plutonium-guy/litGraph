@@ -167,7 +167,8 @@ impl Retriever for StepBackRetriever {
 
         let branch_k = self.branch_k.max(k);
         let mut set: JoinSet<Result<Vec<Document>>> = JoinSet::new();
-        for q in queries.iter().cloned() {
+        for q in &queries {
+            let q = q.clone();
             let base = self.base.clone();
             set.spawn(async move { base.retrieve(&q, branch_k).await });
         }

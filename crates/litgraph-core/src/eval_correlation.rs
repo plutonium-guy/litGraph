@@ -238,11 +238,9 @@ pub fn correlate_scorers(report: &EvalReport) -> Vec<ScorerCorrelation> {
     for (idx, case) in report.per_case.iter().enumerate() {
         for (scorer, val) in &case.scores {
             if let Some(v) = score_to_f64(val) {
-                per_scorer
-                    .get_mut(scorer)
-                    .unwrap()
-                    .get_mut(idx)
-                    .map(|slot| *slot = Some(v));
+                if let Some(slot) = per_scorer.get_mut(scorer).unwrap().get_mut(idx) {
+                    *slot = Some(v);
+                }
             }
         }
     }

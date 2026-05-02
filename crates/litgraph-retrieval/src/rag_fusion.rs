@@ -135,7 +135,7 @@ impl Retriever for RagFusionRetriever {
         // Per-query retrieval, parallel.
         let mut set: JoinSet<Result<Vec<Document>>> = JoinSet::new();
         let branch_k = self.branch_k.max(k);
-        for q in queries.iter().cloned() {
+        for q in queries {
             let base = self.base.clone();
             set.spawn(async move { base.retrieve(&q, branch_k).await });
         }
