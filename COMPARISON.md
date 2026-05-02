@@ -1,11 +1,18 @@
-# litGraph vs LangGraph — Feature Comparison
+# litGraph vs LangChain vs LangGraph — Feature Comparison
 
-Honest, side-by-side. Where litGraph wins, where LangGraph wins, where
-they're equivalent. Snapshot date: 2026-05-02 (litGraph v0.1.1 ·
-LangGraph 0.4.x lineage).
+Three-way side-by-side. Where litGraph wins, where LangChain / LangGraph
+win, where they're equivalent. Snapshot date: 2026-05-02
+(litGraph v0.1.1 · LangChain 0.3.x · LangGraph 0.4.x).
 
 **Legend:** ✅ shipped · ⏳ partial · ❌ missing · 🚫 won't do · 💰 paid /
-hosted only.
+hosted only · 📦 via LangChain (LangGraph delegates) · 📦📦 via
+LangChain Community.
+
+LangGraph is the *orchestration* layer; LangChain Core is the
+*provider/abstraction* layer; LangChain Community is the *integrations*
+catalogue. The three-column layout makes the dependency split explicit:
+when LangGraph says "yes, via LangChain", that's a real cost — extra
+deps, extra Python frames, separate version-pinning surface.
 
 ---
 
@@ -13,386 +20,577 @@ hosted only.
 
 | Question | Answer |
 |---|---|
-| **Want managed deployment + visual studio + huge integration list?** | **LangGraph** — LangSmith / LangGraph Cloud / Studio are mature. |
-| **Want sub-microsecond per-node scheduling, true parallelism, no GIL contention, slim deps?** | **litGraph** — Rust core, ~107× faster vector search, ~90× faster scheduler. |
-| **Want a graph DSL that feels the same in either?** | **Both** — `StateGraph`/`add_node`/`add_edge`/`compile` translate one-to-one. |
-| **Production-ready today?** | **LangGraph** for hosted; **litGraph** for self-hosted Python apps that need throughput. |
+| **Want managed deployment + visual studio + huge integration list?** | **LangGraph + LangChain** — LangSmith / Cloud / Studio + 200+ provider integrations. |
+| **Want sub-microsecond per-node scheduling, true parallelism, no GIL contention, slim deps?** | **litGraph** — Rust core, ~107× faster vector search, ~90× faster scheduler, one wheel. |
+| **Want a graph DSL that drops in?** | **LangGraph or litGraph** — `StateGraph`/`add_node`/`add_edge` translate one-to-one. (LangChain doesn't have a graph DSL — it has LCEL.) |
+| **Want LCEL chain composition (`|` pipes)?** | **LangChain only.** litGraph + LangGraph favour explicit graphs. |
+| **Production-ready today?** | **LangChain + LangGraph** for hosted/managed; **litGraph** for self-hosted Python apps that need throughput. |
 
-If your bottleneck is the LLM call, the framework hardly matters. If your
-bottleneck is the framework (long sessions, big retrieval, fan-out
+If your bottleneck is the LLM call, the framework hardly matters. If
+your bottleneck is the framework (long sessions, big retrieval, fan-out
 agents), Rust wins.
 
 ---
 
-## 1. Core graph primitives
+## 1. Headline primitive
 
-| Feature | litGraph | LangGraph |
-|---|---|---|
-| `StateGraph` with typed state | ✅ | ✅ |
-| Add/remove nodes + edges | ✅ | ✅ |
-| Conditional edges | ✅ | ✅ |
-| Reducers (LangGraph `Annotated[..., add]`) | ✅ (state-channel reducer) | ✅ |
-| Dynamic fan-out (`Send` API) | ✅ (`add_send`) | ✅ |
-| Subgraphs (compose graphs) | ✅ | ✅ |
-| START / END sentinels | ✅ | ✅ |
-| `compile().invoke / .stream / .batch` | ✅ | ✅ |
-| Visualize (Mermaid / Graphviz) | ✅ | ✅ |
-| Super-step parallel execution | ✅ (Kahn scheduler) | ✅ |
-| Cycle detection at compile time | ✅ | ✅ |
-
-**Verdict:** Functional parity. The DSL was deliberately designed to be a one-to-one drop-in.
-
----
-
-## 2. Streaming
-
-| Feature | litGraph | LangGraph |
-|---|---|---|
-| Token-level streaming from chat models | ✅ | ✅ |
-| Streaming `StateGraph.stream()` | ✅ | ✅ |
-| Stream modes: `values`, `updates`, `messages`, `debug` | ⏳ (`values`, `updates`; `messages` via callback bus; `debug` via OTel) | ✅ |
-| Multiple-consumer broadcast | ✅ (`broadcast(stream, n)`) | ❌ (manual `tee`) |
-| Race / first-wins between streams | ✅ (`race(streams)`) | ❌ |
-| Multiplex streams with origin tags | ✅ (`multiplex(streams)`) | ❌ |
-| `astream_events` (LangChain-shaped) | ❌ (use callback bus) | ✅ |
-| Sub-millisecond per-event overhead | ✅ (Rust SSE parse, ~12 µs/16 KB) | ❌ (~ms-class Python overhead) |
-
-**Verdict:** litGraph wins on raw streaming primitives + perf. LangGraph
-wins on the LangChain-typed event taxonomy (`astream_events`).
-
----
-
-## 3. Checkpointing + time-travel
-
-| Feature | litGraph | LangGraph |
-|---|---|---|
-| In-memory checkpointer (default) | ✅ | ✅ |
-| SQLite checkpointer | ✅ (WAL mode, durable) | ✅ |
-| Postgres checkpointer | ✅ (deadpool-pooled) | ✅ |
-| Redis checkpointer | ✅ (ZSET, O(log n) latest) | ⏳ (community) |
-| Time-travel — resume from any checkpoint id | ✅ | ✅ |
-| Branch — fork a checkpoint into two threads | ⏳ (manual: copy the thread) | ✅ (`branch()`) |
-| Per-thread state isolation via `thread_id` | ✅ | ✅ |
-| Resume registry across process restarts | ✅ | ⏳ (cloud-only) |
-
-**Verdict:** Backend parity + Redis edge to litGraph; LangGraph has the
-nicer `branch()` ergonomics.
-
----
-
-## 4. Agents
-
-| Feature | litGraph | LangGraph |
-|---|---|---|
-| Prebuilt ReAct agent | ✅ (`ReactAgent`) | ✅ (`create_react_agent`) |
-| Native tool-call format per provider | ✅ | ✅ |
-| Text-mode ReAct (thought/action/obs transcript) | ✅ (`TextReactAgent`) | ⏳ |
-| Plan-and-Execute | ✅ (`PlanExecuteAgent`) | ⏳ (recipe) |
-| Supervisor (multi-agent routing) | ✅ (`SupervisorAgent`) | ✅ (`langgraph-supervisor`) |
-| Debate (multi-agent + judge) | ✅ (`DebateAgent`) | ❌ |
-| Critique-Revise (self-improvement loop) | ✅ (`CritiqueReviseAgent`) | ❌ |
-| Self-Consistency (sample N → vote) | ✅ (`SelfConsistencyChatModel`) | ❌ |
-| Subagent tool (delegate to another agent) | ✅ (`SubagentTool`) | ⏳ |
-| Swarm (handoff topology) | ❌ | ✅ (`langgraph-swarm`) |
-| BigTool (large-scale tool selection) | ⏳ (RAG over tool descriptions, manual) | ✅ (`langgraph-bigtool`) |
-| Deep agent factory (one-call wiring) | ✅ (`litgraph.agents.deep`) | ✅ (`deepagents`) |
-
-**Verdict:** litGraph has more research-backed agent patterns out of
-the box; LangGraph has the swarm + BigTool addons.
-
----
-
-## 5. Tools
-
-| Feature | litGraph | LangGraph |
-|---|---|---|
-| Function tool decorator | ✅ (`@tool` macro in Rust + `FunctionTool` in Python) | ✅ |
-| JSON-schema autoderivation | ✅ (schemars) | ✅ (Pydantic) |
-| Built-in: shell / Python REPL / filesystem | ✅ | ⏳ (community) |
-| Built-in: web fetch / Tavily / DuckDuckGo / webhook | ✅ | ✅ |
-| Built-in: SQLite / virtual-fs / JSON-Patch / slugify | ✅ | ❌ |
-| Built-in: Whisper / TTS / DALL·E / Gmail send | ✅ | ❌ |
-| `before_tool` / `after_tool` middleware hooks | ❌ (planned) | ✅ |
-| Streaming tool execution | 🚫 (offload pattern preferred) | ⏳ |
-| Tool call budget cap | ⏳ (cost-cap covers $; not call-count) | ❌ |
-| MCP tool adapter | ✅ (`McpToolAdapter`) | ✅ |
-
-**Verdict:** litGraph has a fatter battery of stock tools; LangGraph has
-the cleaner middleware model.
-
----
-
-## 6. Memory
-
-| Feature | litGraph | LangGraph |
-|---|---|---|
-| Token-buffer memory | ✅ | ✅ (via state) |
-| Summary-buffer memory | ✅ | ⏳ (recipe) |
-| LangMem-style fact extractor | ✅ (`langmem` module) | ✅ (`langmem` package) |
-| Backend: in-process | ✅ | ✅ |
-| Backend: SQLite | ✅ | ⏳ |
-| Backend: Postgres | ✅ | ✅ |
-| Backend: Redis | ✅ | ⏳ |
-| Hierarchical / namespaced memory | ⏳ (filter-based) | ✅ |
-
-**Verdict:** litGraph has more first-class backends; LangGraph has cleaner namespacing.
-
----
-
-## 7. Retrieval / RAG
-
-| Feature | litGraph | LangGraph |
-|---|---|---|
-| `Retriever` / `VectorStore` traits | ✅ | ❌ (uses LangChain) |
-| BM25 retriever (in-process, parallel) | ✅ (rayon, 23M elem/s) | ⏳ (LangChain wrapper) |
-| RRF fusion (hybrid retrieval) | ✅ (parallel) | ⏳ (LangChain wrapper) |
-| MMR | ✅ | ✅ |
-| HyDE | ✅ | ⏳ (recipe) |
-| Multi-query | ✅ | ✅ |
-| Self-query | ✅ | ✅ |
-| Parent-document | ✅ | ✅ |
-| Multi-vector | ✅ | ✅ |
-| Time-weighted | ✅ | ✅ |
-| Ensemble retriever (weighted) | ✅ | ✅ |
-| Race retriever (first-wins) | ✅ | ❌ |
-| Step-back / sub-query decomposition | ✅ | ⏳ |
-| Contextual compression | ✅ | ✅ |
-| Semantic dedup (ingestion-time) | ✅ | ❌ |
-| Rerankers: Cohere / Voyage / Jina / FastEmbed | ✅ | ⏳ (LangChain) |
-| Vector stores: HNSW / Qdrant / pgvector / Chroma / Weaviate | ✅ | ⏳ (LangChain) |
-| **HNSW search throughput** | **2.4 G elem/s** | LangChain-dep, ~10–100× slower |
-
-**Verdict:** litGraph wins decisively. Retrieval is the litGraph killer
-feature: native Rust BM25 + HNSW + RRF + MMR all on the hot path,
-no GIL.
-
----
-
-## 8. Observability
-
-| Feature | litGraph | LangGraph |
-|---|---|---|
-| Callback bus | ✅ | ✅ |
-| Cost tracker | ✅ (`CostTracker`) | ⏳ (LangSmith) |
-| `on_request` hook (raw HTTP body) | ✅ | ❌ |
-| OTel exporter (OTLP gRPC + HTTP) | ✅ | ⏳ |
-| LangSmith integration | ⏳ (shim) | ✅ (first-class) |
-| Trace exemplars (link span ↔ prompt excerpt) | ❌ (planned) | ✅ |
-| GraphEvent / NodeEvent stream | ✅ | ✅ |
-
-**Verdict:** litGraph wins on OTel + raw-HTTP debugging; LangGraph wins
-on LangSmith depth.
-
----
-
-## 9. Human-in-the-loop (HITL)
-
-| Feature | litGraph | LangGraph |
-|---|---|---|
-| `interrupt_before` / `interrupt_after` | ✅ | ✅ |
-| Dynamic `interrupt(payload)` from a node | ✅ | ✅ |
-| Resume with edited state | ✅ (`compiled.resume(...)`) | ✅ (`Command(resume=...)`) |
-| Webhook-resume bridge (HTTP → resume) | ✅ | 💰 (LangGraph Cloud) |
-| Pending interrupt inspection | ✅ | ✅ |
-
-**Verdict:** Parity for the primitives; litGraph ships the webhook bridge
-self-host, LangGraph gates it behind Cloud.
-
----
-
-## 10. Functional API
-
-| Feature | litGraph | LangGraph |
-|---|---|---|
-| `@entrypoint` decorator | ✅ | ✅ |
-| `@task` decorator | ✅ | ✅ |
-| Auto-parallel task fan-out | ✅ (tokio JoinSet) | ✅ |
-| Same checkpointing/streaming as `StateGraph` | ✅ | ✅ |
-
-**Verdict:** Parity.
-
----
-
-## 11. Structured output
-
-| Feature | litGraph | LangGraph |
-|---|---|---|
-| `with_structured_output` | ✅ | ✅ |
-| Pydantic v2 | ✅ | ✅ |
-| Dataclass / TypedDict | ✅ | ⏳ |
-| Raw JSON Schema | ✅ | ✅ |
-| Stream coercion (`coerce_one`/`coerce_stream`) | ✅ | ❌ |
-| Partial-JSON repair | ✅ (Rust, 904 MB/s) | ⏳ (json-repair Python) |
-| Output fixer (LLM-on-error retry) | ✅ | ✅ |
-
-**Verdict:** litGraph wins on stream coercion + repair perf.
-
----
-
-## 12. Resilience wrappers
-
-| Feature | litGraph | LangGraph |
-|---|---|---|
-| Retry (with backoff + jitter) | ✅ | ⏳ (LangChain) |
-| Fallback (provider failover) | ✅ | ⏳ |
-| Rate limiter | ✅ | ⏳ |
-| Token budget cap | ✅ | ❌ |
-| Cost cap (USD ceiling) | ✅ | ❌ |
-| PII scrubbing pre-call | ✅ | ❌ |
-| Prompt caching middleware | ✅ | ⏳ |
-| Timeout wrapper | ✅ | ✅ (asyncio) |
-| Composes freely (decorator stack) | ✅ | ⏳ |
-
-**Verdict:** litGraph wins. Resilience is a first-class subsystem; in
-LangGraph you assemble it from LangChain bits.
-
----
-
-## 13. Evaluation
-
-| Feature | litGraph | LangGraph |
-|---|---|---|
-| EvalHarness driver | ✅ | ⏳ (LangSmith Eval) |
-| BLEU (multi-ref) / ROUGE-N / ROUGE-L | ✅ | ❌ (Python deps) |
-| chrF / chrF++ | ✅ | ❌ |
-| METEOR-lite | ✅ | ❌ |
-| BERTScore-lite | ✅ | ❌ |
-| WER / CER (+ sub/ins/del breakdown) | ✅ | ❌ |
-| TER (with shifts) | ✅ | ❌ |
-| Relaxed Word Mover Distance | ✅ | ❌ |
-| Pearson / Spearman / Kendall's tau-b | ✅ | ❌ |
-| Paired permutation test | ✅ | ❌ |
-| LLM-as-judge | ✅ | ✅ (LangSmith) |
-| Pairwise evaluator | ✅ | ✅ |
-| Trajectory eval | ✅ | ✅ |
-| Dataset versioning + regression alerts | ✅ | 💰 (LangSmith) |
-
-**Verdict:** litGraph has a stand-alone, self-hosted eval suite; LangGraph
-defers to LangSmith (managed, paid).
-
----
-
-## 14. Deployment
-
-| Feature | litGraph | LangGraph |
-|---|---|---|
-| HTTP serve binary (REST + SSE) | ✅ (`litgraph-serve`) | ✅ (`langgraph-cli serve`) |
-| LangGraph Cloud-API compatible endpoints | ✅ (Studio router behind feature flag) | ✅ (native) |
-| Managed cloud hosting | ❌ (self-host only) | 💰 (LangGraph Cloud) |
-| Studio UI (visual debugger) | ⏳ (cloud-API surface only; no local UI) | ✅ |
-| Multi-tenant auth scaffolding | ❌ (planned) | 💰 |
-| WebSocket endpoint | ❌ (SSE covers it) | ⏳ |
-
-**Verdict:** LangGraph wins for managed deploys; litGraph wins for
-self-host (single Rust binary, no Python runtime needed at the edge).
-
----
-
-## 15. Provider coverage
-
-### Chat
-
-| Provider | litGraph | LangGraph |
-|---|---|---|
-| OpenAI (Chat Completions + Responses) | ✅ | ✅ |
-| Anthropic | ✅ (+thinking blocks +prompt caching) | ✅ |
-| Google Gemini (AI Studio + Vertex) | ✅ | ✅ |
-| AWS Bedrock (native + Converse) | ✅ (no AWS SDK dep — pure Rust SigV4) | ✅ |
-| Cohere | ✅ | ✅ |
-| Mistral | ⏳ (via OpenAI-compat) | ✅ (native) |
-| OpenAI-compat: Ollama / vLLM / Together / Groq / Fireworks / DeepSeek / xAI / LM Studio | ✅ | ✅ |
-| Local model via candle / mistral.rs | ❌ (planned) | ❌ |
-
-### Embeddings
-
-OpenAI · Cohere · Voyage · Jina · Bedrock · Gemini · FastEmbed (local ONNX). litGraph has all native; LangGraph delegates to LangChain wrappers.
-
-### Vector stores
-
-| Store | litGraph | LangGraph |
-|---|---|---|
-| In-memory | ✅ | ✅ (LangChain) |
-| HNSW (embedded) | ✅ (instant-distance, pure Rust) | ⏳ (faiss/hnswlib via LangChain) |
-| Qdrant | ✅ (REST, no gRPC) | ✅ |
-| pgvector | ✅ | ✅ |
-| Chroma | ✅ | ✅ |
-| Weaviate | ✅ | ✅ |
-| LanceDB | 🚫 | ✅ |
-| Pinecone | 🚫 | ✅ |
-
-### Loaders
-
-litGraph: text, JSONL, MD, dir, CSV, PDF, DOCX, Jupyter, HTML, sitemap, S3, GDrive, Confluence, Jira, Linear, Notion, Slack, Gmail, GitHub (files + issues), GitLab, Discord, Wikipedia. All rayon-parallel.
-
-LangGraph: ~150+ via LangChain ecosystem. Wider coverage; most pull heavy Python deps.
-
----
-
-## 16. Performance
-
-Apples-to-apples micro-benches (criterion on macOS arm64). Reproduce with `cargo bench -p litgraph-bench`. LangGraph numbers approximated from `pytest-benchmark` runs of equivalent operations on the same hardware.
-
-| Operation | litGraph | LangGraph (approx) | Speed-up |
+| Feature | litGraph | LangChain | LangGraph |
 |---|---|---|---|
-| Graph fanout/64 nodes | ~ 90 µs (706 K nodes/s) | ~ 8 ms | ~ 90× |
-| BM25 search / 50 K docs | ~ 2.1 ms (23.4 M elem/s) | ~ 200 ms (LangChain-dep) | ~ 100× |
-| HNSW search / 100 K vecs | ~ 41 µs (2.4 G elem/s) | ~ 4 ms (faiss-py) | ~ 100× |
-| SSE parse / 16 KB chunk | ~ 12 µs (1.3 GB/s) | ~ 2 ms (Python sse-starlette) | ~ 165× |
-| JSON repair / 256 B | ~ 280 ns (904 MB/s) | ~ 50 µs (json-repair) | ~ 175× |
-| RRF fuse / 4 × 100 lists | ~ 65 µs (6.1 M docs/s) | ~ 5 ms (LangChain) | ~ 75× |
+| Headline abstraction | `StateGraph` (typed, compiled) | `Runnable` + LCEL `|` pipes | `StateGraph` (compiled) |
+| Compile step before run | ✅ | ⏳ (lazy, via `RunnableLambda` chain) | ✅ |
+| Static cycle / shape check | ✅ | ❌ | ✅ |
+| Drop-in `RunnableInterface` | ❌ (different shape on purpose) | ✅ | ✅ (StateGraph IS Runnable) |
+| Functional API (`@entrypoint` / `@task`) | ✅ | ❌ | ✅ |
 
-The numbers shift case-by-case but the shape doesn't: every primitive on
-the litGraph hot path is a Rust call; LangGraph hits Python.
-
----
-
-## 17. Runtime / dependencies
-
-| Dimension | litGraph | LangGraph |
-|---|---|---|
-| Core language | Rust | Python |
-| Python binding | abi3-py39 (one wheel covers 3.9–3.13+) | n/a (it IS Python) |
-| GIL behaviour | dropped (`py.detach()`) around every blocking call | held during call paths |
-| Free-threaded Python 3.13t | ✅ supported | ⏳ (depends on stack) |
-| Default wheel size | ~13 MB (one native .so) | ~5–50 MB (varies w/ deps) |
-| Required runtime deps | none (Python stdlib only) | `langchain-core` + transitive deps |
-| Optional integrations | Cargo features (zero default features) | pip extras |
-| Cold-import time | < 50 ms | ~ 500 ms – 2 s |
+LangChain is chain-shaped; litGraph + LangGraph are graph-shaped. If
+you've already invested in LCEL pipes, LangGraph migration is cheaper
+than litGraph migration.
 
 ---
 
-## 18. When LangGraph is the better choice
+## 2. Core graph primitives
 
-- You need a **managed cloud** with autoscaling + persistence + RBAC out of the box.
-- You want **LangGraph Studio** (visual graph debugger) — litGraph implements the cloud API surface but no local UI yet.
-- You're **already on LangSmith** for tracing, eval, prompt management.
-- You need a **niche loader / vector store** that only exists in the LangChain ecosystem (LanceDB, Pinecone, etc.).
-- You're a Python shop with no Rust toolchain and don't want the build-from-source friction (PyPI wheels exist for both, but litGraph's optional crate features require a Rust compile).
+| Feature | litGraph | LangChain | LangGraph |
+|---|---|---|---|
+| `StateGraph` typed state | ✅ | ❌ (LCEL only) | ✅ |
+| Add/remove nodes + edges | ✅ | ❌ | ✅ |
+| Conditional edges | ✅ | ⏳ (`RunnableBranch`) | ✅ |
+| Reducers (`Annotated[..., add]`) | ✅ | ❌ | ✅ |
+| Dynamic fan-out (`Send` API) | ✅ (`add_send`) | ⏳ (`RunnableParallel` static) | ✅ |
+| Subgraphs | ✅ | ⏳ (chain-of-chains) | ✅ |
+| START / END sentinels | ✅ | n/a | ✅ |
+| `compile().invoke / .stream / .batch` | ✅ | ✅ (via Runnable) | ✅ |
+| Visualize (Mermaid / Graphviz) | ✅ | ⏳ | ✅ |
+| Super-step parallel execution | ✅ (Kahn scheduler) | ❌ | ✅ |
+
+**Verdict:** LangGraph and litGraph functionally equal. LangChain doesn't
+play in this column — its parallelism comes from `RunnableParallel`,
+which is static fan-out only.
 
 ---
 
-## 19. When litGraph is the better choice
+## 3. Chain / pipeline DSL
+
+| Feature | litGraph | LangChain | LangGraph |
+|---|---|---|---|
+| LCEL `|` operator chaining | ❌ (use graph nodes) | ✅ | ❌ (use graph nodes) |
+| `Runnable` interface | ❌ | ✅ | ✅ (StateGraph IS one) |
+| `RunnableParallel` | ⏳ (graph fan-out) | ✅ | ✅ |
+| `RunnableBranch` | ⏳ (conditional edges) | ✅ | ✅ |
+| `RunnableLambda` | ⏳ (a node IS a function) | ✅ | ✅ |
+| `with_fallbacks` chain | ✅ (`FallbackChatModel`) | ✅ | ✅ |
+| Streaming chains | ✅ | ✅ | ✅ |
+
+If LCEL pipes are how your team thinks, LangChain is unique here. The
+litGraph design call is "explicit graph > implicit chain" — a node IS
+already a function.
+
+---
+
+## 4. Streaming
+
+| Feature | litGraph | LangChain | LangGraph |
+|---|---|---|---|
+| Token-level streaming | ✅ | ✅ | ✅ |
+| `astream_events` (typed event taxonomy) | ❌ (callback bus instead) | ✅ | ✅ |
+| Stream modes: `values`, `updates`, `messages`, `debug` | ⏳ (`values`+`updates`; `messages` via callback bus) | n/a | ✅ |
+| Multi-consumer broadcast | ✅ (`broadcast(stream, n)`) | ❌ | ❌ |
+| Race / first-wins between streams | ✅ (`race(streams)`) | ❌ | ❌ |
+| Multiplex streams with origin tags | ✅ (`multiplex(streams)`) | ❌ | ❌ |
+| Sub-millisecond per-event overhead | ✅ (Rust SSE parse, ~12 µs/16 KB) | ❌ (~ms-class Python) | ❌ (~ms-class Python) |
+
+**Verdict:** litGraph wins on raw streaming primitives + perf. LangChain
+defines the typed event vocabulary that LangGraph inherits.
+
+---
+
+## 5. Checkpointing + time-travel
+
+| Feature | litGraph | LangChain | LangGraph |
+|---|---|---|---|
+| In-memory checkpointer | ✅ | ❌ | ✅ |
+| SQLite checkpointer | ✅ (WAL, durable) | ❌ | ✅ |
+| Postgres checkpointer | ✅ (deadpool-pooled) | ❌ | ✅ |
+| Redis checkpointer | ✅ (ZSET, O(log n) latest) | ❌ | ⏳ (community) |
+| Time-travel (resume from any checkpoint id) | ✅ | ❌ | ✅ |
+| Branch (fork a checkpoint) | ⏳ (manual: copy thread) | ❌ | ✅ (`branch()`) |
+| Per-thread state via `thread_id` | ✅ | ❌ | ✅ |
+| Resume registry across process restarts | ✅ | ❌ | ⏳ (cloud) |
+
+LangChain has no checkpointing — that's why LangGraph exists.
+
+---
+
+## 6. Agents
+
+| Feature | litGraph | LangChain | LangGraph |
+|---|---|---|---|
+| Modern ReAct agent | ✅ (`ReactAgent`) | ⏳ (`AgentExecutor` legacy) | ✅ (`create_react_agent`) |
+| Native tool-call format per provider | ✅ | ✅ | ✅ |
+| Text-mode ReAct (T/A/O transcript) | ✅ (`TextReactAgent`) | ✅ (legacy) | ⏳ |
+| Plan-and-Execute | ✅ (`PlanExecuteAgent`) | ⏳ (deprecated) | ⏳ (recipe) |
+| Supervisor (multi-agent routing) | ✅ (`SupervisorAgent`) | ❌ | ✅ (`langgraph-supervisor`) |
+| Debate (multi-agent + judge) | ✅ (`DebateAgent`) | ❌ | ❌ |
+| Critique-Revise (self-improvement) | ✅ (`CritiqueReviseAgent`) | ❌ | ❌ |
+| Self-Consistency (sample N → vote) | ✅ (`SelfConsistencyChatModel`) | ❌ | ❌ |
+| Subagent tool (delegate to another agent) | ✅ (`SubagentTool`) | ⏳ | ⏳ |
+| Swarm (handoff topology) | ❌ | ❌ | ✅ (`langgraph-swarm`) |
+| BigTool (large-scale tool selection) | ⏳ (RAG over tool descs, manual) | ❌ | ✅ (`langgraph-bigtool`) |
+| Deep agent factory (one-call wiring) | ✅ (`litgraph.agents.deep`) | ❌ | ✅ (`deepagents` pkg) |
+| Legacy `AgentExecutor` API | ❌ (skipped intentionally) | ✅ | ❌ |
+
+**Verdict:** litGraph has more research-backed patterns out of the box
+(debate, critique-revise, self-consistency); LangGraph has the swarm +
+BigTool addons; LangChain still ships the legacy `AgentExecutor` for
+back-compat.
+
+---
+
+## 7. Tools
+
+| Feature | litGraph | LangChain | LangGraph |
+|---|---|---|---|
+| `@tool` decorator | ✅ (`#[tool]` macro + `FunctionTool`) | ✅ | 📦 (LangChain) |
+| JSON Schema autoderivation | ✅ (schemars) | ✅ (Pydantic) | 📦 |
+| Built-in: shell / Python REPL / filesystem | ✅ | ⏳ (community) | 📦 |
+| Built-in: web fetch / Tavily / DuckDuckGo / webhook | ✅ | ✅ | 📦 |
+| Built-in: SQLite / virtual-fs / JSON-Patch / slugify | ✅ | ⏳ | 📦 |
+| Built-in: Whisper / TTS / DALL·E / Gmail send | ✅ | ⏳ (community) | 📦 |
+| `before_tool` / `after_tool` hooks | ❌ (planned) | ✅ (callbacks) | ✅ |
+| Streaming tool execution | 🚫 (offload pattern preferred) | ⏳ | ⏳ |
+| Tool call budget cap | ⏳ ($-cap, not call-count) | ❌ | ❌ |
+| MCP tool adapter | ✅ | ⏳ | ✅ |
+| Total stock tool count | ~ 35 | 200+ (Community) | inherits LangChain |
+
+**Verdict:** litGraph: fattest *built-in* tool set (35+ first-class).
+LangChain Community: largest *catalogue* but spread across N packages.
+
+---
+
+## 8. Memory + chat history
+
+| Feature | litGraph | LangChain | LangGraph |
+|---|---|---|---|
+| Token-buffer memory | ✅ | ✅ (`ConversationBufferMemory`) | ⏳ (via state) |
+| Summary-buffer memory | ✅ | ✅ | ⏳ (recipe) |
+| LangMem-style fact extractor | ✅ (`langmem` module) | ⏳ | ✅ (`langmem` pkg) |
+| Backend: in-process | ✅ | ✅ | ✅ |
+| Backend: SQLite | ✅ | ✅ | ⏳ |
+| Backend: Postgres | ✅ | ✅ | ✅ |
+| Backend: Redis | ✅ | ✅ | ⏳ |
+| Backend: DynamoDB / MongoDB / Cassandra / … | ❌ | ✅ (Community) | 📦📦 |
+| Hierarchical / namespaced memory | ⏳ (filter-based) | ⏳ | ✅ |
+| Vector-backed long-term memory | ✅ (postgres + sqlite) | ✅ | ✅ |
+
+**Verdict:** LangChain's memory backend catalogue is unmatched.
+litGraph covers the four production-relevant backends.
+
+---
+
+## 9. Retrieval / RAG
+
+| Feature | litGraph | LangChain | LangGraph |
+|---|---|---|---|
+| `Retriever` / `VectorStore` traits | ✅ (native Rust) | ✅ (Python) | 📦 |
+| BM25 retriever | ✅ (rayon, 23 M elem/s) | ✅ (Python `rank-bm25`) | 📦 |
+| RRF fusion | ✅ (parallel, 6 M docs/s) | ⏳ (manual) | 📦 |
+| MMR | ✅ | ✅ | 📦 |
+| HyDE | ✅ | ✅ | 📦 |
+| Multi-query | ✅ | ✅ | 📦 |
+| Self-query | ✅ | ✅ | 📦 |
+| Parent-document | ✅ | ✅ | 📦 |
+| Multi-vector | ✅ | ✅ | 📦 |
+| Time-weighted | ✅ | ✅ | 📦 |
+| Ensemble retriever (weighted) | ✅ | ✅ | 📦 |
+| Race retriever (first-wins) | ✅ | ❌ | ❌ |
+| Step-back / sub-query decomposition | ✅ | ⏳ | 📦 |
+| Contextual compression | ✅ | ✅ | 📦 |
+| Semantic dedup at ingest | ✅ | ❌ | ❌ |
+| Rerankers: Cohere / Voyage / Jina / FastEmbed | ✅ (native) | ✅ (Community) | 📦 |
+| **HNSW search throughput / 100 K vecs** | **~ 41 µs (2.4 G elem/s)** | ~ 4 ms (faiss-py) | 📦 (LangChain) |
+| **BM25 search / 50 K docs** | **~ 2.1 ms (23.4 M elem/s)** | ~ 200 ms | 📦 |
+
+**Verdict:** litGraph wins decisively on retrieval. Native Rust BM25 +
+HNSW + RRF + MMR all on the hot path, no GIL. LangChain has the
+broadest catalogue of *integrations* (every cloud retrieval API);
+LangGraph inherits LangChain's wrappers wholesale.
+
+---
+
+## 10. Vector stores
+
+| Store | litGraph | LangChain | LangGraph |
+|---|---|---|---|
+| In-memory | ✅ | ✅ | 📦 |
+| HNSW (embedded) | ✅ (instant-distance, Rust) | ✅ (faiss / hnswlib via Community) | 📦 |
+| FAISS | ❌ (HNSW covers it) | ✅ | 📦 |
+| Qdrant | ✅ (REST, no gRPC) | ✅ | 📦 |
+| pgvector | ✅ | ✅ | 📦 |
+| Chroma | ✅ | ✅ | 📦 |
+| Weaviate | ✅ | ✅ | 📦 |
+| LanceDB | 🚫 | ✅ | 📦 |
+| Pinecone | 🚫 | ✅ | 📦 |
+| Milvus | ❌ | ✅ | 📦 |
+| Redis-search | ❌ | ✅ | 📦 |
+| Neo4j (vector) | ❌ | ✅ | 📦 |
+| MongoDB Atlas Vector | ❌ | ✅ | 📦 |
+| Total | 6 | 80+ | inherits |
+
+LangChain wins coverage; litGraph covers the production-relevant 6.
+
+---
+
+## 11. Document loaders
+
+| Feature | litGraph | LangChain | LangGraph |
+|---|---|---|---|
+| Text · JSONL · MD · Dir · CSV | ✅ (rayon-parallel) | ✅ | 📦 |
+| PDF · DOCX | ✅ | ✅ | 📦 |
+| HTML · sitemap · web | ✅ | ✅ | 📦 |
+| S3 · Google Drive | ✅ | ✅ | 📦 |
+| Confluence · Jira · Linear · Notion · Slack | ✅ | ✅ | 📦 |
+| GitHub (files + issues) · GitLab · Discord · Wikipedia | ✅ | ✅ | 📦 |
+| Gmail · Jupyter | ✅ | ✅ | 📦 |
+| Outlook · IMAP · WhatsApp · YouTube · Hugging Face · Airtable · Reddit · Twitter · … | ❌ | ✅ (Community, ~150 total) | 📦 |
+| **Parallel ingest** | ✅ (rayon, all loaders) | ⏳ (depends on loader) | 📦 |
+| Total stock loaders | ~ 25 | 150+ | inherits |
+
+**Verdict:** LangChain wins on breadth (~6× more loaders). litGraph
+covers the mainstream business loaders and adds parallel ingest as a
+default, not a per-loader feature.
+
+---
+
+## 12. Splitters
+
+| Feature | litGraph | LangChain | LangGraph |
+|---|---|---|---|
+| Recursive character | ✅ | ✅ | 📦 |
+| Markdown header | ✅ | ✅ | 📦 |
+| HTML header | ✅ | ✅ | 📦 |
+| JSON splitter | ✅ | ✅ | 📦 |
+| Token splitter (tiktoken / HF) | ✅ | ✅ | 📦 |
+| Semantic chunker | ✅ | ✅ | 📦 |
+| Code-aware (tree-sitter, definition-level) | ✅ | ⏳ (language-specific) | 📦 |
+| NLTK / SpaCy sentence splitter | ❌ | ✅ | 📦 |
+
+**Verdict:** Near-parity, with LangChain edging out on NLP-toolkit
+splitters.
+
+---
+
+## 13. Output parsers / structured output
+
+| Feature | litGraph | LangChain | LangGraph |
+|---|---|---|---|
+| `with_structured_output` | ✅ | ✅ | ✅ (via LangChain) |
+| Pydantic v2 | ✅ | ✅ | ✅ |
+| Dataclass / TypedDict | ✅ | ⏳ | ✅ |
+| Raw JSON Schema | ✅ | ✅ | ✅ |
+| Stream coercion (`coerce_one`/`coerce_stream`) | ✅ | ❌ | ❌ |
+| Partial-JSON repair | ✅ (Rust, 904 MB/s) | ⏳ (`json-repair` py) | ⏳ |
+| Output fixer (LLM-on-error retry) | ✅ | ✅ | ⏳ |
+| Boolean / list / numbered-list parsers | ✅ | ✅ | ✅ |
+| Markdown table parser | ✅ | ⏳ | ⏳ |
+| ReAct step parser | ✅ | ✅ | ⏳ |
+| XML tag parser | ✅ | ✅ | ⏳ |
+| Custom regex parser | ✅ | ✅ | ⏳ |
+
+litGraph wins on stream coercion + repair perf. LangChain has the
+deepest catalogue of legacy parsers.
+
+---
+
+## 14. Prompt templates
+
+| Feature | litGraph | LangChain | LangGraph |
+|---|---|---|---|
+| `ChatPromptTemplate` | ✅ | ✅ | ✅ (LangChain) |
+| `MessagesPlaceholder` | ✅ | ✅ | ✅ |
+| Few-shot prompt template | ✅ | ✅ | ✅ |
+| Semantic-similarity example selector | ✅ | ✅ | ✅ |
+| Length-based example selector | ✅ | ✅ | ✅ |
+| Strict-undefined Jinja (catch typos) | ✅ (minijinja) | ⏳ | ⏳ |
+| from/to JSON · from/to dict | ✅ | ✅ | ✅ |
+| Compose: extend / `+` / concat | ✅ | ✅ | ✅ |
+| Hub (community-shared prompts) | ❌ | ✅ (LangChain Hub) | ✅ |
+
+LangChain wins on the Hub ecosystem; litGraph wins on strict-Jinja
+catch-typos-at-render-time.
+
+---
+
+## 15. Resilience wrappers
+
+| Feature | litGraph | LangChain | LangGraph |
+|---|---|---|---|
+| Retry (exponential backoff + jitter) | ✅ | ✅ | 📦 |
+| Fallback (provider failover) | ✅ | ✅ (`with_fallbacks`) | 📦 |
+| Rate limiter | ✅ | ⏳ (`InMemoryRateLimiter`) | 📦 |
+| Token budget cap | ✅ | ❌ | ❌ |
+| Cost cap (USD ceiling) | ✅ | ❌ | ❌ |
+| PII scrubbing pre-call | ✅ | ⏳ (community) | ⏳ |
+| Prompt-cache middleware | ✅ | ⏳ | ⏳ |
+| Timeout wrapper | ✅ | ✅ (asyncio) | ✅ |
+| Composes freely (decorator stack) | ✅ | ⏳ | ⏳ |
+
+litGraph wins. Resilience is a first-class subsystem; in LangChain it's
+scattered across Core + Community; LangGraph delegates.
+
+---
+
+## 16. Caching
+
+| Feature | litGraph | LangChain | LangGraph |
+|---|---|---|---|
+| In-memory cache | ✅ | ✅ | 📦 |
+| SQLite cache | ✅ | ✅ | 📦 |
+| Redis cache | ⏳ (via memory-redis) | ✅ | 📦 |
+| Semantic cache (embedding similarity) | ✅ | ✅ | 📦 |
+| GPTCache adapter | ❌ | ✅ | 📦 |
+| Embedding cache (separate from model cache) | ✅ | ⏳ | ⏳ |
+| Composes (semantic → identity → model) | ✅ | ⏳ | ⏳ |
+
+LangChain's cache backend catalogue is wider; litGraph composes cleaner.
+
+---
+
+## 17. Observability + tracing
+
+| Feature | litGraph | LangChain | LangGraph |
+|---|---|---|---|
+| Callback handler interface | ✅ | ✅ | 📦 |
+| Cost tracker | ✅ (`CostTracker`) | ⏳ (LangSmith) | ⏳ (LangSmith) |
+| `on_request` raw HTTP hook | ✅ | ❌ | ❌ |
+| OTel exporter (OTLP gRPC + HTTP) | ✅ | ⏳ (community) | ⏳ |
+| LangSmith integration | ⏳ (shim) | ✅ (first-class) | ✅ (first-class) |
+| Trace exemplars (link span ↔ prompt) | ❌ (planned) | ✅ (LangSmith) | ✅ |
+| GraphEvent / NodeEvent stream | ✅ | n/a | ✅ |
+| Stdout / file logger out of the box | ✅ | ✅ | ✅ |
+
+litGraph wins on OTel + raw-HTTP debugging; LangChain/LangGraph win on
+LangSmith depth (it's the same product).
+
+---
+
+## 18. Human-in-the-loop (HITL)
+
+| Feature | litGraph | LangChain | LangGraph |
+|---|---|---|---|
+| `interrupt_before` / `interrupt_after` | ✅ | ❌ | ✅ |
+| Dynamic `interrupt(payload)` from a node | ✅ | ❌ | ✅ |
+| Resume with edited state | ✅ (`compiled.resume(...)`) | ❌ | ✅ (`Command(resume=...)`) |
+| Webhook-resume bridge (HTTP → resume) | ✅ | ❌ | 💰 (Cloud) |
+| Pending interrupt inspection | ✅ | ❌ | ✅ |
+
+LangChain has no HITL — that's why LangGraph exists.
+
+---
+
+## 19. Provider coverage — chat models
+
+| Provider | litGraph | LangChain | LangGraph |
+|---|---|---|---|
+| OpenAI (Chat Completions + Responses) | ✅ | ✅ | 📦 |
+| Anthropic (+ thinking blocks + prompt caching) | ✅ | ✅ | 📦 |
+| Google Gemini (AI Studio + Vertex) | ✅ | ✅ | 📦 |
+| AWS Bedrock (native + Converse, no AWS SDK) | ✅ | ✅ (depends on boto3) | 📦 |
+| Cohere | ✅ | ✅ | 📦 |
+| Mistral | ⏳ (via OpenAI-compat) | ✅ (native) | 📦 |
+| Ollama / vLLM / Together / Groq / Fireworks / DeepSeek / xAI / LM Studio | ✅ (via OpenAI-compat) | ✅ (each native) | 📦 |
+| HuggingFace TGI · IBM watsonx · Databricks · Snowflake Cortex · Replicate · NVIDIA NIM | ❌ | ✅ (Community) | 📦 |
+| Local model via candle / mistral.rs | ❌ (planned) | ❌ | ❌ |
+| Total provider count | ~ 6 native + 8 OpenAI-compat | 50+ | inherits |
+
+LangChain wins on native-integration breadth; litGraph hits the
+top-tier providers natively + everything OpenAI-compatible for free.
+
+---
+
+## 20. Embedding providers
+
+| Provider | litGraph | LangChain | LangGraph |
+|---|---|---|---|
+| OpenAI · Cohere · Voyage · Jina | ✅ | ✅ | 📦 |
+| Bedrock · Gemini | ✅ | ✅ | 📦 |
+| FastEmbed (local ONNX) | ✅ | ✅ | 📦 |
+| HuggingFace Inference / Sentence-Transformers / Instructor / E5 / NVIDIA NIM | ❌ | ✅ | 📦 |
+
+LangChain wins on integration breadth.
+
+---
+
+## 21. Evaluation
+
+| Feature | litGraph | LangChain | LangGraph |
+|---|---|---|---|
+| Eval driver / harness | ✅ (`EvalHarness`) | ⏳ (`langchain.evaluation`) | ⏳ (LangSmith Eval) |
+| BLEU (multi-ref) / ROUGE-N / ROUGE-L | ✅ | ⏳ (string distance only) | ❌ |
+| chrF / chrF++ | ✅ | ❌ | ❌ |
+| METEOR-lite | ✅ | ❌ | ❌ |
+| BERTScore-lite | ✅ | ⏳ (via deps) | ❌ |
+| WER / CER (+ sub/ins/del breakdown) | ✅ | ❌ | ❌ |
+| TER (with shifts) | ✅ | ❌ | ❌ |
+| Relaxed Word Mover Distance | ✅ | ❌ | ❌ |
+| Pearson / Spearman / Kendall's tau-b | ✅ | ❌ | ❌ |
+| Paired permutation test | ✅ | ❌ | ❌ |
+| LLM-as-judge | ✅ | ✅ | ✅ (LangSmith) |
+| Pairwise evaluator | ✅ | ✅ | ✅ |
+| Trajectory eval | ✅ | ✅ | ✅ |
+| Dataset versioning + regression alerts | ✅ | ❌ | 💰 (LangSmith) |
+
+**Verdict:** litGraph has a stand-alone, self-hosted eval suite.
+LangChain ships some string-distance scorers; LangSmith owns the rest
+behind a paywall.
+
+---
+
+## 22. MCP (Model Context Protocol)
+
+| Feature | litGraph | LangChain | LangGraph |
+|---|---|---|---|
+| MCP client (stdio + HTTP/SSE) | ✅ | ⏳ (community) | ✅ |
+| MCP server (expose own tools) | ✅ | ❌ | ⏳ |
+| MCP tool adapter (drop-in to agent) | ✅ | ⏳ | ✅ |
+| Resource + prompt support | ✅ | ⏳ | ⏳ |
+
+litGraph + LangGraph both ship first-class MCP; LangChain Core hasn't.
+
+---
+
+## 23. Deployment
+
+| Feature | litGraph | LangChain | LangGraph |
+|---|---|---|---|
+| HTTP serve binary (REST + SSE) | ✅ (`litgraph-serve`) | ⏳ (`LangServe`) | ✅ (`langgraph-cli serve`) |
+| LangGraph Cloud-API compatible | ✅ (Studio router behind feature flag) | ❌ | ✅ (native) |
+| Managed cloud hosting | ❌ (self-host only) | 💰 (LangSmith deploy) | 💰 (LangGraph Cloud) |
+| Studio UI (visual debugger) | ⏳ (cloud-API surface; no local UI) | ⏳ (LangServe Playground) | ✅ |
+| Multi-tenant auth scaffolding | ❌ (planned) | ❌ | 💰 |
+| WebSocket endpoint | ❌ (SSE covers it) | ⏳ (LangServe) | ⏳ |
+| Single binary deploy (no Python at edge) | ✅ (Rust binary) | ❌ | ❌ |
+
+LangGraph wins for managed deploy; litGraph wins for self-hosted
+single-binary deploy.
+
+---
+
+## 24. Performance
+
+Apples-to-apples micro-benches (criterion on macOS arm64). LangChain /
+LangGraph numbers approximated from public `pytest-benchmark` runs of
+equivalent operations. Numbers shift case-by-case but the shape doesn't
+— every primitive on the litGraph hot path is a Rust call; LangChain
+hits Python; LangGraph hits LangChain.
+
+| Operation | litGraph | LangChain | LangGraph |
+|---|---|---|---|
+| Graph fanout / 64 nodes | ~ 90 µs | n/a | ~ 8 ms (~ 90× slower) |
+| BM25 search / 50 K docs | ~ 2.1 ms | ~ 200 ms | ~ 200 ms (uses LangChain) |
+| HNSW search / 100 K vecs | ~ 41 µs | ~ 4 ms | ~ 4 ms (uses LangChain) |
+| SSE parse / 16 KB chunk | ~ 12 µs | ~ 2 ms | ~ 2 ms |
+| JSON repair / 256 B | ~ 280 ns | ~ 50 µs | ~ 50 µs |
+| RRF fuse / 4 × 100 lists | ~ 65 µs | ~ 5 ms | ~ 5 ms |
+| Cold-import time | < 50 ms | ~ 500 ms – 2 s | ~ 1–3 s |
+
+If your throughput SLO is dominated by framework overhead (fan-out
+agents, retrieval-heavy pipelines, long sessions), the gap shows. If
+it's dominated by the LLM call, the framework hardly matters.
+
+---
+
+## 25. Runtime / dependencies
+
+| Dimension | litGraph | LangChain | LangGraph |
+|---|---|---|---|
+| Core language | Rust | Python | Python |
+| Python binding | abi3-py39 (one wheel covers 3.9–3.13+) | n/a | n/a |
+| GIL behaviour | dropped (`py.detach()`) on every blocking call | held | held |
+| Free-threaded Python 3.13t | ✅ supported | ⏳ | ⏳ |
+| Default wheel size | ~ 13 MB (one native .so) | ~ 5 MB (Core) + 50–500 MB (Community) | ~ 5 MB + LangChain |
+| Required runtime deps | none (Python stdlib) | `langchain-core` + Pydantic + jsonpatch + … | `langchain-core` + `langgraph-core` + … |
+| Optional integrations | Cargo features (zero defaults) | pip extras + langchain-* sub-packages | pip extras |
+| Cold-import time | < 50 ms | ~ 500 ms – 2 s | ~ 1–3 s |
+| Type checker friendliness | ✅ (PEP 561 stubs) | ⏳ (improved in 0.3.x) | ⏳ |
+
+LangChain itself is now split into ~ 30 sub-packages (`langchain-core`,
+`langchain-openai`, `langchain-anthropic`, `langchain-aws`, …) to manage
+dep weight. Even so, a typical LangChain agent install is ~ 200 MB of
+transitive deps; litGraph is ~ 13 MB.
+
+---
+
+## 26. Ecosystem / community
+
+| Dimension | litGraph | LangChain | LangGraph |
+|---|---|---|---|
+| GitHub stars | ~ 100s (early) | 90 K+ | 12 K+ |
+| Production users | early adopters | thousands | hundreds |
+| Hub (shared prompts/agents) | ❌ | ✅ | ⏳ |
+| Tutorials / blog posts | small | enormous | growing |
+| Stack Overflow tag | ❌ | ✅ | ⏳ |
+| Hiring market familiarity | low | high | medium |
+
+LangChain wins decisively on ecosystem — that's its biggest moat.
+
+---
+
+## 27. When LangChain is the better choice
+
+- You want **LCEL pipes** (`prompt | model | parser`) as your composition model.
+- You need an **integration that only exists in LangChain Community** (a niche loader, vector store, tool, or memory backend).
+- You want **LangChain Hub** for shared prompts / agents.
+- Your team already knows LangChain idioms and you're optimising for hiring/onboarding speed.
+- You don't need durable orchestration (no checkpointing, no HITL).
+
+## 28. When LangGraph is the better choice
+
+- You want a **graph DSL** + **LangChain provider catalogue** + **LangSmith / Cloud / Studio**.
+- You want **managed cloud hosting** with autoscaling, persistence, RBAC.
+- You're already on **LangSmith** for tracing, eval, prompt management.
+- You want **branch / time-travel** ergonomics with the polish of an established product.
+- You're a Python shop with no Rust toolchain.
+
+## 29. When litGraph is the better choice
 
 - **Throughput / latency matters.** Long agent sessions, retrieval-heavy
   workloads, fan-out across many tools — Rust gives 50–100× headroom on
   framework overhead.
-- **You self-host and pay for compute.** A single Rust binary uses
-  ~10× less CPU than equivalent Python for the same orchestration, so
-  bills shrink.
+- **You self-host and pay for compute.** A Rust binary uses ~ 10× less
+  CPU than equivalent Python for the same orchestration → bills shrink.
 - **You need true parallelism.** Free-threaded Python 3.13t works, but
   most stacks are still GIL-bound. litGraph drops the GIL.
-- **You want slim, auditable deps.** 1 wheel (~13 MB) vs. 200+
-  transitive Python deps. Easier supply-chain review.
+- **You want slim, auditable deps.** 1 wheel (~ 13 MB) vs. 200 MB of
+  Python transitive deps. Easier supply-chain review.
 - **You want a stand-alone eval suite.** BLEU, ROUGE, chrF, METEOR,
-  BERTScore-lite, WER, TER, RWMD, statistical tests — all in-process,
-  no LangSmith required.
+  BERTScore-lite, WER, TER, RWMD, statistical tests — all native, no
+  LangSmith required.
 - **You want resilience built in, not assembled.** Retry, fallback,
-  rate-limit, budget, cost-cap, PII scrubbing — all native, all
-  composable as decorators.
+  rate-limit, budget, cost-cap, PII scrubbing, prompt-cache — all
+  composable as decorators in one crate.
+- **You want a single-binary edge deploy.** No Python runtime needed at
+  the edge.
 
 ---
 
-## 20. Migration cheat sheet
+## 30. Migration cheat sheet
+
+### From LangChain (chains)
+
+| LangChain | litGraph |
+|---|---|
+| `prompt | model | parser` (LCEL) | three nodes in a `StateGraph`, or a `@task` chain |
+| `RunnableParallel({...})` | parallel branches in `StateGraph` |
+| `RunnableBranch((cond, x), default)` | `add_conditional_edges` |
+| `RunnableLambda(f)` | `g.add_node("f", f)` |
+| `with_fallbacks([m1, m2])` | `FallbackChatModel([m1, m2])` |
+| `AgentExecutor(agent, tools)` | `ReactAgent(model, tools)` |
+| `ConversationBufferMemory()` | `TokenBufferMemory(model_name=...)` |
+| `RetrievalQA.from_chain_type(...)` | compose `Retriever` + an agent or graph node |
+| `OutputParser` | `with_structured_output(Schema)` |
+| `LangChainTracer()` | `tracing.init_otlp(...)` or `CostTracker` |
+
+### From LangGraph
 
 | LangGraph | litGraph |
 |---|---|
@@ -403,29 +601,28 @@ the litGraph hot path is a Rust call; LangGraph hits Python.
 | `Command(goto=..., update=...)` | return `NodeOutput.goto(...)` from a node |
 | `interrupt(payload)` | `g.interrupt_before("node")` + `compiled.resume(...)` |
 | `compiled.stream(state, stream_mode="values")` | `for ev in compiled.stream(state):` |
-| `from langchain.prompts import ChatPromptTemplate` | `from litgraph.prompts import ChatPromptTemplate` |
-| `from langchain.tools import tool` | `from litgraph.tools import FunctionTool` (or `#[tool]` macro in Rust) |
-| `RunnableParallel({...})` | parallel branches in `StateGraph` (built-in) |
-| `OutputParser` | `with_structured_output(Schema)` |
-| `RetrievalQA` | compose `Retriever` + an agent or graph node |
 | `langgraph.func.entrypoint` / `task` | `litgraph.functional.entrypoint` / `task` |
 | `MessagesState` | `add_messages` reducer on a state channel |
 
 ---
 
-## 21. Honesty notes
+## 31. Honesty notes
 
 This doc is written by a litGraph maintainer, so:
 
-- **Benchmarks** are micro, not end-to-end. End-to-end timings are dominated
-  by the LLM call, where both frameworks are equal.
-- **LangGraph numbers** are approximated from public `pytest-benchmark`
-  runs and may have shifted in newer versions.
-- **Feature checkmarks** for LangGraph reflect its public API as of the
-  0.4.x lineage; LangChain ecosystem (LangChain Core / LangChain
-  Community) supplies many of the non-graph features.
-- **litGraph's "✅"** sometimes hides "shipped, not yet at LangGraph's
+- **Benchmarks** are micro, not end-to-end. End-to-end timings are
+  dominated by the LLM call, where all three are equal.
+- **LangChain / LangGraph numbers** are approximated from public
+  `pytest-benchmark` runs and may have shifted in newer versions.
+- **Feature checkmarks** for LangChain reflect the 0.3.x lineage with
+  Community packages; LangGraph reflects the 0.4.x lineage. Both move
+  fast; check `pip show langchain langgraph` if a row looks stale.
+- **litGraph "✅"** sometimes means "shipped, not yet at LangChain's
   scale of polish" — see [MISSING_FEATURES.md](MISSING_FEATURES.md) for
   the gaps we ourselves track.
+- **LangChain Community wraps** count as ✅ for LangChain and 📦 for
+  LangGraph, since LangGraph imports LangChain. That accurately reflects
+  the dep cost.
 
-If a row here looks unfair to LangGraph, file an issue and we'll fix it.
+If a row here looks unfair to LangChain or LangGraph, file an issue
+and we'll fix it.
