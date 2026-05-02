@@ -971,6 +971,186 @@ pub fn cer(reference: &str, candidate: &str) -> f32 {
     dist as f32 / denom as f32
 }
 
+/// Stratified edit-operation counts — diagnostic complement to
+/// raw `wer` / `cer` rates. Answers "are most errors substitutions
+/// or insertions?" — common ASR/MT debugging question.
+///
+/// `total_edits = substitutions + insertions + deletions` and
+/// `error_rate = total_edits / max(1, ref_len)` matches the same
+/// formula as `wer` / `cer` so callers can derive the rate without
+/// a second call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EditBreakdown {
+    pub substitutions: u32,
+    pub insertions: u32,
+    pub deletions: u32,
+    pub ref_len: u32,
+    pub cand_len: u32,
+}
+
+impl EditBreakdown {
+    /// Total edit count (sum of subs / ins / dels).
+    pub fn total_edits(&self) -> u32 {
+        self.substitutions + self.insertions + self.deletions
+    }
+    /// Error rate = total_edits / max(1, ref_len). Matches
+    /// `wer`/`cer` definition so callers can use this struct as a
+    /// drop-in replacement for the raw rate calls.
+    pub fn error_rate(&self) -> f32 {
+        let denom = self.ref_len.max(1) as f32;
+        self.total_edits() as f32 / denom
+    }
+}
+
+/// Word-level edit breakdown — Levenshtein with traceback over
+/// whitespace-tokenized lowercase tokens.
+///
+/// **Why a separate function**: `wer` returns just the rate. Many
+/// debugging questions need the breakdown — "is the ASR mostly
+/// dropping words (high deletions) or hallucinating extras (high
+/// insertions)?" "Are substitutions concentrated in proper nouns?"
+/// Without the breakdown you have to call WER + manually run a
+/// second alignment.
+///
+/// **Algorithm**: full O(m·n) Levenshtein DP matrix (not the
+/// rolling-row variant `wer` uses) so traceback can walk back
+/// from (m, n) emitting per-cell decisions. Each cell is filled
+/// from min of `prev[j-1] + match_or_sub_cost`, `prev[j] + 1`
+/// (deletion), `curr[j-1] + 1` (insertion). Traceback chooses
+/// the parent that produced the cell's value, biasing toward
+/// substitution > insertion > deletion on ties (matches the
+/// `tercom` reference impl convention).
+pub fn wer_breakdown(reference: &str, candidate: &str) -> EditBreakdown {
+    let ref_tokens: Vec<String> = tokenize_lower(reference).collect();
+    let cand_tokens: Vec<String> = tokenize_lower(candidate).collect();
+    let (sub, ins, del) = traceback_edits(&ref_tokens, &cand_tokens);
+    EditBreakdown {
+        substitutions: sub,
+        insertions: ins,
+        deletions: del,
+        ref_len: ref_tokens.len() as u32,
+        cand_len: cand_tokens.len() as u32,
+    }
+}
+
+/// Char-level edit breakdown — same algorithm as `wer_breakdown`
+/// over `Vec<char>`. Whitespace is preserved (significant — same
+/// convention as `cer`).
+pub fn cer_breakdown(reference: &str, candidate: &str) -> EditBreakdown {
+    let ref_chars: Vec<char> = reference.to_lowercase().chars().collect();
+    let cand_chars: Vec<char> = candidate.to_lowercase().chars().collect();
+    let (sub, ins, del) = traceback_edits_chars(&ref_chars, &cand_chars);
+    EditBreakdown {
+        substitutions: sub,
+        insertions: ins,
+        deletions: del,
+        ref_len: ref_chars.len() as u32,
+        cand_len: cand_chars.len() as u32,
+    }
+}
+
+/// Full Levenshtein DP + traceback over `Vec<String>`. Returns
+/// (substitutions, insertions, deletions). Convention:
+/// - **deletion**: ref token has no cand counterpart (cand is
+///   shorter on this stretch).
+/// - **insertion**: cand token has no ref counterpart (cand is
+///   longer on this stretch).
+/// - **substitution**: aligned but mismatched.
+fn traceback_edits(a: &[String], b: &[String]) -> (u32, u32, u32) {
+    let m = a.len();
+    let n = b.len();
+    if m == 0 {
+        return (0, n as u32, 0);
+    }
+    if n == 0 {
+        return (0, 0, m as u32);
+    }
+    // Full matrix (not rolling) — needed for traceback.
+    let mut dp: Vec<Vec<usize>> = vec![vec![0; n + 1]; m + 1];
+    for i in 0..=m {
+        dp[i][0] = i;
+    }
+    for j in 0..=n {
+        dp[0][j] = j;
+    }
+    for i in 1..=m {
+        for j in 1..=n {
+            let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
+            dp[i][j] = (dp[i - 1][j - 1] + cost)
+                .min(dp[i - 1][j] + 1)
+                .min(dp[i][j - 1] + 1);
+        }
+    }
+    // Traceback from (m, n) → (0, 0). Tie-break: prefer
+    // substitution > deletion > insertion (matches tercom).
+    let (mut i, mut j) = (m, n);
+    let (mut sub, mut ins, mut del) = (0_u32, 0_u32, 0_u32);
+    while i > 0 || j > 0 {
+        if i > 0 && j > 0 && a[i - 1] == b[j - 1] && dp[i][j] == dp[i - 1][j - 1] {
+            // Match — no edit.
+            i -= 1;
+            j -= 1;
+        } else if i > 0 && j > 0 && dp[i][j] == dp[i - 1][j - 1] + 1 {
+            sub += 1;
+            i -= 1;
+            j -= 1;
+        } else if i > 0 && dp[i][j] == dp[i - 1][j] + 1 {
+            del += 1;
+            i -= 1;
+        } else {
+            ins += 1;
+            j -= 1;
+        }
+    }
+    (sub, ins, del)
+}
+
+/// Char-level traceback — same logic over `&[char]`.
+fn traceback_edits_chars(a: &[char], b: &[char]) -> (u32, u32, u32) {
+    let m = a.len();
+    let n = b.len();
+    if m == 0 {
+        return (0, n as u32, 0);
+    }
+    if n == 0 {
+        return (0, 0, m as u32);
+    }
+    let mut dp: Vec<Vec<usize>> = vec![vec![0; n + 1]; m + 1];
+    for i in 0..=m {
+        dp[i][0] = i;
+    }
+    for j in 0..=n {
+        dp[0][j] = j;
+    }
+    for i in 1..=m {
+        for j in 1..=n {
+            let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
+            dp[i][j] = (dp[i - 1][j - 1] + cost)
+                .min(dp[i - 1][j] + 1)
+                .min(dp[i][j - 1] + 1);
+        }
+    }
+    let (mut i, mut j) = (m, n);
+    let (mut sub, mut ins, mut del) = (0_u32, 0_u32, 0_u32);
+    while i > 0 || j > 0 {
+        if i > 0 && j > 0 && a[i - 1] == b[j - 1] && dp[i][j] == dp[i - 1][j - 1] {
+            i -= 1;
+            j -= 1;
+        } else if i > 0 && j > 0 && dp[i][j] == dp[i - 1][j - 1] + 1 {
+            sub += 1;
+            i -= 1;
+            j -= 1;
+        } else if i > 0 && dp[i][j] == dp[i - 1][j] + 1 {
+            del += 1;
+            i -= 1;
+        } else {
+            ins += 1;
+            j -= 1;
+        }
+    }
+    (sub, ins, del)
+}
+
 /// Levenshtein distance over a generic token sequence. O(m·n) time,
 /// O(min(m,n)) space via rolling row.
 fn token_levenshtein(a: &[String], b: &[String]) -> usize {
@@ -1962,6 +2142,118 @@ mod tests {
         let c = cer("running", "runs");
         assert!((w - 1.0).abs() < 1e-5);
         assert!(c < w, "CER ({c}) should be < WER ({w}) on a morphological diff");
+    }
+
+    // ─── WER / CER breakdown ──────────────────────────────────────
+
+    #[test]
+    fn wer_breakdown_identical_zero_edits() {
+        let b = wer_breakdown("the cat sat", "the cat sat");
+        assert_eq!(b.substitutions, 0);
+        assert_eq!(b.insertions, 0);
+        assert_eq!(b.deletions, 0);
+        assert_eq!(b.total_edits(), 0);
+        assert_eq!(b.error_rate(), 0.0);
+    }
+
+    #[test]
+    fn wer_breakdown_pure_substitution() {
+        let b = wer_breakdown("the cat sat", "the cat ran");
+        assert_eq!(b.substitutions, 1);
+        assert_eq!(b.insertions, 0);
+        assert_eq!(b.deletions, 0);
+        assert_eq!(b.total_edits(), 1);
+    }
+
+    #[test]
+    fn wer_breakdown_pure_insertion() {
+        let b = wer_breakdown("the cat sat", "the cat sat down");
+        assert_eq!(b.insertions, 1);
+        assert_eq!(b.substitutions, 0);
+        assert_eq!(b.deletions, 0);
+    }
+
+    #[test]
+    fn wer_breakdown_pure_deletion() {
+        let b = wer_breakdown("the cat sat", "the cat");
+        assert_eq!(b.deletions, 1);
+        assert_eq!(b.substitutions, 0);
+        assert_eq!(b.insertions, 0);
+    }
+
+    #[test]
+    fn wer_breakdown_mixed_operations() {
+        // ref: "the cat sat on the mat" (6)
+        // cand: "the cat ran on mat" (5) — sub sat→ran + del "the".
+        let b = wer_breakdown("the cat sat on the mat", "the cat ran on mat");
+        assert_eq!(b.substitutions, 1);
+        assert_eq!(b.deletions, 1);
+        assert_eq!(b.insertions, 0);
+        assert_eq!(b.total_edits(), 2);
+        assert!((b.error_rate() - 2.0 / 6.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn wer_breakdown_empty_ref_only_insertions() {
+        let b = wer_breakdown("", "every word is an insertion");
+        assert_eq!(b.deletions, 0);
+        assert_eq!(b.substitutions, 0);
+        assert_eq!(b.insertions, 5);
+    }
+
+    #[test]
+    fn wer_breakdown_empty_cand_only_deletions() {
+        let b = wer_breakdown("every word is a deletion", "");
+        assert_eq!(b.deletions, 5);
+        assert_eq!(b.insertions, 0);
+        assert_eq!(b.substitutions, 0);
+    }
+
+    #[test]
+    fn wer_breakdown_error_rate_matches_wer() {
+        let cases: Vec<(&str, &str)> = vec![
+            ("the cat sat", "the cat sat"),
+            ("the cat sat", "the cat ran"),
+            ("the cat sat on the mat", "the cat ran"),
+            ("hello", "completely different gibberish"),
+        ];
+        for (r, c) in cases {
+            let b = wer_breakdown(r, c);
+            let raw = wer(r, c);
+            assert!(
+                (b.error_rate() - raw).abs() < 1e-5,
+                "ref={r:?} cand={c:?}: breakdown {} != raw {raw}",
+                b.error_rate()
+            );
+        }
+    }
+
+    #[test]
+    fn cer_breakdown_identical_zero() {
+        let b = cer_breakdown("hello", "hello");
+        assert_eq!(b.total_edits(), 0);
+    }
+
+    #[test]
+    fn cer_breakdown_single_char_substitution() {
+        let b = cer_breakdown("hello", "jello");
+        assert_eq!(b.substitutions, 1);
+        assert_eq!(b.total_edits(), 1);
+        assert_eq!(b.ref_len, 5);
+    }
+
+    #[test]
+    fn cer_breakdown_error_rate_matches_cer() {
+        let cases: Vec<(&str, &str)> = vec![
+            ("hello world", "hello world"),
+            ("hello", "jello"),
+            ("hello world", "helloworld"),
+        ];
+        for (r, c) in cases {
+            let b = cer_breakdown(r, c);
+            let raw = cer(r, c);
+            assert!((b.error_rate() - raw).abs() < 1e-5);
+        }
     }
 
     // ─── chrF++ ───────────────────────────────────────────────────
