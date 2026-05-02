@@ -100,8 +100,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - target: x86_64
-            runner: macos-13       # Intel
+          # macos-13 (Intel) runners are deprecated / queue-starved on
+          # the free tier — jobs sit in `Waiting for runner` for 10+
+          # minutes routinely. Apple stopped shipping Intel Macs in
+          # late 2023; the few remaining users can install from sdist
+          # (Rust + maturin), which the publish step uploads.
           - target: aarch64
             runner: macos-14       # Apple Silicon
     steps:
