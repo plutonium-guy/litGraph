@@ -791,6 +791,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::approx_constant)]
     fn parse_csv_coerces_numeric_strings() {
         let t = parse_table_csv("x\n42\n3.14\nhello").unwrap();
         assert_eq!(t.cell("x", 0).unwrap(), 42);

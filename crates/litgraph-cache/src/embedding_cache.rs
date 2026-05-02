@@ -451,6 +451,7 @@ mod tests {
     // ── SqliteEmbeddingCache ──────────────────────────────────────────────
 
     #[test]
+    #[allow(clippy::approx_constant)]
     fn pack_unpack_roundtrip_preserves_f32_bits() {
         let original = vec![0.0f32, 1.5, -3.14, f32::INFINITY, f32::NEG_INFINITY, 1e-30];
         let packed = pack_f32(&original);

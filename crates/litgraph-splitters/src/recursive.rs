@@ -135,14 +135,13 @@ impl RecursiveCharacterSplitter {
         }
 
         // Find first separator that actually appears; skip separators not present.
-        let sep = loop {
-            if sep_idx >= self.separators.len() {
-                return hard_split(text, self.chunk_size, self.chunk_overlap);
-            }
-            let s = &self.separators[sep_idx];
-            if s.is_empty() || text.contains(s.as_str()) {
-                break s.clone();
-            }
+        if sep_idx >= self.separators.len() {
+            return hard_split(text, self.chunk_size, self.chunk_overlap);
+        }
+        let s = &self.separators[sep_idx];
+        let sep = if s.is_empty() || text.contains(s.as_str()) {
+            s.clone()
+        } else {
             return self.split_recursive(text, sep_idx + 1);
         };
 

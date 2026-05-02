@@ -166,7 +166,7 @@ impl Splitter for TokenTextSplitter {
             if next_start >= remaining.len() {
                 break;
             }
-            if next_start <= 0 {
+            if next_start == 0 {
                 // Couldn't step back without overlapping — break to avoid reprocessing.
                 break;
             }
