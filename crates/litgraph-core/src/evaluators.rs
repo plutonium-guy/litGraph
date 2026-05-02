@@ -545,6 +545,132 @@ pub fn chrf(reference: &str, candidate: &str) -> f32 {
     chrf_n(reference, candidate, 6, 2.0).f_beta
 }
 
+/// chrF++ (Popović 2017) — chrF + word n-grams averaged together.
+/// Adds word-level overlap to chrF's char-level signal so paraphrase-
+/// reordering is caught (chrF alone is permutation-invariant within
+/// short n; word bigrams catch word-order changes).
+///
+/// **Algorithm**: macro-average across (a) `char_max_n` character
+/// n-grams (1..=char_max_n) and (b) `word_max_n` word n-grams
+/// (1..=word_max_n) — single mean over `char_max_n + word_max_n`
+/// total precisions and recalls. F-beta combination with the same
+/// β as chrF.
+///
+/// **Standard params** (Popović 2017 §4): `char_max_n=6`,
+/// `word_max_n=2`, `β=2.0`. Word bigrams are the standard chrF++
+/// addition; chrF+ is char + word unigrams only (less common).
+///
+/// Returns `ChrfScore` with the same shape as `chrf_n` so callers
+/// can swap the two without rewiring.
+pub fn chrf_pp(
+    reference: &str,
+    candidate: &str,
+    char_max_n: usize,
+    word_max_n: usize,
+    beta: f32,
+) -> ChrfScore {
+    if (char_max_n == 0 && word_max_n == 0)
+        || reference.is_empty()
+        || candidate.is_empty()
+    {
+        return ChrfScore::zero(beta);
+    }
+    // Char-side: same prep as chrf_n — lowercase + strip whitespace.
+    let ref_chars: Vec<char> = reference
+        .to_lowercase()
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    let cand_chars: Vec<char> = candidate
+        .to_lowercase()
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    // Word-side: lowercase + whitespace tokenize (matches the rest of
+    // the evaluator family).
+    let ref_words: Vec<String> = tokenize_lower(reference).collect();
+    let cand_words: Vec<String> = tokenize_lower(candidate).collect();
+
+    let mut sum_p = 0.0_f32;
+    let mut sum_r = 0.0_f32;
+    let mut count = 0_f32;
+
+    // Char n-grams contribution.
+    for n in 1..=char_max_n {
+        if ref_chars.len() < n || cand_chars.len() < n {
+            continue;
+        }
+        let (p, r) = char_ngram_pr(&ref_chars, &cand_chars, n);
+        sum_p += p;
+        sum_r += r;
+        count += 1.0;
+    }
+    // Word n-grams contribution.
+    for n in 1..=word_max_n {
+        if ref_words.len() < n || cand_words.len() < n {
+            continue;
+        }
+        let (p, r) = word_ngram_pr(&ref_words, &cand_words, n);
+        sum_p += p;
+        sum_r += r;
+        count += 1.0;
+    }
+    if count == 0.0 {
+        return ChrfScore::zero(beta);
+    }
+    let chr_p = sum_p / count;
+    let chr_r = sum_r / count;
+    let beta_sq = beta * beta;
+    let denom = beta_sq * chr_p + chr_r;
+    let f_beta = if denom == 0.0 {
+        0.0
+    } else {
+        (1.0 + beta_sq) * chr_p * chr_r / denom
+    };
+    ChrfScore {
+        precision: chr_p,
+        recall: chr_r,
+        f_beta,
+        beta,
+    }
+}
+
+/// Standard chrF++ — `char_max_n=6`, `word_max_n=2`, `β=2.0`.
+/// Returns the headline F-beta directly. Use `chrf_pp` for the full
+/// struct or non-standard parameters.
+pub fn chrf_pp_default(reference: &str, candidate: &str) -> f32 {
+    chrf_pp(reference, candidate, 6, 2, 2.0).f_beta
+}
+
+/// Compute clipped word-n-gram precision and recall for a single n.
+/// Mirrors `char_ngram_pr` but operates on `Vec<String>` word
+/// tokens instead of `Vec<char>`.
+fn word_ngram_pr(ref_words: &[String], cand_words: &[String], n: usize) -> (f32, f32) {
+    let ref_grams = ngrams(ref_words, n);
+    let cand_grams = ngrams(cand_words, n);
+    if ref_grams.is_empty() || cand_grams.is_empty() {
+        return (0.0, 0.0);
+    }
+    use std::collections::HashMap;
+    let mut ref_counts: HashMap<&Vec<String>, usize> = HashMap::new();
+    for g in &ref_grams {
+        *ref_counts.entry(g).or_insert(0) += 1;
+    }
+    let mut cand_counts: HashMap<&Vec<String>, usize> = HashMap::new();
+    for g in &cand_grams {
+        *cand_counts.entry(g).or_insert(0) += 1;
+    }
+    let mut overlap: usize = 0;
+    for (g, &cc) in &cand_counts {
+        if let Some(&rc) = ref_counts.get(g) {
+            overlap += rc.min(cc);
+        }
+    }
+    let p = overlap as f32 / cand_grams.len() as f32;
+    let r = overlap as f32 / ref_grams.len() as f32;
+    (p, r)
+}
+
 /// chrF result with diagnostic breakdown.
 ///
 /// `f_beta` is the headline number (β-weighted F-score over the
@@ -1836,6 +1962,54 @@ mod tests {
         let c = cer("running", "runs");
         assert!((w - 1.0).abs() < 1e-5);
         assert!(c < w, "CER ({c}) should be < WER ({w}) on a morphological diff");
+    }
+
+    // ─── chrF++ ───────────────────────────────────────────────────
+
+    #[test]
+    fn chrf_pp_identical_near_one() {
+        let s = chrf_pp_default("the cat sat on the mat", "the cat sat on the mat");
+        assert!(s > 0.99, "got {s}");
+    }
+
+    #[test]
+    fn chrf_pp_empty_inputs_zero() {
+        assert_eq!(chrf_pp_default("", "x"), 0.0);
+        assert_eq!(chrf_pp_default("x", ""), 0.0);
+        assert_eq!(chrf_pp_default("", ""), 0.0);
+    }
+
+    #[test]
+    fn chrf_pp_catches_word_reorder_better_than_chrf() {
+        // Same vocabulary, different order. chrF (char-only) is
+        // permutation-invariant within short n; chrF++ adds word
+        // n-grams which catch word-order changes.
+        let same_order = chrf_pp_default("the cat sat", "the cat sat");
+        let scrambled = chrf_pp_default("the cat sat", "sat cat the");
+        assert!(scrambled < same_order, "scrambled {scrambled} should < same {same_order}");
+    }
+
+    #[test]
+    fn chrf_pp_word_max_n_zero_falls_back_to_chrf() {
+        // word_max_n=0 → only char n-grams contribute → equivalent to chrf_n.
+        let pp_score = chrf_pp("the cat", "the cat", 6, 0, 2.0);
+        let chrf_score = chrf_n("the cat", "the cat", 6, 2.0);
+        assert!((pp_score.f_beta - chrf_score.f_beta).abs() < 1e-5);
+    }
+
+    #[test]
+    fn chrf_pp_char_max_n_zero_word_only() {
+        // char_max_n=0 → only word n-grams. With 3 identical tokens
+        // and word_max_n=2, both n=1 and n=2 contribute → score ~1.
+        let pp_score = chrf_pp("the cat sat", "the cat sat", 0, 2, 2.0);
+        assert!(pp_score.f_beta > 0.99);
+    }
+
+    #[test]
+    fn chrf_pp_disjoint_yields_zero() {
+        // Disjoint vocab (no shared words OR chars) → score 0.
+        let s = chrf_pp_default("abc def", "xyz qrs");
+        assert_eq!(s, 0.0);
     }
 
     // ─── Multi-reference BLEU + ROUGE ───────────────────────────
