@@ -161,7 +161,7 @@ pub use eval_significance::{
 pub use eval_effect_size::{paired_effect_size, PairedEffectSizeResult};
 pub use eval_bootstrap::{bootstrap_eval_ci, bootstrap_mean_ci, ConfidenceInterval};
 pub use eval_correlation::{
-    correlate_scorers, pearson_correlation, spearman_correlation, ScorerCorrelation,
+    correlate_scorers, kendall_tau, pearson_correlation, spearman_correlation, ScorerCorrelation,
 };
 pub use memory::{
     BufferMemory, ConversationMemory, MemorySnapshot, SummaryBufferMemory, TokenBufferMemory,

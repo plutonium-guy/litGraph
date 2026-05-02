@@ -121,6 +121,88 @@ fn ranks(xs: &[f64]) -> Vec<f64> {
     ranks
 }
 
+/// Kendall's tau-b rank correlation coefficient.
+///
+/// Counts concordant pairs (both rankings agree on ordering) minus
+/// discordant pairs (rankings disagree), normalized by total pair
+/// count with **tie correction** for tied values in either series.
+///
+/// # Why a third correlation alongside Pearson + Spearman
+///
+/// - **Pearson** is parametric (assumes linear relationship + normality
+///   of residuals). Sensitive to outliers.
+/// - **Spearman** is non-parametric over ranks but uses Pearson on
+///   those ranks — still noise-sensitive when many ties exist.
+/// - **Kendall's tau-b** counts pairwise agreements directly. More
+///   robust than Spearman when:
+///   - The data has many ties (tau-b's `(n_c+n_d+n_x)(n_c+n_d+n_y)`
+///     denominator subtracts tied pairs from both sides correctly).
+///   - The relationship is monotonic but heavy-tailed (Spearman's
+///     squared-rank-diff inflates the influence of large rank gaps).
+///   - Sample size is small (Kendall's exact distribution converges
+///     to normal faster than Spearman's).
+///
+/// Common practice: report both Spearman and Kendall — agreement
+/// validates the rank-relationship; divergence flags ties or
+/// outliers that need investigation.
+///
+/// # Algorithm (tau-b)
+///
+/// For all `i < j`:
+/// - concordant: `(xs[i] - xs[j]) * (ys[i] - ys[j]) > 0`
+/// - discordant: `(xs[i] - xs[j]) * (ys[i] - ys[j]) < 0`
+/// - tie in x only: `xs[i] == xs[j]` but `ys[i] != ys[j]`
+/// - tie in y only: `ys[i] == ys[j]` but `xs[i] != xs[j]`
+/// - tie in both: skipped (contributes to neither numerator nor
+///   denominator)
+///
+/// τ-b = (n_c − n_d) / sqrt((n_c + n_d + n_x) · (n_c + n_d + n_y))
+///
+/// O(n²) in the naive impl. Fine for eval-scale n; if hot at scale
+/// the Knight 1966 O(n log n) merge-sort variant exists.
+///
+/// # Edge cases
+///
+/// Returns `None` for: length mismatch, n < 2, denominator zero
+/// (full ties on one side — same condition Pearson hits with
+/// constant input).
+pub fn kendall_tau(xs: &[f64], ys: &[f64]) -> Option<f64> {
+    if xs.len() != ys.len() || xs.len() < 2 {
+        return None;
+    }
+    let n = xs.len();
+    let mut n_c: u64 = 0;
+    let mut n_d: u64 = 0;
+    let mut n_x: u64 = 0; // ties in x only
+    let mut n_y: u64 = 0; // ties in y only
+    for i in 0..n {
+        for j in (i + 1)..n {
+            let dx = xs[i] - xs[j];
+            let dy = ys[i] - ys[j];
+            let tx = dx == 0.0;
+            let ty = dy == 0.0;
+            match (tx, ty) {
+                (true, true) => {} // skip both-ties
+                (true, false) => n_x += 1,
+                (false, true) => n_y += 1,
+                (false, false) => {
+                    if dx.signum() == dy.signum() {
+                        n_c += 1;
+                    } else {
+                        n_d += 1;
+                    }
+                }
+            }
+        }
+    }
+    let cd = (n_c + n_d) as f64;
+    let denom = ((cd + n_x as f64) * (cd + n_y as f64)).sqrt();
+    if denom == 0.0 {
+        return None;
+    }
+    Some((n_c as f64 - n_d as f64) / denom)
+}
+
 /// Per-pair correlation between two scorers in a single EvalReport.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScorerCorrelation {
@@ -129,6 +211,7 @@ pub struct ScorerCorrelation {
     pub n: u64,
     pub pearson: Option<f64>,
     pub spearman: Option<f64>,
+    pub kendall: Option<f64>,
 }
 
 /// Compute Pearson + Spearman correlation between every pair of scorers
@@ -186,6 +269,7 @@ pub fn correlate_scorers(report: &EvalReport) -> Vec<ScorerCorrelation> {
                 n: xs.len() as u64,
                 pearson: pearson_correlation(&xs, &ys),
                 spearman: spearman_correlation(&xs, &ys),
+                kendall: kendall_tau(&xs, &ys),
             });
         }
     }
@@ -461,5 +545,112 @@ mod tests {
             error: None,
             metadata: json!({}),
         }
+    }
+
+    // ─── Kendall's tau ────────────────────────────────────────────
+
+    #[test]
+    fn kendall_perfect_positive() {
+        // Strictly monotonic increasing — all C(n,2) pairs concordant.
+        let xs = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+        let ys = xs.clone();
+        let t = kendall_tau(&xs, &ys).unwrap();
+        assert!((t - 1.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn kendall_perfect_negative() {
+        let xs = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+        let ys = vec![5.0, 4.0, 3.0, 2.0, 1.0];
+        let t = kendall_tau(&xs, &ys).unwrap();
+        assert!((t - -1.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn kendall_zero_correlation_for_balanced_swap() {
+        // 4 pairs: 2 concordant + 2 discordant → τ = 0.
+        let xs = vec![1.0, 2.0, 3.0, 4.0];
+        let ys = vec![1.0, 4.0, 2.0, 3.0];
+        // Pairs (i,j): (0,1) dx=-1 dy=-3 → conc;
+        //              (0,2) dx=-2 dy=-1 → conc;
+        //              (0,3) dx=-3 dy=-2 → conc;
+        //              (1,2) dx=-1 dy=2 → disc;
+        //              (1,3) dx=-2 dy=1 → disc;
+        //              (2,3) dx=-1 dy=-1 → conc.
+        // n_c=4, n_d=2, τ = 2/6 ≈ 0.333.
+        let t = kendall_tau(&xs, &ys).unwrap();
+        assert!((t - 1.0 / 3.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn kendall_handles_ties_in_x_only() {
+        // x has tied values but y doesn't.
+        // xs = [1, 1, 2, 3], ys = [10, 20, 30, 40].
+        // Pairs: (0,1) dx=0 dy=-10 → tie in x;
+        //        (0,2) dx=-1 dy=-20 → conc;
+        //        (0,3) dx=-2 dy=-30 → conc;
+        //        (1,2) dx=-1 dy=-10 → conc;
+        //        (1,3) dx=-2 dy=-20 → conc;
+        //        (2,3) dx=-1 dy=-10 → conc.
+        // n_c=5, n_d=0, n_x=1, n_y=0.
+        // τ-b = (5-0)/sqrt((5+0+1)(5+0+0)) = 5/sqrt(30) ≈ 0.913.
+        let xs = vec![1.0, 1.0, 2.0, 3.0];
+        let ys = vec![10.0, 20.0, 30.0, 40.0];
+        let t = kendall_tau(&xs, &ys).unwrap();
+        let expected = 5.0 / (30.0_f64).sqrt();
+        assert!((t - expected).abs() < 1e-10, "got {t}");
+    }
+
+    #[test]
+    fn kendall_returns_none_for_constant() {
+        // All x identical → no non-tie pairs in x → denom collapses on
+        // one side. Specifically n_c+n_d=0, n_x=C(4,2)=6, n_y=0 →
+        // sqrt((0+6)(0+0)) = 0 → None.
+        let xs = vec![3.0, 3.0, 3.0, 3.0];
+        let ys = vec![1.0, 2.0, 3.0, 4.0];
+        assert!(kendall_tau(&xs, &ys).is_none());
+    }
+
+    #[test]
+    fn kendall_returns_none_for_length_mismatch() {
+        assert!(kendall_tau(&[1.0, 2.0], &[1.0]).is_none());
+    }
+
+    #[test]
+    fn kendall_returns_none_for_n_less_than_2() {
+        assert!(kendall_tau(&[1.0], &[1.0]).is_none());
+        assert!(kendall_tau(&[], &[]).is_none());
+    }
+
+    #[test]
+    fn kendall_agrees_with_spearman_no_ties() {
+        // Both should give the same sign for any monotonic data.
+        let xs = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let ys = vec![2.0, 4.0, 5.0, 7.0, 6.0, 9.0];
+        let s = spearman_correlation(&xs, &ys).unwrap();
+        let k = kendall_tau(&xs, &ys).unwrap();
+        // Both > 0 for this monotonic-ish data.
+        assert!(s > 0.0);
+        assert!(k > 0.0);
+    }
+
+    #[test]
+    fn correlate_scorers_includes_kendall() {
+        let cases: Vec<EvalCaseResult> = (0..5)
+            .map(|i| {
+                make_case(
+                    &format!("q{i}"),
+                    &[("a", i as f64 * 0.1), ("b", i as f64 * 0.2)],
+                )
+            })
+            .collect();
+        let report = make_report(cases);
+        let res = correlate_scorers(&report);
+        assert_eq!(res.len(), 1);
+        let r = &res[0];
+        // a and b are linearly related → all three correlations = 1.
+        assert!((r.pearson.unwrap() - 1.0).abs() < 1e-10);
+        assert!((r.spearman.unwrap() - 1.0).abs() < 1e-10);
+        assert!((r.kendall.unwrap() - 1.0).abs() < 1e-10);
     }
 }
