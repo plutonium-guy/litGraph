@@ -409,7 +409,7 @@ long-term Store. Older (v0.3) features rolled in from prior audit.
 |---|---|---|
 | `py.detach` around heavy work | Real parallelism | ✅ everywhere |
 | abi3 wheels (cp39+) | Wide compat | ✅ maturin |
-| `.pyi` stubs (pyo3-stub-gen) | IDE autocomplete | 🟡 hand-written stubs in `litgraph-stubs/`, no auto-gen |
+| `.pyi` stubs (pyo3-stub-gen) | IDE autocomplete | 🟡 hand-written stubs in `litgraph-stubs/`, drift checker shipped iter 320 (`tools/check_stubs.py`); full pyo3-stub-gen integration still on roadmap. **Drift checker** introspects the built native module via `dir()` walk (top-level fns + classes + their methods, skip dunders + privates), parses every `.pyi` in `litgraph-stubs/litgraph-stubs/` via stdlib `ast`, reports `missing_in_stubs` (runtime attrs without stub entries → IDE silent on new bindings) and `missing_in_runtime` (stub names that no longer exist → IDE suggests dead names). Exit 0 in-sync / exit 1 drift. Native-module-absent → graceful exit 0 with a stderr note (so Rust-only branches don't false-fail in CI). 16 Python tests cover the pure-fn API: runtime walk over fake module (top-level fns, classes + methods, dunder skip, private skip), .pyi parse (top-level fns/async/classes/methods/constants/multi-file merge/malformed-doesn't-crash/empty-dir/nonexistent-dir), drift detection end-to-end (missing-in-stubs found, missing-in-runtime found, in-sync detected). Limitation: compares names only, not signatures — full type-parity would need pyo3-stub-gen which is a multi-iter rewrite. |
 | Free-threaded build tested | 3.13t support | ✅ FREE_THREADING.md |
 
 ---
@@ -532,7 +532,7 @@ Top gaps to close, ranked by user-impact for a no-code-glue path:
 3. ✅ **Deep Agents harness** — `PlanningTool` + `VirtualFilesystemTool` + `load_agents_md` + `load_skills_dir` + `SystemPromptBuilder` + `SubagentTool` + one-call `litgraph.deep_agent.create_deep_agent(...)` factory all shipped (43 Rust + 41 Py tests across the seven).
 4. 🟡 **Functional API** (`@entrypoint` + `@task`) — pure-Python v1 shipped iter 317 (decorators + `Workflow` class with invoke/ainvoke/astream); maturin mixed-layout via `python-source = "python"`. Full StateGraph runtime integration (checkpointable per-task graph nodes) remains roadmap work.
 5. ✅ **Pydantic-coerced state in Python** (iter 318) — `coerce_one` + `coerce_stream` pure-Python helpers; supports Pydantic v1/v2 BaseModel + dataclass + TypedDict; pydantic is optional dep.
-6. ❌ **`pyo3-stub-gen` auto-stubs** — manual stubs go stale. Pyright import warnings hurt agent-authored code.
+6. 🟡 **`pyo3-stub-gen` auto-stubs** — drift checker shipped iter 320 (`tools/check_stubs.py`, CI-runnable, 16 tests). Full pyo3-stub-gen integration (auto-generates .pyi from `#[gen_stub_pyfunction]` macros in Rust source) still on roadmap.
 7. ✅ **fastembed-rs local embeddings** — `litgraph-embeddings-fastembed::FastembedEmbeddings` ships ONNX-backed local embeddings; default `bge-small-en-v1.5`, all fastembed models selectable.
 8. ❌ **candle / mistral.rs local chat** — full offline agent.
 9. ✅ **LangServe-style HTTP serve crate** — `litgraph-serve::serve_chat(model, addr)` ships REST + SSE in one call. (CLI wrapper still pending.)
