@@ -73,10 +73,10 @@ pub use format_instructions::{
     react_format_instructions, xml_format_instructions,
 };
 pub use evaluators::{
-    bleu, bleu_n, bleu_smoothed, chrf, chrf_n, contains_all, contains_any, embedding_cosine,
-    exact_match, exact_match_strict, jaccard_similarity, json_validity, levenshtein,
-    levenshtein_ratio, meteor_exact, meteor_lite, regex_match, rouge_1, rouge_2, rouge_l,
-    rouge_n, BleuScore, ChrfScore, MeteorScore, RougeScore,
+    bleu, bleu_n, bleu_smoothed, cer, chrf, chrf_n, contains_all, contains_any,
+    embedding_cosine, exact_match, exact_match_strict, jaccard_similarity, json_validity,
+    levenshtein, levenshtein_ratio, meteor_exact, meteor_lite, regex_match, rouge_1, rouge_2,
+    rouge_l, rouge_n, wer, BleuScore, ChrfScore, MeteorScore, RougeScore,
 };
 pub use output_fixer::{fix_with_llm, parse_with_retry};
 pub use partial_json::{parse_partial_json, repair_partial_json};

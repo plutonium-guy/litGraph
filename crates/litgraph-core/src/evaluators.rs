@@ -607,6 +607,113 @@ fn char_ngrams(chars: &[char], n: usize) -> Vec<Vec<char>> {
         .collect()
 }
 
+/// Word Error Rate — `levenshtein_word_distance(ref, cand) / ref_word_count`.
+///
+/// Standard ASR / MT / NLG metric. **Lower is better** (opposite of
+/// ROUGE / BLEU / chrF / METEOR which are higher-better).
+///
+/// # Distinct from `levenshtein_ratio`
+///
+/// `levenshtein_ratio` (already in this file) is char-level + bounded
+/// to `[0, 1]` via `1 - dist/max(|a|, |b|)`. WER is **word-level**
+/// (the more usual ASR convention) and unbounded above 1.0 — a
+/// candidate twice as long as the reference with all wrong words
+/// has WER ≈ 2.0.
+///
+/// # Algorithm
+///
+/// 1. Tokenize both via lowercase + whitespace split.
+/// 2. Compute Levenshtein edit distance over the token sequences
+///    (insertion + deletion + substitution; cost 1 each).
+/// 3. Return `dist / max(1, ref_word_count)`.
+///
+/// # Edge cases
+///
+/// - Both empty → 0.0 (no edits needed).
+/// - Empty ref + non-empty cand → cand.len() / 1 = `cand_len` (every
+///   cand word is an insertion error).
+/// - Empty cand + non-empty ref → 1.0 (every ref word is a deletion).
+pub fn wer(reference: &str, candidate: &str) -> f32 {
+    let ref_tokens: Vec<String> = tokenize_lower(reference).collect();
+    let cand_tokens: Vec<String> = tokenize_lower(candidate).collect();
+    if ref_tokens.is_empty() && cand_tokens.is_empty() {
+        return 0.0;
+    }
+    let dist = token_levenshtein(&ref_tokens, &cand_tokens);
+    let denom = ref_tokens.len().max(1);
+    dist as f32 / denom as f32
+}
+
+/// Character Error Rate — char-level Levenshtein / ref char count.
+///
+/// Same shape as WER but operates on Unicode characters. Standard
+/// for OCR + char-level MT evaluation. **Lower is better.**
+///
+/// Lowercases both inputs (matches the rest of the evaluator family).
+/// Treats whitespace as significant (standard CER convention — a
+/// missing space is an edit).
+pub fn cer(reference: &str, candidate: &str) -> f32 {
+    let ref_chars: Vec<char> = reference.to_lowercase().chars().collect();
+    let cand_chars: Vec<char> = candidate.to_lowercase().chars().collect();
+    if ref_chars.is_empty() && cand_chars.is_empty() {
+        return 0.0;
+    }
+    let dist = char_levenshtein(&ref_chars, &cand_chars);
+    let denom = ref_chars.len().max(1);
+    dist as f32 / denom as f32
+}
+
+/// Levenshtein distance over a generic token sequence. O(m·n) time,
+/// O(min(m,n)) space via rolling row.
+fn token_levenshtein(a: &[String], b: &[String]) -> usize {
+    let m = a.len();
+    let n = b.len();
+    if m == 0 {
+        return n;
+    }
+    if n == 0 {
+        return m;
+    }
+    let mut prev: Vec<usize> = (0..=n).collect();
+    let mut curr: Vec<usize> = vec![0; n + 1];
+    for i in 1..=m {
+        curr[0] = i;
+        for j in 1..=n {
+            let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
+            curr[j] = (curr[j - 1] + 1)
+                .min(prev[j] + 1)
+                .min(prev[j - 1] + cost);
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+    prev[n]
+}
+
+/// Char-level sibling — same algorithm over `Vec<char>`.
+fn char_levenshtein(a: &[char], b: &[char]) -> usize {
+    let m = a.len();
+    let n = b.len();
+    if m == 0 {
+        return n;
+    }
+    if n == 0 {
+        return m;
+    }
+    let mut prev: Vec<usize> = (0..=n).collect();
+    let mut curr: Vec<usize> = vec![0; n + 1];
+    for i in 1..=m {
+        curr[0] = i;
+        for j in 1..=n {
+            let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
+            curr[j] = (curr[j - 1] + 1)
+                .min(prev[j] + 1)
+                .min(prev[j - 1] + cost);
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+    prev[n]
+}
+
 /// METEOR-lite (Banerjee & Lavie 2005) — alignment-based MT/NLG eval
 /// with chunk-fragmentation penalty. The fourth NLG-eval primitive
 /// alongside ROUGE (iter 304), BLEU (iter 305), chrF (iter 307).
@@ -1448,6 +1555,105 @@ mod tests {
         let exact = meteor_exact("walk runs", "walks run");
         let lite = meteor_lite("walk runs", "walks run");
         assert!(lite.score >= exact.score);
+    }
+
+    // ─── WER / CER ────────────────────────────────────────────────
+
+    #[test]
+    fn wer_identical_zero() {
+        assert_eq!(wer("the cat sat", "the cat sat"), 0.0);
+    }
+
+    #[test]
+    fn wer_one_word_substitution() {
+        // 3 ref words, 1 substitution → WER = 1/3.
+        let r = wer("the cat sat", "the cat ran");
+        assert!((r - 1.0 / 3.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn wer_one_deletion() {
+        // 3 ref, cand has 2 → 1 deletion → WER = 1/3.
+        let r = wer("the cat sat", "the cat");
+        assert!((r - 1.0 / 3.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn wer_one_insertion() {
+        // 3 ref, cand has 4 → 1 insertion → WER = 1/3.
+        let r = wer("the cat sat", "the cat sat down");
+        assert!((r - 1.0 / 3.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn wer_can_exceed_one() {
+        // Ref 1 word, cand 5 unrelated words → 5 substitutions/insertions
+        // for 1 ref word → WER = 5.0 (or close — depends on alignment).
+        let r = wer("hello", "completely different gibberish words here");
+        assert!(r > 1.0, "WER should exceed 1.0 for very long disjoint cand, got {r}");
+    }
+
+    #[test]
+    fn wer_empty_ref_empty_cand_zero() {
+        assert_eq!(wer("", ""), 0.0);
+    }
+
+    #[test]
+    fn wer_empty_cand_one() {
+        assert_eq!(wer("the cat sat", ""), 1.0);
+    }
+
+    #[test]
+    fn wer_lowercase_normalization() {
+        // Same as wer_identical_zero with case differences.
+        assert_eq!(wer("The Cat Sat", "the cat sat"), 0.0);
+    }
+
+    #[test]
+    fn cer_identical_zero() {
+        assert_eq!(cer("hello world", "hello world"), 0.0);
+    }
+
+    #[test]
+    fn cer_single_char_substitution() {
+        // 5 ref chars (excluding... actually including space → "hello" is 5).
+        // Substitute "hello" → "jello": 1 edit, ref_len=5, CER = 1/5 = 0.2.
+        let r = cer("hello", "jello");
+        assert!((r - 0.2).abs() < 1e-5);
+    }
+
+    #[test]
+    fn cer_treats_whitespace_significantly() {
+        // Missing space is an edit. "helloworld" vs "hello world":
+        // ref="hello world" (11 chars), cand="helloworld" (10 chars).
+        // 1 deletion → CER = 1/11 ≈ 0.0909.
+        let r = cer("hello world", "helloworld");
+        assert!((r - 1.0 / 11.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn cer_empty_ref_empty_cand_zero() {
+        assert_eq!(cer("", ""), 0.0);
+    }
+
+    #[test]
+    fn cer_lowercase_normalization() {
+        assert_eq!(cer("Hello", "hello"), 0.0);
+    }
+
+    #[test]
+    fn cer_lower_than_wer_for_morphological_diff() {
+        // "running" vs "runs" — WER counts as 1 substitution out of 1
+        // ref word → WER = 1.0. CER counts shared chars; ref="running"
+        // (7), cand="runs" (4). Levenshtein dist = 4 (delete -ning, swap
+        // letters... let me think. "running" → "runs":
+        // r-u-n-n-i-n-g vs r-u-n-s — share r,u,n. Edit 4 chars (delete
+        // n,i,n,g + insert s OR substitute n→s + delete i,n,g = 4 edits).
+        // CER = 4/7 ≈ 0.571.
+        let w = wer("running", "runs");
+        let c = cer("running", "runs");
+        assert!((w - 1.0).abs() < 1e-5);
+        assert!(c < w, "CER ({c}) should be < WER ({w}) on a morphological diff");
     }
 
     #[test]
