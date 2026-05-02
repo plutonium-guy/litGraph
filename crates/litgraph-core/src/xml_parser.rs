@@ -252,12 +252,7 @@ fn find_ci(haystack: &str, needle: &str) -> Option<usize> {
     if nb.is_empty() || nb.len() > hb.len() {
         return None;
     }
-    for i in 0..=hb.len() - nb.len() {
-        if hb[i..i + nb.len()].eq_ignore_ascii_case(nb) {
-            return Some(i);
-        }
-    }
-    None
+    (0..=hb.len() - nb.len()).find(|&i| hb[i..i + nb.len()].eq_ignore_ascii_case(nb))
 }
 
 fn find_next_byte(bytes: &[u8], from: usize, target: u8) -> Option<usize> {

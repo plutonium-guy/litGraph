@@ -68,6 +68,6 @@ where
 {
     Arc::new(move |s: S| {
         let fut = f(s);
-        Box::pin(async move { fut.await })
+        Box::pin(fut)
     })
 }

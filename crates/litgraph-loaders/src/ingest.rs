@@ -227,8 +227,8 @@ where
             match item {
                 Ok(doc) => {
                     buf.push(doc);
-                    if buf.len() >= embed_chunk_size {
-                        if !flush_buf(
+                    if buf.len() >= embed_chunk_size
+                        && !flush_buf(
                             &mut buf,
                             &embedder,
                             embed_chunk_size,
@@ -236,9 +236,8 @@ where
                             &batch_tx,
                         )
                         .await
-                        {
-                            return;
-                        }
+                    {
+                        return;
                     }
                 }
                 Err(e) => {
@@ -406,8 +405,8 @@ where
             match item {
                 Ok(doc) => {
                     buf.push(doc);
-                    if buf.len() >= embed_chunk_size {
-                        if !flush_buf(
+                    if buf.len() >= embed_chunk_size
+                        && !flush_buf(
                             &mut buf,
                             &embedder,
                             embed_chunk_size,
@@ -416,9 +415,8 @@ where
                             &stage3_progress,
                         )
                         .await
-                        {
-                            return;
-                        }
+                    {
+                        return;
                     }
                 }
                 Err(e) => {

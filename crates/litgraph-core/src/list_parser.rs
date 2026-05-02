@@ -47,7 +47,7 @@ pub fn parse_comma_list(text: &str) -> Vec<String> {
         .trim();
 
     if !line.contains(',') {
-        let t = strip_quotes(line.trim_end_matches(|c: char| c == '.' || c == '!').trim());
+        let t = strip_quotes(line.trim_end_matches(['.', '!']).trim());
         if t.is_empty() {
             return vec![];
         }
@@ -64,7 +64,7 @@ pub fn parse_comma_list(text: &str) -> Vec<String> {
         }
     }
     if let Some(last) = parts.last_mut() {
-        if let Some(idx) = last.find(|c: char| c == '.' || c == '!' || c == '?') {
+        if let Some(idx) = last.find(['.', '!', '?']) {
             *last = &last[..idx];
         }
     }

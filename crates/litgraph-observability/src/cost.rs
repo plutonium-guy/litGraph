@@ -51,10 +51,8 @@ impl PriceSheet {
         let mut best: Option<(usize, ModelPrice)> = None;
         for (key, price) in &self.inner {
             let k = key.to_ascii_lowercase();
-            if m.contains(&k) {
-                if best.map_or(true, |(len, _)| k.len() > len) {
-                    best = Some((k.len(), *price));
-                }
+            if m.contains(&k) && best.is_none_or(|(len, _)| k.len() > len) {
+                best = Some((k.len(), *price));
             }
         }
         best.map(|(_, p)| p)

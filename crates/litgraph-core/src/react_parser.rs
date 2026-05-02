@@ -141,7 +141,7 @@ fn extract_block(text: &str, label: &str) -> Option<String> {
     // When the LLM uses `**Label:**` markdown-bold, the `**` close marker
     // sits right after the colon — strip it so it doesn't bleed into the
     // block content. Also strip trailing bold markers at block END below.
-    let after_colon = after_colon.trim_start_matches(|c: char| c == '*');
+    let after_colon = after_colon.trim_start_matches('*');
 
     // Now find where this block ends — the next label OR EOF.
     // Candidate labels are any of: Thought, Action, Action Input,

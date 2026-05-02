@@ -126,10 +126,10 @@ impl Retriever for SemanticCachedRetriever {
                     continue;
                 }
                 let sim = cosine_similarity(&q_emb, &entry.embedding);
-                if sim >= self.similarity_threshold {
-                    if best.map(|(_, s)| sim > s).unwrap_or(true) {
-                        best = Some((i, sim));
-                    }
+                if sim >= self.similarity_threshold
+                    && best.is_none_or(|(_, s)| sim > s)
+                {
+                    best = Some((i, sim));
                 }
             }
             best.map(|(i, _)| cache[i].response.clone())
