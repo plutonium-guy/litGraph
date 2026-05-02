@@ -52,6 +52,7 @@ use futures::Stream;
 use litgraph_core::react_format_instructions;
 use litgraph_core::react_parser::{parse_react_step, ReactStep};
 use litgraph_core::tool::Tool;
+#[allow(unused_imports)]
 use litgraph_core::{ChatModel, ChatOptions, Message, Role};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;

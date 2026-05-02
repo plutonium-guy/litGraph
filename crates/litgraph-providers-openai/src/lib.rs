@@ -16,7 +16,6 @@ use litgraph_core::{
 };
 use litgraph_core::model::{ChatStream, ChatStreamEvent};
 use reqwest::Client;
-use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tracing::debug;
 

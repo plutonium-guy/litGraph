@@ -193,7 +193,8 @@ fn collect_sections(html: &str, tags: &[String]) -> Vec<SectionMatch> {
                 // Walk forward tracking depth.
                 let mut depth = 1;
                 let mut j = content_start;
-                let mut content_end = content_start;
+                let mut content_end = 0usize;
+                let _ = content_end;
                 while j < lower.len() && depth > 0 {
                     let next_open = lower[j..].find(&opener).map(|p| j + p);
                     let next_close = lower[j..].find(&closer).map(|p| j + p);

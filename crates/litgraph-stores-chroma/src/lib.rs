@@ -12,6 +12,7 @@
 //! pre-flight roundtrip and survives the "collection already exists" race
 //! between concurrent processes.
 
+#[allow(unused_imports)]
 use std::sync::Arc;
 use std::time::Duration;
 

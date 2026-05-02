@@ -241,6 +241,7 @@ impl PyTokenBufferMemory {
         Ok(())
     }
 
+    #[pyo3(signature = (message=None))]
     fn set_system<'py>(&self, message: Option<Bound<'py, PyAny>>) -> PyResult<()> {
         let m = message.map(parse_one_message).transpose()?;
         self.inner.lock()

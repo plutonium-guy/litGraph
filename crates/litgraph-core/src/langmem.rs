@@ -54,7 +54,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::json;
 
 use crate::message::Message;
 use crate::model::{ChatModel, ChatOptions};
@@ -68,7 +68,7 @@ use crate::{Error, Result};
 /// instruct against it.
 pub const DEFAULT_EXTRACTION_SYSTEM_PROMPT: &str = "\
 You distil long-term memorable facts from a conversation. Output ONLY \
-the JSON object specified by the schema. \
+the JSON object specified by the schema.
 
 Rules:
 - Memorable means: information that would help a future conversation \

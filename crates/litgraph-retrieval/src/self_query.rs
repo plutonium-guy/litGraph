@@ -36,7 +36,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use litgraph_core::{
-    ChatModel, ChatOptions, Document, Embeddings, Error, Message, Result, StructuredChatModel,
+    ChatModel, ChatOptions, Document, Embeddings, Message, Result, StructuredChatModel,
 };
 use serde_json::{Value, json};
 

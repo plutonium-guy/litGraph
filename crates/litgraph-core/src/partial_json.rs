@@ -197,7 +197,7 @@ fn strip_dangling_key_if_any(s: &str) -> String {
         return s.to_string();
     }
     // Walk backward to the matching open quote.
-    let mut i = bytes.len() - 1; // points at closing "
+    let i = bytes.len() - 1; // points at closing "
     if i == 0 {
         return s.to_string();
     }

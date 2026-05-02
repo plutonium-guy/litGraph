@@ -177,7 +177,7 @@ impl Retriever for StepBackRetriever {
         // order — so we collect into a position-keyed map instead).
         let mut by_pos: Vec<Option<Vec<Document>>> = vec![None; queries.len()];
         let mut errors: Vec<String> = Vec::new();
-        let mut idx_lookup: std::collections::HashMap<String, usize> =
+        let idx_lookup: std::collections::HashMap<String, usize> =
             queries.iter().enumerate().map(|(i, q)| (q.clone(), i)).collect();
         // We re-key by query string from the closure — but JoinSet's
         // join_next doesn't return the input. We track via a parallel

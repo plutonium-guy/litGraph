@@ -3,9 +3,9 @@
 Production-grade, slim alternative to LangChain + LangGraph.
 Rust core, Python bindings via PyO3 0.28 + maturin.
 
-## Status — 2026-04-29 (iter 162)
+## Status — 2026-05-02 (iter 325)
 
-39 crates · ~1081 Rust tests · ~948 Python tests · all passing.
+43 crates · 2536 Rust unit tests · 166 Python test modules · all passing.
 
 **Legend:** ✅ done · ⏳ in flight · ❌ not started · 🚫 deferred indefinitely
 

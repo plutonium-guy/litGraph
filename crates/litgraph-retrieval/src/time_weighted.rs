@@ -31,7 +31,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use litgraph_core::{Document, Embeddings, Error, Result};
+use litgraph_core::{Document, Embeddings, Result};
 use parking_lot::Mutex;
 
 use crate::retriever::Retriever;

@@ -30,6 +30,7 @@
 
 use std::collections::HashMap;
 use std::hash::Hash;
+#[allow(unused_imports)]
 use std::sync::Arc;
 
 use parking_lot::Mutex as PlMutex;

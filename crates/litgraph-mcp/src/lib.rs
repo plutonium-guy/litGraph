@@ -823,8 +823,9 @@ for line in sys.stdin:
                                 }
                                 "notifications/initialized" => {
                                     // 202-style empty ack. Write headers + zero body.
-                                    let resp = "HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n";
+                                    let resp = "HTTP/1.1 202 Accepted\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
                                     let _ = stream.write_all(resp.as_bytes()).await;
+                                    let _ = stream.shutdown().await;
                                     return;
                                 }
                                 "tools/list" => json!({
@@ -858,12 +859,13 @@ for line in sys.stdin:
                             };
                             let body_bytes = serde_json::to_vec(&body_value).unwrap();
                             let resp = format!(
-                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{}\r\n",
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n{}\r\n",
                                 body_bytes.len(),
                                 extra_headers,
                             );
                             let _ = stream.write_all(resp.as_bytes()).await;
                             let _ = stream.write_all(&body_bytes).await;
+                            let _ = stream.shutdown().await;
                         });
                     }
                 }
@@ -1045,8 +1047,9 @@ for line in sys.stdin:
                                 }
                                 "notifications/initialized" => {
                                     // 202 empty — same as JSON path, no SSE body.
-                                    let resp = "HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n";
+                                    let resp = "HTTP/1.1 202 Accepted\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
                                     let _ = stream.write_all(resp.as_bytes()).await;
+                                    let _ = stream.shutdown().await;
                                     return;
                                 }
                                 "tools/list" => json!({
@@ -1084,12 +1087,13 @@ for line in sys.stdin:
                             let payload = serde_json::to_string(&body_value).unwrap();
                             let sse = format!(": keep\n\ndata: {payload}\n\n");
                             let resp = format!(
-                                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n{}\r\n",
+                                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\nContent-Length: {}\r\n{}\r\n",
                                 sse.len(),
                                 extra_headers,
                             );
                             let _ = stream.write_all(resp.as_bytes()).await;
                             let _ = stream.write_all(sse.as_bytes()).await;
+                            let _ = stream.shutdown().await;
                         });
                     }
                 }

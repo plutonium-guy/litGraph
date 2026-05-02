@@ -47,8 +47,6 @@ use std::sync::Arc;
 
 use litgraph_core::{Document, Embeddings, Result};
 
-use crate::transformers::embedding_redundant_filter;
-
 /// Result of a [`SemanticDeduplicator::dedup`] call.
 ///
 /// `kept` and `kept_indices` are aligned (kept[i] is the document at

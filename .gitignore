@@ -71,6 +71,8 @@ coverage.xml
 *.pot
 
 .DS_Store
+# AppleDouble metadata (created when working off ext drives like T7)
+._*
 
 # Sphinx documentation
 docs/_build/
