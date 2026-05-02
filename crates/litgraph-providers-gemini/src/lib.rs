@@ -336,9 +336,7 @@ impl ChatModel for GeminiChat {
             let msg = Message {
                 role: Role::Assistant,
                 content: if agg_text.is_empty() { vec![] } else { vec![ContentPart::Text { text: agg_text.clone() }] },
-                tool_calls: if tool_calls.is_empty() { vec![] } else {
-                    if !matches!(finish, FinishReason::Stop) { tool_calls.clone() } else { tool_calls.clone() }
-                },
+                tool_calls: tool_calls.clone(),
                 tool_call_id: None,
                 name: None,
                 cache: false,

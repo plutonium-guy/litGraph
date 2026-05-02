@@ -22,4 +22,11 @@ pub trait VectorStore: Send + Sync {
     async fn delete(&self, ids: &[String]) -> Result<()>;
 
     async fn len(&self) -> usize;
+
+    /// Convenience: `self.len().await == 0`. Override for stores where
+    /// emptiness is cheaper than counting (e.g., remote stores that
+    /// otherwise need a full count query).
+    async fn is_empty(&self) -> bool {
+        self.len().await == 0
+    }
 }

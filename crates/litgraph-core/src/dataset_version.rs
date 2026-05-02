@@ -587,11 +587,8 @@ mod tests {
 
     #[tokio::test]
     async fn jsonl_store_round_trips_to_disk() {
-        let dir = std::env::temp_dir().join(format!(
-            "litgraph-rs-test-{}",
-            now_ms()
-        ));
-        let path = dir.join("runs.jsonl");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("runs.jsonl");
         let s = JsonlRunStore::new(&path);
         let cases = make_cases();
         let m = DatasetManifest::new("toy", "v1", &cases);
@@ -601,16 +598,12 @@ mod tests {
         assert_eq!(latest, r);
         let hist = s.history("toy").await.unwrap();
         assert_eq!(hist.len(), 1);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
     async fn jsonl_store_appends_multiple_runs() {
-        let dir = std::env::temp_dir().join(format!(
-            "litgraph-rs-test-multi-{}",
-            now_ms()
-        ));
-        let path = dir.join("runs.jsonl");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("runs.jsonl");
         let s = JsonlRunStore::new(&path);
         let cases = make_cases();
         let m = DatasetManifest::new("toy", "v1", &cases);
@@ -622,16 +615,12 @@ mod tests {
         assert_eq!(hist.len(), 3);
         let latest = s.latest_for("toy").await.unwrap().unwrap();
         assert!((latest.scorer_means["exact_match"].as_f64().unwrap() - 0.9).abs() < 1e-9);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
     async fn jsonl_store_missing_file_returns_empty() {
-        let dir = std::env::temp_dir().join(format!(
-            "litgraph-rs-test-missing-{}",
-            now_ms()
-        ));
-        let path = dir.join("nope.jsonl");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nope.jsonl");
         let s = JsonlRunStore::new(&path);
         assert!(s.history("any").await.unwrap().is_empty());
         assert!(s.latest_for("any").await.unwrap().is_none());

@@ -114,8 +114,8 @@ fn resolve_endpoint(cfg: &BedrockConfig) -> (String, String) {
         .unwrap_or_else(|| format!("https://bedrock-runtime.{}.amazonaws.com", cfg.region));
     let base = base.trim_end_matches('/').to_string();
     let host = base
-        .splitn(2, "://")
-        .nth(1)
+        .split_once("://")
+        .map(|(_, after)| after)
         .unwrap_or(&base)
         .split('/')
         .next()
@@ -1307,9 +1307,7 @@ fn parse_converse_response(model: &str, v: Value) -> Result<ChatResponse> {
         })
         .unwrap_or_default();
 
-    let content_parts = if text.is_empty() && tool_calls.is_empty() {
-        vec![]
-    } else if text.is_empty() {
+    let content_parts = if text.is_empty() {
         vec![]
     } else {
         vec![ContentPart::Text { text }]

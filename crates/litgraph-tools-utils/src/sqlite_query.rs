@@ -288,7 +288,7 @@ fn base64_encode(b: &[u8]) -> String {
     // Tiny inline base64 encoder — avoids pulling the `base64` crate just
     // for blob columns the agent is rarely going to read.
     const A: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity((b.len() + 2) / 3 * 4);
+    let mut out = String::with_capacity(b.len().div_ceil(3) * 4);
     for chunk in b.chunks(3) {
         let n = chunk.len();
         let mut buf = [0u8; 3];

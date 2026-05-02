@@ -93,7 +93,7 @@ fn render_mermaid(sk: &GraphSkeleton) -> String {
         let shape = if name == START {
             format!("(({label}))")
         } else if name == END {
-            format!("(((End)))")
+            "(((End)))".to_string()
         } else {
             format!("[{label}]")
         };

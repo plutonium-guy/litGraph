@@ -66,7 +66,7 @@ pub fn count_message_tokens(model: &str, messages: &[Message]) -> usize {
 
 fn fallback_estimate(text: &str) -> usize {
     // 4 chars/token is the standard rule-of-thumb across modern BPE models.
-    (text.len() + 3) / 4
+    text.len().div_ceil(4)
 }
 
 /// Drop the OLDEST non-system messages until the total token count is under
