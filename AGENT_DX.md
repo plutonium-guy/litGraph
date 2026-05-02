@@ -72,7 +72,7 @@ least *one* of these to contain a runnable snippet.
 | Module docstrings list "common patterns" with code | 🚧 | M |
 | README ships per-subsystem 10–20-line snippets | ✅ (iter 333) | — |
 | USAGE.md as the "long-form quickstart" doc | ✅ | — |
-| **💡 `litgraph examples list`** — CLI that prints the example index | 💡 | S |
+| **`litgraph examples list`** — CLI that prints the example index | ✅ (iter 340) | S |
 | **💡 Examples are tested in CI** (every example file is a pytest case) | 💡 | M |
 
 **Why Claude Code cares:** when the agent calls `help(ReactAgent)`, the
@@ -150,10 +150,10 @@ when there's a `--template` flag.
 
 | Feature | Status | Effort |
 |---|---|---|
-| `litgraph init <template>` scaffolds a minimal repo | 🚧 (planned in MISSING_FEATURES) | M |
-| Templates: `chat-agent`, `rag`, `react-agent`, `multi-agent`, `eval-suite`, `serve` | 💡 | M |
-| Scaffolded repo includes: `pyproject.toml`, `.env.example`, `tests/`, `README.md`, `Makefile` | 💡 | S |
-| Scaffolded repo runs `pytest` green out of the box (with mock provider) | 💡 | M |
+| `litgraph init <template>` scaffolds a minimal repo | ✅ (iter 340) | M |
+| Templates: `chat-agent`, `rag`, `react-agent`, `multi-agent`, `eval-suite`, `serve` | ⏳ (chat-agent shipped iter 340; rest planned) | M |
+| Scaffolded repo includes: `pyproject.toml`, `.env.example`, `tests/`, `README.md`, AGENTS.md | ✅ (iter 340) | S |
+| Scaffolded repo runs `pytest` green out of the box (with mock provider) | ✅ (iter 340) | M |
 | `litgraph add-tool <name>` generates a stub tool with schema + test | 💡 | M |
 | `litgraph add-node <name>` adds a graph node + wiring | 💡 | M |
 
@@ -270,11 +270,12 @@ patterns that the agent treats as a starting point.
 | `examples/parallel_graph.py` | ✅ | — |
 | `examples/langgraph_compat.py` | ✅ | — |
 | **💡 `examples/multi_agent_supervisor.py`** | 💡 | S |
-| **💡 `examples/eval_harness.py`** | 💡 | S |
-| **💡 `examples/checkpoint_resume.py`** | 💡 | S |
+| **`examples/eval_harness.py`** | ✅ (iter 340) | S |
+| **`examples/checkpoint_resume.py`** | ✅ (iter 340) | S |
 | **💡 `examples/mcp_client_server.py`** | 💡 | S |
 | **💡 `examples/observability_otel.py`** | 💡 | S |
-| **💡 `examples/structured_output.py`** | 💡 | S |
+| **`examples/structured_output.py`** | ✅ (iter 340) | S |
+| **`examples/mock_test_pattern.py`** | ✅ (iter 340) | S |
 | **💡 `examples/local_ollama.py`** | 💡 | S |
 | **💡 `examples/web_research.py`** (Tavily + RAG + ReAct) | 💡 | M |
 | **💡 `examples/code_review_bot.py`** (CritiqueRevise) | 💡 | M |
@@ -356,7 +357,7 @@ doc index is a fallback.
 |---|---|---|
 | `litgraph search-docs <query>` returns Markdown chunks | 💡 | M |
 | Bundled offline doc index in the wheel | 💡 | M |
-| `litgraph show <symbol>` prints docstring + sig + nearest example | 💡 | S |
+| `litgraph show <symbol>` prints docstring + sig + nearest example | ✅ (iter 340) | S |
 
 **Why Claude Code cares:** offline / sandboxed environments still need
 discoverability. A CLI works when MCP doesn't.
