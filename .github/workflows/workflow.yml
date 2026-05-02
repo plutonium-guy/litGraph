@@ -1,0 +1,212 @@
+# Build wheels + sdist with maturin and publish to PyPI via Trusted
+# Publishing (OIDC). No `PYPI_API_TOKEN` is needed — PyPI is configured
+# to accept this exact (owner, repo, workflow filename, environment)
+# tuple.
+#
+# PyPI publisher binding (must match — set on https://pypi.org/manage/account/publishing/):
+#   PyPI Project Name: litGraph
+#   Owner            : plutonium-guy
+#   Repository       : litGraph
+#   Workflow         : workflow.yml          (this file's basename)
+#   Environment      : pypi                  (configured in repo Settings → Environments)
+#
+# Triggers:
+# - Push a tag like `v0.1.0` to release that version (the version in
+#   `Cargo.toml` / `crates/litgraph-py/Cargo.toml` must match the tag,
+#   minus the leading `v`).
+# - Or run manually via "Run workflow" — wheels build but only publish
+#   on a tag push (the publish job's `if:` check enforces this).
+#
+# Output: a single abi3 wheel per (OS, arch) pair plus an sdist.
+#   Linux:    x86_64, aarch64, musllinux x86_64
+#   macOS:    x86_64, aarch64 (Apple Silicon)
+#   Windows:  x86_64
+#   sdist:    tar.gz
+#
+# pyproject.toml already declares `features = ["pyo3/extension-module"]`
+# and PyO3 is configured for abi3-py39, so one wheel per platform
+# covers Python 3.9 → 3.13+.
+
+name: workflow
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-linux:
+    name: build wheel (linux/${{ matrix.target }})
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [x86_64, aarch64]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --out dist --strip
+          manylinux: auto
+          sccache: ${{ !startsWith(github.ref, 'refs/tags/') }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-linux-${{ matrix.target }}
+          path: dist
+          if-no-files-found: error
+
+  build-musllinux:
+    name: build wheel (musllinux/${{ matrix.target }})
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [x86_64]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --out dist --strip
+          manylinux: musllinux_1_2
+          sccache: ${{ !startsWith(github.ref, 'refs/tags/') }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-musllinux-${{ matrix.target }}
+          path: dist
+          if-no-files-found: error
+
+  build-macos:
+    name: build wheel (macos/${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64
+            runner: macos-13       # Intel
+          - target: aarch64
+            runner: macos-14       # Apple Silicon
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --out dist --strip
+          sccache: ${{ !startsWith(github.ref, 'refs/tags/') }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-macos-${{ matrix.target }}
+          path: dist
+          if-no-files-found: error
+
+  build-windows:
+    name: build wheel (windows/${{ matrix.target }})
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [x64]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          architecture: ${{ matrix.target }}
+      - name: Build wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --out dist --strip
+          sccache: ${{ !startsWith(github.ref, 'refs/tags/') }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-windows-${{ matrix.target }}
+          path: dist
+          if-no-files-found: error
+
+  build-sdist:
+    name: build sdist
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-sdist
+          path: dist
+          if-no-files-found: error
+
+  publish:
+    name: publish to PyPI (trusted publisher)
+    # Only publish on a tag push. Manual dispatch builds + uploads
+    # artifacts to the run for inspection but does NOT publish — that
+    # protects against accidental releases from the UI.
+    if: startsWith(github.ref, 'refs/tags/')
+    needs:
+      - build-linux
+      - build-musllinux
+      - build-macos
+      - build-windows
+      - build-sdist
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/litGraph
+    permissions:
+      # Required for OIDC-based Trusted Publishing — PyPI verifies the
+      # GitHub-issued OIDC token against the publisher binding above.
+      id-token: write
+      # Optional: lets `actions/attest-build-provenance` sign artifacts.
+      attestations: write
+      contents: read
+    steps:
+      - name: Download all wheels + sdist
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          # Flatten every `wheels-*/` artifact into a single dist/ dir.
+          merge-multiple: true
+
+      - name: List artifacts before upload
+        run: ls -la dist
+
+      - name: Generate artifact attestation
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-path: "dist/*"
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          # No `password:` field — Trusted Publishing supplies the
+          # token via OIDC. Verify-metadata catches name / version
+          # mismatches before the upload hits PyPI.
+          packages-dir: dist
+          verify-metadata: true
+          skip-existing: false
+          print-hash: true
