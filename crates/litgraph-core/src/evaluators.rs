@@ -607,6 +607,188 @@ fn char_ngrams(chars: &[char], n: usize) -> Vec<Vec<char>> {
         .collect()
 }
 
+/// Multi-reference BLEU (Papineni et al. 2002 §3) — n-gram precision
+/// against the **max count** across N references, with brevity
+/// penalty using the closest reference length.
+///
+/// # Why multi-reference
+///
+/// Single-reference BLEU is harsh on cands that pick a different
+/// valid wording than the chosen ref ("the cat slept" vs ref "the
+/// cat was sleeping" — overlap collapses on tense / aux verbs).
+/// Multi-reference BLEU is the standard fix: every WMT shared task
+/// ships 2-4 reference translations per source sentence, and the
+/// metric takes the BEST overlap across them. Cands that match ANY
+/// valid wording get full credit.
+///
+/// # Algorithm
+///
+/// 1. Tokenize cand and each ref via lowercase + whitespace.
+/// 2. For each n in `1..=max_n`: build the cand n-gram count map
+///    AND, for each n-gram, take `max(ref1_count, ref2_count, ...)`
+///    across all refs as the "ceiling" count. Overlap = `Σ
+///    min(cand_count, max_ref_count)`.
+/// 3. Geometric mean (or smoothed if `smooth=true`) — same shape
+///    as iter-305 single-ref `bleu_n`.
+/// 4. Brevity penalty uses the CLOSEST reference length to the
+///    candidate (not the average): `r_closest = arg_min |r_len −
+///    cand_len|`. This is the standard rule from the original BLEU
+///    paper for multi-ref — picking the ref length closest to the
+///    cand avoids over-penalizing when ref lengths vary widely.
+/// 5. `BLEU = BP · gm`.
+///
+/// Returns `BleuScore::zero` shape if `references.is_empty()` or
+/// any input is empty.
+pub fn bleu_multi(
+    references: &[&str],
+    candidate: &str,
+    max_n: usize,
+    smooth: bool,
+) -> BleuScore {
+    if references.is_empty() || max_n == 0 || candidate.is_empty() {
+        return BleuScore {
+            score: 0.0,
+            brevity_penalty: 0.0,
+            precisions: Vec::new(),
+            ref_len: 0,
+            cand_len: tokenize_lower(candidate).count(),
+        };
+    }
+    let cand_tokens: Vec<String> = tokenize_lower(candidate).collect();
+    let c = cand_tokens.len();
+    if c == 0 {
+        return BleuScore {
+            score: 0.0,
+            brevity_penalty: 0.0,
+            precisions: Vec::new(),
+            ref_len: 0,
+            cand_len: 0,
+        };
+    }
+    // Tokenize each reference once.
+    let ref_token_lists: Vec<Vec<String>> = references
+        .iter()
+        .map(|r| tokenize_lower(r).collect())
+        .collect();
+    // Closest reference length to the candidate (BLEU multi-ref
+    // brevity-penalty rule from the original paper).
+    let r_closest = ref_token_lists
+        .iter()
+        .map(|tokens| tokens.len())
+        .min_by_key(|len| {
+            let d = (*len as i64 - c as i64).abs();
+            // Tie-break: prefer the SHORTER ref length on ties (matches
+            // sacrebleu / NIST mteval convention).
+            (d, *len as i64)
+        })
+        .unwrap_or(0);
+    if r_closest == 0 {
+        return BleuScore {
+            score: 0.0,
+            brevity_penalty: 0.0,
+            precisions: Vec::new(),
+            ref_len: 0,
+            cand_len: c,
+        };
+    }
+    let mut precisions = Vec::with_capacity(max_n);
+    for n in 1..=max_n {
+        let cand_grams = ngrams(&cand_tokens, n);
+        if cand_grams.is_empty() {
+            precisions.push(0.0);
+            continue;
+        }
+        // Build max-count-across-refs map: for each n-gram, the
+        // ceiling is the max of its counts across ALL references.
+        use std::collections::HashMap;
+        let mut max_ref_counts: HashMap<&Vec<String>, usize> = HashMap::new();
+        let ref_grams_per_ref: Vec<Vec<Vec<String>>> = ref_token_lists
+            .iter()
+            .map(|tokens| ngrams(tokens, n))
+            .collect();
+        for r_grams in &ref_grams_per_ref {
+            let mut this_ref: HashMap<&Vec<String>, usize> = HashMap::new();
+            for g in r_grams {
+                *this_ref.entry(g).or_insert(0) += 1;
+            }
+            for (g, &c) in &this_ref {
+                let entry = max_ref_counts.entry(g).or_insert(0);
+                if c > *entry {
+                    *entry = c;
+                }
+            }
+        }
+        // Cand counts.
+        let mut cand_counts: HashMap<&Vec<String>, usize> = HashMap::new();
+        for g in &cand_grams {
+            *cand_counts.entry(g).or_insert(0) += 1;
+        }
+        let mut overlap: usize = 0;
+        for (g, &cc) in &cand_counts {
+            if let Some(&max_rc) = max_ref_counts.get(g) {
+                overlap += max_rc.min(cc);
+            }
+        }
+        let p = if smooth && overlap == 0 {
+            1.0 / (cand_grams.len() + 1) as f32
+        } else {
+            overlap as f32 / cand_grams.len() as f32
+        };
+        precisions.push(p);
+    }
+    let bp = if c >= r_closest {
+        1.0
+    } else {
+        (1.0 - r_closest as f32 / c as f32).exp()
+    };
+    let any_zero = precisions.iter().any(|&p| p == 0.0);
+    let geo_mean = if any_zero {
+        0.0
+    } else {
+        let log_sum: f32 = precisions.iter().map(|p| p.ln()).sum();
+        (log_sum / precisions.len() as f32).exp()
+    };
+    BleuScore {
+        score: bp * geo_mean,
+        brevity_penalty: bp,
+        precisions,
+        ref_len: r_closest,
+        cand_len: c,
+    }
+}
+
+/// Multi-reference ROUGE-N — n-gram F-score taking the BEST score
+/// across all references. Shadow of iter-304 `rouge_n` for the
+/// multi-ref case common in NLG eval.
+///
+/// The common convention (matching Lin's 2004 follow-up + most
+/// reference impls) is "max F over refs" rather than "max overlap
+/// per gram". That keeps each ref independent — a cand that
+/// mirrors ref 1 perfectly scores 1.0 even if ref 2 is wildly
+/// different.
+pub fn rouge_n_multi(references: &[&str], candidate: &str, n: usize) -> RougeScore {
+    if references.is_empty() {
+        return RougeScore::zero();
+    }
+    references
+        .iter()
+        .map(|r| rouge_n(r, candidate, n))
+        .max_by(|a, b| a.f1.partial_cmp(&b.f1).unwrap_or(std::cmp::Ordering::Equal))
+        .unwrap_or_else(RougeScore::zero)
+}
+
+/// Multi-reference ROUGE-L — same max-over-refs rule applied to LCS-based F1.
+pub fn rouge_l_multi(references: &[&str], candidate: &str) -> RougeScore {
+    if references.is_empty() {
+        return RougeScore::zero();
+    }
+    references
+        .iter()
+        .map(|r| rouge_l(r, candidate))
+        .max_by(|a, b| a.f1.partial_cmp(&b.f1).unwrap_or(std::cmp::Ordering::Equal))
+        .unwrap_or_else(RougeScore::zero)
+}
+
 /// Word Error Rate — `levenshtein_word_distance(ref, cand) / ref_word_count`.
 ///
 /// Standard ASR / MT / NLG metric. **Lower is better** (opposite of
@@ -1654,6 +1836,104 @@ mod tests {
         let c = cer("running", "runs");
         assert!((w - 1.0).abs() < 1e-5);
         assert!(c < w, "CER ({c}) should be < WER ({w}) on a morphological diff");
+    }
+
+    // ─── Multi-reference BLEU + ROUGE ───────────────────────────
+
+    #[test]
+    fn bleu_multi_picks_best_overlap_across_refs() {
+        // Ref 1 is verbose; ref 2 matches cand exactly. max_n=3 since
+        // cand is 3 tokens (BLEU at higher n needs cand long enough
+        // to have those n-grams; same caveat as single-ref BLEU —
+        // see iter-305 docstring).
+        let cand = "the cat sat";
+        let refs = ["the cat was sleeping nicely", "the cat sat"];
+        let s = bleu_multi(&refs, cand, 3, false);
+        // Ref 2 matches exactly → all 3 unigrams + 2 bigrams + 1
+        // trigram match. score should be near 1.0.
+        assert!(s.score > 0.9, "got {}", s.score);
+    }
+
+    #[test]
+    fn bleu_multi_brevity_uses_closest_ref_length() {
+        // Cand length 3. Ref lengths [10, 4, 100] — closest is 4.
+        // BP = exp(1 - 4/3) ≈ 0.717.
+        let cand = "the cat sat";
+        let refs = [
+            "the cat was sleeping for a long time today there",
+            "the cat sat there",
+            "completely different and very very very very very very long sentence here",
+        ];
+        let s = bleu_multi(
+            &refs.iter().copied().collect::<Vec<_>>(),
+            cand,
+            1,
+            false,
+        );
+        assert_eq!(s.ref_len, 4);
+        let expected_bp = (1.0_f32 - 4.0 / 3.0).exp();
+        assert!((s.brevity_penalty - expected_bp).abs() < 1e-5);
+    }
+
+    #[test]
+    fn bleu_multi_empty_refs_zero() {
+        let s = bleu_multi(&[], "anything", 4, false);
+        assert_eq!(s.score, 0.0);
+    }
+
+    #[test]
+    fn bleu_multi_at_least_as_good_as_best_single_ref() {
+        // For any cand, multi-ref BLEU should be >= the best of the
+        // single-ref BLEU scores (the multi-ref formula is a max-
+        // count-per-gram extension; can't score lower than picking
+        // the best ref alone).
+        let cand = "the cat sat on the mat";
+        let refs = ["completely unrelated", "the cat sat on the floor"];
+        let single_best = refs
+            .iter()
+            .map(|r| bleu(r, cand))
+            .fold(0.0_f32, f32::max);
+        let multi = bleu_multi(&refs, cand, 4, false);
+        assert!(
+            multi.score >= single_best - 1e-5,
+            "multi {} should >= best single-ref {single_best}",
+            multi.score
+        );
+    }
+
+    #[test]
+    fn rouge_n_multi_picks_max_f1() {
+        let cand = "the cat sat on the mat";
+        let refs = ["completely unrelated", "the cat sat on the mat"];
+        let r = rouge_n_multi(&refs, cand, 1);
+        // Identical to ref 2 → F1 = 1.0.
+        assert!((r.f1 - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn rouge_n_multi_empty_refs_zero() {
+        let r = rouge_n_multi(&[], "anything", 1);
+        assert_eq!(r.f1, 0.0);
+    }
+
+    #[test]
+    fn rouge_l_multi_picks_max_f1() {
+        let cand = "the cat sat on the mat";
+        let refs = ["totally different vocabulary used here", "the cat sat on the mat"];
+        let r = rouge_l_multi(&refs, cand);
+        assert!((r.f1 - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn rouge_n_multi_at_least_as_good_as_best_single() {
+        let cand = "the cat sat on the mat";
+        let refs = ["the cat sat on the floor", "the dog ran fast"];
+        let single_best = refs
+            .iter()
+            .map(|r| rouge_1(r, cand).f1)
+            .fold(0.0_f32, f32::max);
+        let multi = rouge_n_multi(&refs, cand, 1);
+        assert!(multi.f1 >= single_best - 1e-5);
     }
 
     #[test]
