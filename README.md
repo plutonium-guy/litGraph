@@ -15,6 +15,7 @@ Hot paths (HTTP, SSE parsing, tokenization, vector math, graph scheduling, JSON 
 |-----|-----------------|
 | [USAGE.md](USAGE.md) | how to use every subsystem |
 | [COMPARISON.md](COMPARISON.md) | litGraph vs LangChain vs LangGraph — feature-by-feature |
+| [AGENTS.md](AGENTS.md) | rules for AI coding agents working in this repo |
 | [AGENT_DX.md](AGENT_DX.md) | features that make Claude Code / Cursor / Cline build with litGraph easily |
 | [FEATURES.md](FEATURES.md) | what's done, with status legend |
 | [MISSING_FEATURES.md](MISSING_FEATURES.md) | gaps + nice-to-haves (next ~10 iters) |

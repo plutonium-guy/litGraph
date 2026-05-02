@@ -2117,7 +2117,7 @@ checksum = "92daf443525c4cce67b150400bc2316076100ce0b3686209eb8cf3c31612e6f0"
 
 [[package]]
 name = "litgraph-agents"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -2134,7 +2134,7 @@ dependencies = [
 
 [[package]]
 name = "litgraph-bench"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "criterion",
@@ -2152,7 +2152,7 @@ dependencies = [
 
 [[package]]
 name = "litgraph-cache"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "bincode",
@@ -2173,7 +2173,7 @@ dependencies = [
 
 [[package]]
 name = "litgraph-checkpoint-postgres"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "bincode",
@@ -2189,7 +2189,7 @@ dependencies = [
 
 [[package]]
 name = "litgraph-checkpoint-redis"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "bincode",
@@ -2204,7 +2204,7 @@ dependencies = [
 
 [[package]]
 name = "litgraph-checkpoint-sqlite"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "bincode",
@@ -2219,7 +2219,7 @@ dependencies = [
 
 [[package]]
 name = "litgraph-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -2242,7 +2242,7 @@ dependencies = [
 
 [[package]]
 name = "litgraph-embeddings-fastembed"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "fastembed",
@@ -2256,7 +2256,7 @@ dependencies = [
 
 [[package]]
 name = "litgraph-graph"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "bincode",
@@ -2276,7 +2276,7 @@ dependencies = [
 
 [[package]]
 name = "litgraph-loaders"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2305,7 +2305,7 @@ dependencies = [
 
 [[package]]
 name = "litgraph-macros"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "litgraph-core",
@@ -2320,7 +2320,7 @@ dependencies = [
 
 [[package]]
 name = "litgraph-mcp"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "litgraph-core",
@@ -2336,7 +2336,7 @@ dependencies = [
 
 [[package]]
 name = "litgraph-memory-postgres"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "deadpool-postgres",
@@ -2351,7 +2351,7 @@ dependencies = [
 
 [[package]]
 name = "litgraph-memory-redis"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "litgraph-core",
@@ -2365,7 +2365,7 @@ dependencies = [
 
 [[package]]
 name = "litgraph-memory-sqlite"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "litgraph-core",
@@ -2380,7 +2380,7 @@ dependencies = [
 
 [[package]]
 name = "litgraph-observability"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "futures",
@@ -2399,7 +2399,7 @@ dependencies = [
 
 [[package]]
 name = "litgraph-providers-anthropic"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -2419,7 +2419,7 @@ dependencies = [
 
 [[package]]
 name = "litgraph-providers-bedrock"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -2442,7 +2442,7 @@ dependencies = [
 
 [[package]]
 name = "litgraph-providers-cohere"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -2461,7 +2461,7 @@ dependencies = [
 
 [[package]]
 name = "litgraph-providers-gemini"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -2481,7 +2481,7 @@ dependencies = [
 
 [[package]]
 name = "litgraph-providers-jina"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "litgraph-core",
@@ -2495,7 +2495,7 @@ dependencies = [
 
 [[package]]
 name = "litgraph-providers-openai"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -2515,7 +2515,7 @@ dependencies = [
 
 [[package]]
 name = "litgraph-providers-voyage"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "litgraph-core",
@@ -2529,7 +2529,7 @@ dependencies = [
 
 [[package]]
 name = "litgraph-py"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2579,7 +2579,7 @@ dependencies = [
 
 [[package]]
 name = "litgraph-rerankers-cohere"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "litgraph-core",
@@ -2594,7 +2594,7 @@ dependencies = [
 
 [[package]]
 name = "litgraph-rerankers-fastembed"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "fastembed",
@@ -2607,7 +2607,7 @@ dependencies = [
 
 [[package]]
 name = "litgraph-rerankers-jina"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "litgraph-core",
@@ -2622,7 +2622,7 @@ dependencies = [
 
 [[package]]
 name = "litgraph-rerankers-voyage"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "litgraph-core",
@@ -2637,7 +2637,7 @@ dependencies = [
 
 [[package]]
 name = "litgraph-resilience"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "backon",
@@ -2657,7 +2657,7 @@ dependencies = [
 
 [[package]]
 name = "litgraph-retrieval"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "backon",
@@ -2677,7 +2677,7 @@ dependencies = [
 
 [[package]]
 name = "litgraph-serve"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "axum",
@@ -2696,7 +2696,7 @@ dependencies = [
 
 [[package]]
 name = "litgraph-splitters"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "litgraph-core",
@@ -2712,7 +2712,7 @@ dependencies = [
 
 [[package]]
 name = "litgraph-store-postgres"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "deadpool-postgres",
@@ -2727,7 +2727,7 @@ dependencies = [
 
 [[package]]
 name = "litgraph-stores-chroma"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "litgraph-core",
@@ -2744,7 +2744,7 @@ dependencies = [
 
 [[package]]
 name = "litgraph-stores-hnsw"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "instant-distance",
@@ -2760,7 +2760,7 @@ dependencies = [
 
 [[package]]
 name = "litgraph-stores-memory"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "litgraph-core",
@@ -2774,7 +2774,7 @@ dependencies = [
 
 [[package]]
 name = "litgraph-stores-pgvector"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "deadpool-postgres",
@@ -2791,7 +2791,7 @@ dependencies = [
 
 [[package]]
 name = "litgraph-stores-qdrant"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "litgraph-core",
@@ -2807,7 +2807,7 @@ dependencies = [
 
 [[package]]
 name = "litgraph-stores-weaviate"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "litgraph-core",
@@ -2823,7 +2823,7 @@ dependencies = [
 
 [[package]]
 name = "litgraph-tokenizers"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "litgraph-core",
  "parking_lot",
@@ -2833,7 +2833,7 @@ dependencies = [
 
 [[package]]
 name = "litgraph-tools-search"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "litgraph-core",
@@ -2847,7 +2847,7 @@ dependencies = [
 
 [[package]]
 name = "litgraph-tools-utils"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2876,7 +2876,7 @@ dependencies = [
 
 [[package]]
 name = "litgraph-tracing-otel"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "opentelemetry",
  "opentelemetry-otlp",

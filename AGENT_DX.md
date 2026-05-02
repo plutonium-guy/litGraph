@@ -45,11 +45,11 @@ context guessing. Optimise the import surface for grep.
 | Feature | Status | Effort |
 |---|---|---|
 | Top-level re-exports of every public type from `litgraph` | ✅ partial | S |
-| `litgraph.__all__` exhaustive (so `dir(litgraph)` is complete) | 🚧 | S |
+| `litgraph.__all__` exhaustive (so `dir(litgraph)` is complete) | ✅ (iter 339) | S |
 | Single import path per concept — no `litgraph.foo.bar.Foo` aliases | ✅ | — |
 | `litgraph.<subsystem>.__all__` with one-liner module docstring | 🚧 | S |
 | README has a 60-second copy-pasteable hello-world | ✅ (iter 333) | — |
-| **💡 `litgraph.recipes` namespace** with one-call patterns (rag, react, supervisor, eval) — same shape as scikit-learn's `datasets` | 💡 | M |
+| **`litgraph.recipes` namespace** with one-call patterns (eval, serve; rag/multi_agent planned) — same shape as scikit-learn's `datasets` | ✅ partial (iter 339) | M |
 
 **Why Claude Code cares:** when the agent grep-searches "ReactAgent",
 it should find one canonical import path. Multiple aliases
@@ -171,13 +171,13 @@ saves the agent from chasing them.
 
 | Feature | Status | Effort |
 |---|---|---|
-| Native module built + version matches | 🚧 | S |
-| API key env vars set per provider | 🚧 | S |
+| Native module built + version matches | ✅ (iter 339) | S |
+| API key env vars set per provider | ✅ (iter 339) | S |
 | Connectivity test to each configured provider | 🚧 | S |
 | Tokenizer files downloaded (HF cache) | 🚧 | S |
 | Postgres / Redis / SQLite reachable (if configured) | 🚧 | S |
-| Free-threaded vs GIL Python build | 🚧 | S |
-| `litgraph doctor --json` for agent consumption | 💡 | S |
+| Free-threaded vs GIL Python build | ✅ (iter 339) | S |
+| `litgraph doctor --json` for agent consumption | ✅ (iter 339) | S |
 
 **Why Claude Code cares:** "why doesn't this work?" → `litgraph doctor`
 prints a 6-line diagnostic. The agent gets exact-error→exact-fix
@@ -193,10 +193,10 @@ every coding agent the right context on first read.
 
 | Feature | Status | Effort |
 |---|---|---|
-| Top-level `AGENTS.md` with: build cmds, test cmds, lint, repo layout, conventions | 🚧 | S |
+| Top-level `AGENTS.md` with: build cmds, test cmds, lint, repo layout, conventions | ✅ (iter 339) | S |
 | Per-subsystem `AGENTS.md` (e.g. `crates/litgraph-py/AGENTS.md`) | 💡 | M |
 | `AGENTS.md` shipped in the wheel so `pip install litgraph` includes it | 💡 | S |
-| Pointer from README to AGENTS.md | 💡 | S |
+| Pointer from README to AGENTS.md | ✅ (iter 339) | S |
 
 **What `AGENTS.md` should contain:**
 
@@ -337,8 +337,8 @@ Lower the barrier from "intent" to "working agent."
 | `ReactAgent(m, tools, system_prompt=...)` | ✅ | — |
 | `litgraph.agents.deep.create_deep_agent(...)` (retries+budget+tracing wired) | ✅ | — |
 | **💡 `litgraph.recipes.rag(corpus_path, model=...)`** → working RAG agent in 1 call | 💡 | M |
-| **💡 `litgraph.recipes.eval(target, cases)`** → harness with sane metrics | 💡 | S |
-| **💡 `litgraph.recipes.serve(graph, port=8080)`** → REST + SSE in 1 call | 💡 | S |
+| **`litgraph.recipes.eval(target, cases)`** → harness with sane metrics | ✅ (iter 339) | S |
+| **`litgraph.recipes.serve(graph, port=8080)`** → REST + SSE in 1 call | ⏳ (renders cmd; full impl pending) | S |
 | **💡 `litgraph.recipes.multi_agent(roles=[...])`** → supervisor pre-wired | 💡 | M |
 
 **Why Claude Code cares:** when the user says "build me an X", the
@@ -388,11 +388,11 @@ The agent often writes tests. Make the test infrastructure obvious.
 | Feature | Status | Effort |
 |---|---|---|
 | `ScriptedModel` for deterministic chat tests (already used internally) | ⏳ (Rust-only) | S to expose |
-| Python `MockChatModel` with scripted replies | 💡 | S |
-| `MockEmbeddings(dim, deterministic=True)` | 💡 | S |
-| `MockTool(returns=...)` | 💡 | S |
+| Python `MockChatModel` with scripted replies | ✅ (iter 339) | S |
+| `MockEmbeddings(dim, deterministic=True)` | ✅ (iter 339) | S |
+| `MockTool(returns=...)` | ✅ (iter 339) | S |
 | Pytest fixtures auto-discovered: `mock_chat`, `mock_emb`, `mock_store` | 💡 | M |
-| `litgraph.testing` module documented in USAGE.md | 💡 | S |
+| `litgraph.testing` module documented in USAGE.md | 🚧 | S |
 
 **Why Claude Code cares:** the agent's tests need deterministic
 behaviour. If `MockChatModel` is one import away, the agent writes

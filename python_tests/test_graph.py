@@ -14,7 +14,9 @@ from litgraph.cache import MemoryCache, SqliteCache
 
 def test_sanity():
     assert litgraph.sum_as_string(2, 3) == "5"
-    assert litgraph.__version__ == "0.1.0"
+    # Version is bumped per release; assert shape, not value.
+    assert isinstance(litgraph.__version__, str)
+    assert litgraph.__version__.count(".") >= 2
 
 
 def test_state_graph_simple_linear():

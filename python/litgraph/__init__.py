@@ -34,5 +34,15 @@ except ImportError as _native_err:  # pragma: no cover — only in dev w/o build
 # Pure-Python sugar shipped alongside the native module.
 from .functional import entrypoint, task, Workflow  # noqa: E402
 from .coerce import coerce_one, coerce_stream  # noqa: E402
+from . import recipes  # noqa: E402,F401
+from . import testing  # noqa: E402,F401
 
-__all__.extend(["entrypoint", "task", "Workflow", "coerce_one", "coerce_stream"])
+__all__.extend([
+    "entrypoint",
+    "task",
+    "Workflow",
+    "coerce_one",
+    "coerce_stream",
+    "recipes",
+    "testing",
+])
