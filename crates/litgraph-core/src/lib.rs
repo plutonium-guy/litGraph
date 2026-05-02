@@ -166,7 +166,7 @@ pub use eval_bootstrap::{bootstrap_eval_ci, bootstrap_mean_ci, ConfidenceInterva
 pub use eval_correlation::{
     correlate_scorers, kendall_tau, pearson_correlation, spearman_correlation, ScorerCorrelation,
 };
-pub use eval_bertscore::{bertscore, BertScoreResult};
+pub use eval_bertscore::{bertscore, relaxed_wmd, BertScoreResult, WmdScore};
 pub use memory::{
     BufferMemory, ConversationMemory, MemorySnapshot, SummaryBufferMemory, TokenBufferMemory,
     TokenCounter, summarize_conversation,

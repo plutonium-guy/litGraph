@@ -165,6 +165,152 @@ pub async fn bertscore(
     })
 }
 
+/// Result of a Relaxed Word Mover Distance (RWMD) call.
+///
+/// `rwmd` is the headline distance — `max(ref_to_cand, cand_to_ref)`.
+/// Lower is better; 0.0 = identical content (same embeddings); higher
+/// values indicate progressively more semantic distance. The per-
+/// direction fields are exposed so callers can diagnose asymmetric
+/// cases ("ref has content the cand misses entirely" → high
+/// `ref_to_cand`, low `cand_to_ref`).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct WmdScore {
+    pub rwmd: f32,
+    pub ref_to_cand: f32,
+    pub cand_to_ref: f32,
+    pub n_ref_tokens: u32,
+    pub n_cand_tokens: u32,
+}
+
+impl WmdScore {
+    fn zero() -> Self {
+        Self {
+            rwmd: 0.0,
+            ref_to_cand: 0.0,
+            cand_to_ref: 0.0,
+            n_ref_tokens: 0,
+            n_cand_tokens: 0,
+        }
+    }
+}
+
+/// Relaxed Word Mover Distance (Kusner et al. 2015) — semantic
+/// distance via per-token nearest-neighbor matching in embedding
+/// space.
+///
+/// **Lower is better** (opposite of iter-321 BERTScore). 0 = identical
+/// content; higher values = more semantic distance. Unbounded above
+/// 1.0 in principle but for normalized cosine-derived distance stays
+/// in `[0, 2]`.
+///
+/// # Distinct from iter-321 BERTScore
+///
+/// Both use the existing `Embeddings` trait + per-token nearest-
+/// neighbor cosine, but the conventions differ:
+///
+/// - BERTScore reports SIMILARITY (higher-better) as F1 of per-side
+///   max-cosine averages. Result in [0, 1].
+/// - RWMD reports DISTANCE (lower-better) as `1 - max_cosine`
+///   averaged per side, then `max` of the two directions. Result
+///   in [0, 2].
+///
+/// Different conventions, different communities. WMD is the
+/// canonical name in MT literature (Kusner 2015 introduced it for
+/// document classification; widely adopted in machine translation
+/// + summarization eval). BERTScore is the modern name for
+/// embedding-based similarity. Ship both.
+///
+/// # Why "Relaxed" not full WMD
+///
+/// Full Word Mover Distance solves a linear-programming transport
+/// problem (each ref token's "mass" flows to cand tokens minimizing
+/// total transport cost). LP solver is heavy and the asymptotic
+/// complexity is O(n³ log n). RWMD drops the transport constraint
+/// — each token independently picks its nearest-neighbor in the
+/// other side, no flow conservation. Kusner 2015 §4 showed RWMD is
+/// a tight lower bound on full WMD AND has nearly equivalent
+/// empirical correlation with human judgment, at O(n²) cost. The
+/// canonical practical choice.
+///
+/// Full WMD with LP solver is roadmap work for callers who need
+/// exact transport semantics (rare).
+///
+/// # Algorithm
+///
+/// 1. Tokenize via lowercase + whitespace.
+/// 2. Two batched `embed_documents` calls (one per side).
+/// 3. `ref_to_cand = mean(1 - max_cosine_over_cand_per_ref_token)`.
+/// 4. `cand_to_ref = mean(1 - max_cosine_over_ref_per_cand_token)`.
+/// 5. `rwmd = max(ref_to_cand, cand_to_ref)`.
+///
+/// Negative cosines clamped — `1 - max(0, cosine)` — so anti-aligned
+/// pairs contribute distance ≤ 1.0, not > 1.0.
+///
+/// # Edge cases
+///
+/// - Both empty → `WmdScore::zero` (0 distance, 0 tokens).
+/// - One side empty: returns 1.0 distance (no tokens to compare against
+///   — assume max distance under normalized cosine convention).
+pub async fn relaxed_wmd(
+    reference: &str,
+    candidate: &str,
+    embeddings: Arc<dyn Embeddings>,
+) -> Result<WmdScore> {
+    let ref_tokens: Vec<String> = tokenize_lower(reference).collect();
+    let cand_tokens: Vec<String> = tokenize_lower(candidate).collect();
+    if ref_tokens.is_empty() && cand_tokens.is_empty() {
+        return Ok(WmdScore::zero());
+    }
+    if ref_tokens.is_empty() || cand_tokens.is_empty() {
+        return Ok(WmdScore {
+            rwmd: 1.0,
+            ref_to_cand: if ref_tokens.is_empty() { 0.0 } else { 1.0 },
+            cand_to_ref: if cand_tokens.is_empty() { 0.0 } else { 1.0 },
+            n_ref_tokens: ref_tokens.len() as u32,
+            n_cand_tokens: cand_tokens.len() as u32,
+        });
+    }
+    let ref_embs = embeddings.embed_documents(&ref_tokens).await?;
+    let cand_embs = embeddings.embed_documents(&cand_tokens).await?;
+    let n_ref = ref_embs.len();
+    let n_cand = cand_embs.len();
+    // ref → cand: per ref token, find max cosine over cand tokens; distance = 1 - max.
+    let mut r2c_sum = 0.0_f32;
+    for r in &ref_embs {
+        let mut best = -1.0_f32;
+        for c in &cand_embs {
+            let sim = cosine_sim(r, c);
+            if sim > best {
+                best = sim;
+            }
+        }
+        // Clamp negative similarities to 0 — distance never exceeds 1.
+        r2c_sum += 1.0 - best.max(0.0);
+    }
+    // cand → ref: mirror.
+    let mut c2r_sum = 0.0_f32;
+    for c in &cand_embs {
+        let mut best = -1.0_f32;
+        for r in &ref_embs {
+            let sim = cosine_sim(c, r);
+            if sim > best {
+                best = sim;
+            }
+        }
+        c2r_sum += 1.0 - best.max(0.0);
+    }
+    let r2c = r2c_sum / n_ref as f32;
+    let c2r = c2r_sum / n_cand as f32;
+    let rwmd = r2c.max(c2r);
+    Ok(WmdScore {
+        rwmd,
+        ref_to_cand: r2c,
+        cand_to_ref: c2r,
+        n_ref_tokens: n_ref as u32,
+        n_cand_tokens: n_cand as u32,
+    })
+}
+
 fn tokenize_lower(s: &str) -> impl Iterator<Item = String> + '_ {
     s.split_whitespace().map(|t| t.to_lowercase())
 }
@@ -356,6 +502,120 @@ mod tests {
         // P = (1 + 1 + 0.707) / 3 ≈ 0.902.
         assert!((r.recall - 1.0).abs() < 1e-5, "r={}", r.recall);
         assert!(r.precision < 1.0 && r.precision > 0.85, "p={}", r.precision);
+    }
+
+    // ─── Relaxed WMD ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn rwmd_identical_strings_zero_distance() {
+        let emb = ScriptedEmb::new(&[
+            ("the", vec![1.0, 0.0]),
+            ("cat", vec![0.0, 1.0]),
+        ]);
+        let r = relaxed_wmd("the cat", "the cat", emb).await.unwrap();
+        assert!(r.rwmd < 1e-5, "got {}", r.rwmd);
+        assert!(r.ref_to_cand < 1e-5);
+        assert!(r.cand_to_ref < 1e-5);
+    }
+
+    #[tokio::test]
+    async fn rwmd_both_empty_zero() {
+        let emb = ScriptedEmb::new(&[]);
+        let r = relaxed_wmd("", "", emb).await.unwrap();
+        assert_eq!(r, WmdScore::zero());
+    }
+
+    #[tokio::test]
+    async fn rwmd_one_empty_max_distance() {
+        let emb = ScriptedEmb::new(&[("the", vec![1.0, 0.0])]);
+        let r = relaxed_wmd("", "the", emb.clone()).await.unwrap();
+        assert_eq!(r.rwmd, 1.0);
+        let r = relaxed_wmd("the", "", emb).await.unwrap();
+        assert_eq!(r.rwmd, 1.0);
+    }
+
+    #[tokio::test]
+    async fn rwmd_synonyms_low_distance() {
+        // cat/feline + happy/content near-identical embeddings
+        // → low WMD, despite zero word overlap.
+        let emb = ScriptedEmb::new(&[
+            ("cat", vec![1.0, 0.05]),
+            ("feline", vec![0.99, 0.04]),
+            ("happy", vec![0.0, 1.0]),
+            ("content", vec![0.05, 0.99]),
+        ]);
+        let r = relaxed_wmd("cat happy", "feline content", emb).await.unwrap();
+        // High cosine → low distance per token. RWMD < 0.05.
+        assert!(r.rwmd < 0.1, "expected low RWMD, got {}", r.rwmd);
+    }
+
+    #[tokio::test]
+    async fn rwmd_disjoint_high_distance() {
+        let emb = ScriptedEmb::new(&[
+            ("a", vec![1.0, 0.0]),
+            ("x", vec![0.0, 1.0]),
+        ]);
+        // Each side's only token has no good match in the other side:
+        // a vs x → cosine 0 → distance 1.
+        let r = relaxed_wmd("a", "x", emb).await.unwrap();
+        assert!((r.rwmd - 1.0).abs() < 1e-5);
+    }
+
+    #[tokio::test]
+    async fn rwmd_asymmetric_directions() {
+        // Ref has 3 tokens, all matching cand's 1 token strongly.
+        // ref_to_cand: 3 tokens each find a perfect match in cand → 0.
+        // cand_to_ref: 1 cand token finds a perfect match in ref → 0.
+        // Both directions ≈ 0, total ≈ 0. Construct a case where they
+        // differ instead: ref has perfect-match-in-cand token + a
+        // disjoint token; cand has only the matching token.
+        // ref = "good", "weird"; cand = "good"; emb: good aligned, weird disjoint.
+        // ref_to_cand: good→good (dist 0) + weird→good (dist 1) → mean 0.5
+        // cand_to_ref: good→good (dist 0) → mean 0
+        // RWMD = max(0.5, 0) = 0.5. ref_to_cand > cand_to_ref → asymmetric.
+        let emb = ScriptedEmb::new(&[
+            ("good", vec![1.0, 0.0]),
+            ("weird", vec![0.0, 1.0]),
+        ]);
+        let r = relaxed_wmd("good weird", "good", emb).await.unwrap();
+        assert!((r.ref_to_cand - 0.5).abs() < 1e-5, "r2c={}", r.ref_to_cand);
+        assert!(r.cand_to_ref < 1e-5);
+        assert!((r.rwmd - 0.5).abs() < 1e-5);
+    }
+
+    #[tokio::test]
+    async fn rwmd_negative_cosine_clamped_to_distance_one() {
+        // Anti-aligned vectors → cosine -1 → 1 - max(0, -1) = 1.
+        let emb = ScriptedEmb::new(&[
+            ("a", vec![1.0, 0.0]),
+            ("b", vec![-1.0, 0.0]),
+        ]);
+        let r = relaxed_wmd("a", "b", emb).await.unwrap();
+        assert!((r.rwmd - 1.0).abs() < 1e-5);
+        // Should NOT exceed 1.0 — clamp protects against -2 distance.
+        assert!(r.rwmd <= 1.0);
+    }
+
+    #[tokio::test]
+    async fn rwmd_token_counts_in_struct() {
+        let emb = ScriptedEmb::new(&[
+            ("the", vec![1.0, 0.0]),
+            ("cat", vec![0.0, 1.0]),
+            ("sat", vec![0.5, 0.5]),
+        ]);
+        let r = relaxed_wmd("the cat sat", "the cat", emb).await.unwrap();
+        assert_eq!(r.n_ref_tokens, 3);
+        assert_eq!(r.n_cand_tokens, 2);
+    }
+
+    #[tokio::test]
+    async fn rwmd_lowercase_normalization() {
+        let emb = ScriptedEmb::new(&[
+            ("the", vec![1.0, 0.0]),
+            ("cat", vec![0.0, 1.0]),
+        ]);
+        let r = relaxed_wmd("The Cat", "the cat", emb).await.unwrap();
+        assert!(r.rwmd < 1e-5);
     }
 
     #[tokio::test]
