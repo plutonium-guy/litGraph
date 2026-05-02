@@ -465,8 +465,8 @@ checkpointer + interrupt support.
 
 | Feature | Why | Status |
 |---|---|---|
-| `@entrypoint` decorator (workflow root) | Skip graph DSL | ❌ |
-| `@task` decorator (async work unit) | Future-like subtask | ❌ |
+| `@entrypoint` decorator (workflow root) | Skip graph DSL | 🟡 `litgraph.entrypoint(checkpointer=...)` (iter 317) — pure-Python decorator wraps an async fn into a `Workflow` object with `.invoke()` (sync), `.ainvoke()` (async), `.astream()` (yields `{"final": <result>}` chunk in v1; future iters: per-task progress events). Sync function → clear `TypeError` at decoration time, not deep-call surprise. `.invoke()` from inside a running event loop → clear `RuntimeError` ("use `.ainvoke()`"). Checkpointer arg stored for downstream tooling; full StateGraph integration roadmap work. Lives at `python/litgraph/functional.py` shipped via maturin mixed-layout (`python-source = "python"` in pyproject.toml). 13 Python tests cover task-marker, async-callable preserved, Workflow class returned, sync/async invoke, task chaining inside workflow body, sync-fn rejection, checkpointer storage, in-loop invoke error, repr, direct-call returns coroutine, astream chunk shape, name/doc preservation. |
+| `@task` decorator (async work unit) | Future-like subtask | 🟡 `litgraph.task` (iter 317) — pure-Python tagging decorator. Adds `__litgraph_task__ = True` so introspection / future StateGraph-integration tooling can identify task functions. Function unchanged at runtime. Future iters will plumb each `await task_fn(...)` inside an `@entrypoint` body as a checkpointable graph node — for now the runtime delegates to plain async-await execution. |
 | `previous` thread-state access | Resume across calls | ✅ via Checkpointer + thread_id |
 | Checkpointer compatibility | Resume mid-flow | ✅ wrap user fn would work, no decorator sugar |
 | Sync + async function support | Unified API | ✅ at graph level |
@@ -529,7 +529,7 @@ Top gaps to close, ranked by user-impact for a no-code-glue path:
 1. ✅ **Long-term memory `Store`** — core trait + `InMemoryStore` + `PostgresStore` shipped; `SemanticStore` (iter 185) adds Rayon-parallel cosine semantic-search recall on top of any `Store`.
 2. 🟡 **Middleware chain primitive** — `before/after_model` chain shipped (`litgraph.middleware`, 7 Py + 6 Rust tests). Built-ins: Logging, MessageWindow, SystemPrompt. `before/after_tool` hooks + tool-result offload still pending.
 3. ✅ **Deep Agents harness** — `PlanningTool` + `VirtualFilesystemTool` + `load_agents_md` + `load_skills_dir` + `SystemPromptBuilder` + `SubagentTool` + one-call `litgraph.deep_agent.create_deep_agent(...)` factory all shipped (43 Rust + 41 Py tests across the seven).
-4. ❌ **Functional API** (`@entrypoint` + `@task`) — Python decorator alternative to graph DSL. Trims LOC for simple workflows.
+4. 🟡 **Functional API** (`@entrypoint` + `@task`) — pure-Python v1 shipped iter 317 (decorators + `Workflow` class with invoke/ainvoke/astream); maturin mixed-layout via `python-source = "python"`. Full StateGraph runtime integration (checkpointable per-task graph nodes) remains roadmap work.
 5. ❌ **Pydantic-coerced state in Python** — type-safe stream chunks, IDE-narrow types. (Rust side already typed.)
 6. ❌ **`pyo3-stub-gen` auto-stubs** — manual stubs go stale. Pyright import warnings hurt agent-authored code.
 7. ✅ **fastembed-rs local embeddings** — `litgraph-embeddings-fastembed::FastembedEmbeddings` ships ONNX-backed local embeddings; default `bge-small-en-v1.5`, all fastembed models selectable.

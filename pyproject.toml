@@ -19,5 +19,9 @@ dynamic = ["version"]
 
 [tool.maturin]
 manifest-path = "crates/litgraph-py/Cargo.toml"
-module-name = "litgraph"
+# Native module placed inside the `litgraph` package as `litgraph.litgraph`,
+# letting the pure-Python sugar in `python/litgraph/__init__.py` re-export
+# the native API while adding decorators (functional.py).
+module-name = "litgraph.litgraph"
+python-source = "python"
 features = ["pyo3/extension-module"]
