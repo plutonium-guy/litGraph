@@ -6,6 +6,13 @@ build-backend = "maturin"
 name = "litgraph"
 requires-python = ">=3.9"
 description = "Production-grade slim alternative to LangChain/LangGraph. Rust core, Python bindings."
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+readme = "README.md"
+authors = [
+    { name = "Amiya Mandal" },
+]
+keywords = ["llm", "agents", "rag", "langchain", "langgraph", "rust", "pyo3"]
 classifiers = [
     "Programming Language :: Rust",
     "Programming Language :: Python :: Implementation :: CPython",
@@ -13,9 +20,17 @@ classifiers = [
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
-    "License :: OSI Approved :: Apache Software License",
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dynamic = ["version"]
+
+[project.urls]
+Homepage = "https://github.com/plutonium-guy/litGraph"
+Repository = "https://github.com/plutonium-guy/litGraph"
+Issues = "https://github.com/plutonium-guy/litGraph/issues"
+Changelog = "https://github.com/plutonium-guy/litGraph/blob/main/CHANGELOG.md"
 
 [tool.maturin]
 manifest-path = "crates/litgraph-py/Cargo.toml"
@@ -25,3 +40,12 @@ manifest-path = "crates/litgraph-py/Cargo.toml"
 module-name = "litgraph.litgraph"
 python-source = "python"
 features = ["pyo3/extension-module"]
+# Files maturin must include in the sdist that aren't auto-discovered by
+# walking `manifest-path`. PyPI strict-validates that any `License-File:`
+# in the wheel METADATA also exists in the sdist; LICENSE lives at the
+# workspace root, not under `crates/litgraph-py/`, so include it
+# explicitly.
+include = [
+    { path = "LICENSE", format = "sdist" },
+    { path = "README.md", format = "sdist" },
+]
