@@ -14,7 +14,7 @@ model). The reasoning model `deepseek-reasoner` is exercised in the
 streaming + structured-output tests where its different finish
 semantics matter.
 
-**Snapshot date:** 2026-05-02 · iter 359.
+**Snapshot date:** 2026-05-02 · iter 360.
 
 ---
 
@@ -41,15 +41,18 @@ provider changes.
 
 ## Tested ✅
 
-64 live integration tests against DeepSeek pass as of iter 359.
-9 cleanly skipped:
+67 live integration tests against DeepSeek pass as of iter 360.
+10 cleanly skipped:
 - `TokenBudgetChatModel`, `CostCappedChatModel`, `PiiScrubbingChatModel`
-  not exposed on the Python surface today (3 cases).
+  not exposed on the Python surface today (4 cases — the TokenBudget
+  wrapper has two cases).
 - `test_react_agent_with_python_wrapped_tools_blocked` — documented
   Python `HookedTool` blocker (1 case).
 - `LlmJudge` (2 cases) and `synthesize_eval_cases` (2 cases) — both
   use `StructuredChatModel` → `response_format=json_schema`, which
   DeepSeek does not support today. See Gotchas.
+- `broadcast_chat_stream` (1 case) — Python binding fix landed in
+  iter 360; re-enable after the next maturin build picks it up.
 
 | Feature | Test file | Notes |
 |---|---|---|
@@ -85,6 +88,9 @@ provider changes.
 | `PlanningTool` + `VirtualFilesystemTool` attach | `test_react_planning_vfs.py` (1 case) | both deep-agents primitives accepted by ReactAgent; `snapshot()` accessors |
 | `lcel.parallel(...)` over multiple steps | `test_lcel_parallel.py` (1 case) | result list aligned 1:1 with step order; mix model-call + pure fn |
 | `ReactAgent.max_iterations` cap | `test_react_max_iterations.py` (1 case) | agent terminates even if instructed to loop forever |
+| `multiplex_chat_streams` fan-in | `test_broadcast_multiplex.py` (1 case) | two-label tagged stream interleaved (broadcast variant skipped) |
+| `compat.AgentExecutor` LangChain shim | `test_compat_agent_executor.py` (1 case) | `agent.llm + tools` constructor maps to ReactAgent loop |
+| `ReactAgent.stream` lifecycle | `test_react_agent_event_stream.py` (1 case) | iterator yields iteration→final without stream_tokens=True |
 
 ---
 

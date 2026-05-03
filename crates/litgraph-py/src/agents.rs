@@ -126,7 +126,13 @@ pub struct PyBroadcastHandle {
 #[pymethods]
 impl PyBroadcastHandle {
     fn subscribe<'py>(&self, py: Python<'py>) -> PyResult<Py<PyBroadcastSubscriber>> {
+        // `BroadcastHandle::subscribe()` lazily spawns the upstream pump
+        // via `tokio::spawn(...)` on the first call. From synchronous
+        // Python there's no enclosing runtime, so we enter the bridge
+        // runtime before invoking subscribe() to satisfy the spawn.
+        let _guard = crate::runtime::rt().enter();
         let stream = self.inner.subscribe();
+        drop(_guard);
         // Bridge: drain the BroadcastSubscriberStream into an
         // mpsc::Receiver that Python can `__next__` block on.
         let (tx, rx) = mpsc::channel::<litgraph_core::BroadcastEvent>(64);
