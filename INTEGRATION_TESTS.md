@@ -14,7 +14,7 @@ model). The reasoning model `deepseek-reasoner` is exercised in the
 streaming + structured-output tests where its different finish
 semantics matter.
 
-**Snapshot date:** 2026-05-02 · iter 363.
+**Snapshot date:** 2026-05-02 · iter 365.
 
 ---
 
@@ -41,7 +41,7 @@ provider changes.
 
 ## Tested ✅
 
-82 live integration tests against DeepSeek pass as of iter 363.
+85 live integration tests against DeepSeek pass as of iter 365.
 10 cleanly skipped:
 - `TokenBudgetChatModel`, `CostCappedChatModel`, `PiiScrubbingChatModel`
   not exposed on the Python surface today (4 cases — the TokenBudget
@@ -99,6 +99,9 @@ provider changes.
 | `tools.SubagentTool` parent → child delegation | `test_subagent_tool_live.py` (1 case) | parent agent dispatches a math question to a sub-`ReactAgent` |
 | `ReadFileTool` + `WriteFileTool` + `ListDirectoryTool` via agent | `test_filesystem_tools_live.py` (2 cases) | sandbox-rooted FS access; agent reads seed file + write→read round-trip |
 | `Workflow(fn)` direct construction | `test_workflow_direct.py` (2 cases) | sync `invoke` and async `ainvoke` paths without `@entrypoint` decorator |
+| `Workflow.astream` final-chunk contract | `test_workflow_astream.py` (1 case) | v1 yields `{"final": <result>}` chunk after a real model call |
+| `compat.RunnablePassthrough` in parallel | `test_compat_runnable_passthrough.py` (1 case) | identity-branch alongside model-call branch in `RunnableParallel` |
+| Multi-turn context preservation | `test_chat_long_messages.py` (1 case) | system + 2 user/assistant turns + dependent follow-up |
 
 ---
 
