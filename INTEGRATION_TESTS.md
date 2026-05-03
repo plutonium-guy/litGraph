@@ -41,7 +41,11 @@ provider changes.
 
 ## Tested ✅
 
-30 live integration tests against DeepSeek pass as of iter 354.
+41 live integration tests against DeepSeek pass as of iter 355.
+5 cleanly skipped (`TokenBudgetChatModel`, `CostCappedChatModel`,
+`PiiScrubbingChatModel` not exposed on the Python surface today;
+`test_react_agent_with_python_wrapped_tools_blocked` documented
+limitation — see Tool-hooks note below).
 
 | Feature | Test file | Notes |
 |---|---|---|
@@ -49,14 +53,19 @@ provider changes.
 | `OpenAIChat.stream` | `test_chat_stream.py` (4 cases) | SSE → `delta` events + `done` event with usage |
 | Native tool calling via `ReactAgent` | `test_tool_calling.py` (2 cases) | full agent loop: tool_call → tool result → final |
 | `ReactAgent.stream` + `stream_tokens` | `test_react_stream.py` (2 cases) | iteration / final / token_delta events |
+| `TextReActAgent` + `PlanAndExecuteAgent` | `test_agent_variants.py` (2 cases) | transcript-mode + plan-step executor |
 | Structured output (`json_object` mode) | `test_structured_output.py` (2 cases) | DeepSeek requires "json" in prompt — see Gotchas |
 | `CostTracker` instrumentation | `test_cost_tracker.py` (3 cases) | per-call + per-model breakdown + USD helper |
 | `batch_chat` fan-out | `test_batch.py` (3 cases) | order preservation + concurrency = 1/3/4 |
 | `model.with_cache(...)` | `test_caching.py` (2 cases) | hit returns identical text; miss differs |
 | `model.with_retry()` / `with_rate_limit()` | `test_resilience.py` (3 cases) | wrappers compose; happy path passes through |
 | `StateGraph` with model node | `test_state_graph.py` (2 cases) | linear + parallel-branches both call DeepSeek |
-| `recipes.summarize` (map-reduce) | `test_recipes_live.py::test_summarize` | short text → 1 chunk → real summary |
-| `recipes.multi_agent` supervisor | `test_recipes_live.py::test_multi_agent_routes` | live routing decision |
+| `recipes.summarize` + `multi_agent` | `test_recipes_live.py` (2 cases) | end-to-end recipe drivers |
+| `recipes.eval` with DeepSeek as target | `test_eval_live.py` (2 cases) | per_case / aggregate report shape |
+| `@entrypoint` / `@task` functional API | `test_functional_api.py` (2 cases) | async workflow + 2-task combine |
+| `ChatPromptTemplate.from_messages` | `test_prompts_memory.py` (2 cases) | minijinja `{{ var }}` substitution |
+| `TokenBufferMemory` round-trip | `test_prompts_memory.py` (2 cases) | recall + clear |
+| `tool_hooks.{Before,After,ToolBudget,wrap_tool}` | `test_tool_hooks_live.py` (1 case) | hooks fire on a real-derived input |
 
 ---
 
@@ -147,6 +156,23 @@ on by default.
 - **`recipes.summarize._content_of`** was reading `content` (LangChain
   shape) but native litGraph providers return `text`. Fixed in
   iter 354 — now tolerates both keys.
+- **`ChatPromptTemplate` uses minijinja syntax (`{{ var }}`)**, not
+  Python str.format `{var}`. Tests that use the template must double
+  the braces.
+- **`TokenBufferMemory(max_tokens, counter)`** takes a counter
+  callable, not a `model_name` arg. Use a `lambda m: len(m["content"])
+  // 4` for rough estimates or a tiktoken counter for exactness.
+- **`@entrypoint` requires parens** — `@entrypoint()` (no args) wraps
+  an `async def` workflow into a `Workflow`; `@entrypoint` without
+  parens treats the function-or-anything as the first arg and
+  blows up. The wrapped function must be `async def`.
+- **Native `ReactAgent` rejects Python-side `HookedTool`** wrappers —
+  its `extract_tools` only accepts the registered Rust tool types
+  (FunctionTool, ShellTool, …). To attach middleware to the
+  agent loop, use the Rust `ToolMiddlewareChain`
+  (`litgraph_agents::middleware`) wired via `ReactAgentConfig.
+  tool_middleware`. The Python `tool_hooks.wrap_tools` API is for
+  manual / custom dispatchers outside the native loop.
 
 ## Failure triage
 
