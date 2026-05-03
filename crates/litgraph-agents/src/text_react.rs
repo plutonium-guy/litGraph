@@ -177,6 +177,11 @@ pub struct TextReactAgentConfig {
     /// tool catalog. If true (default), a default ReAct instruction is
     /// prepended derived from tool schemas.
     pub auto_format_instructions: bool,
+    /// Optional chain of [`crate::middleware::ToolMiddleware`] hooks
+    /// run around every tool dispatch in the ReAct trace. Default
+    /// empty (zero overhead — same fast path as before this field
+    /// was added). Mirror of `ReactAgentConfig::tool_middleware`.
+    pub tool_middleware: crate::middleware::ToolMiddlewareChain,
 }
 
 impl Default for TextReactAgentConfig {
@@ -186,6 +191,7 @@ impl Default for TextReactAgentConfig {
             system_prompt: None,
             chat_options: ChatOptions::default(),
             auto_format_instructions: true,
+            tool_middleware: crate::middleware::ToolMiddlewareChain::new(),
         }
     }
 }
@@ -290,16 +296,25 @@ impl TextReActAgent {
                 } => {
                     let tool_ref = self.tools.get(&tool);
                     let (observation, is_error) = match tool_ref {
-                        Some(t) => match t.run(input.clone()).await {
-                            Ok(v) => {
-                                let s = match &v {
-                                    serde_json::Value::String(s) => s.clone(),
-                                    _ => v.to_string(),
-                                };
-                                (s, false)
+                        Some(t) => {
+                            let mw = &self.config.tool_middleware;
+                            match mw.dispatch_before(&tool, &input) {
+                                Err(e) => (format!("tool error: {}", e.0), true),
+                                Ok(args) => match t.run(args.clone()).await {
+                                    Ok(v) => match mw.dispatch_after(&tool, &args, &v) {
+                                        Err(e) => (format!("tool error: {}", e.0), true),
+                                        Ok(final_v) => {
+                                            let s = match &final_v {
+                                                serde_json::Value::String(s) => s.clone(),
+                                                _ => final_v.to_string(),
+                                            };
+                                            (s, false)
+                                        }
+                                    },
+                                    Err(e) => (format!("tool error: {e}"), true),
+                                },
                             }
-                            Err(e) => (format!("tool error: {e}"), true),
-                        },
+                        }
                         None => {
                             let err = format!(
                                 "tool `{}` not found. Available: {}",
@@ -448,15 +463,22 @@ impl TextReActAgent {
                             input: input.clone(),
                         };
                         let started = std::time::Instant::now();
-                        let (observation, is_error) = match t.run(input).await {
-                            Ok(v) => {
-                                let s = match &v {
-                                    Value::String(s) => s.clone(),
-                                    _ => v.to_string(),
-                                };
-                                (s, false)
-                            }
-                            Err(e) => (format!("tool error: {e}"), true),
+                        let mw = &agent.config.tool_middleware;
+                        let (observation, is_error) = match mw.dispatch_before(&tool, &input) {
+                            Err(e) => (format!("tool error: {}", e.0), true),
+                            Ok(args) => match t.run(args.clone()).await {
+                                Ok(v) => match mw.dispatch_after(&tool, &args, &v) {
+                                    Ok(final_v) => {
+                                        let s = match &final_v {
+                                            Value::String(s) => s.clone(),
+                                            _ => final_v.to_string(),
+                                        };
+                                        (s, false)
+                                    }
+                                    Err(e) => (format!("tool error: {}", e.0), true),
+                                },
+                                Err(e) => (format!("tool error: {e}"), true),
+                            },
                         };
                         let duration_ms = started.elapsed().as_millis() as u64;
                         yield TextReactEvent::ToolResult {

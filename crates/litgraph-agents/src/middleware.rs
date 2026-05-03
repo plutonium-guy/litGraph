@@ -202,6 +202,62 @@ impl ToolMiddleware for ToolBudgetMiddleware {
     }
 }
 
+/// Wraps a child middleware and retries it up to `max_retries`
+/// times on `MiddlewareError`. Useful for upstream hooks whose
+/// failures are transient (token-refresh, rate-limit hint). Wraps
+/// both `before_tool` and `after_tool`.
+///
+/// Note: this only retries the *middleware*, not the underlying
+/// `tool.run()` call. The latter has its own retry primitives
+/// (`RetryingChatModel`, etc.) for chat-side retries.
+pub struct RetryOnMiddlewareErrorMiddleware<M: ToolMiddleware> {
+    inner: M,
+    max_retries: usize,
+}
+
+impl<M: ToolMiddleware> RetryOnMiddlewareErrorMiddleware<M> {
+    pub fn new(inner: M, max_retries: usize) -> Self {
+        Self { inner, max_retries }
+    }
+}
+
+impl<M: ToolMiddleware> ToolMiddleware for RetryOnMiddlewareErrorMiddleware<M> {
+    fn before_tool(
+        &self,
+        tool_name: &str,
+        args: &Value,
+    ) -> Result<Option<Value>, MiddlewareError> {
+        let mut last_err: Option<MiddlewareError> = None;
+        for _ in 0..=self.max_retries {
+            match self.inner.before_tool(tool_name, args) {
+                Ok(out) => return Ok(out),
+                Err(e) => last_err = Some(e),
+            }
+        }
+        Err(last_err.unwrap_or_else(|| MiddlewareError::new("retry exhausted")))
+    }
+
+    fn after_tool(
+        &self,
+        tool_name: &str,
+        args: &Value,
+        result: &Value,
+    ) -> Result<Option<Value>, MiddlewareError> {
+        let mut last_err: Option<MiddlewareError> = None;
+        for _ in 0..=self.max_retries {
+            match self.inner.after_tool(tool_name, args, result) {
+                Ok(out) => return Ok(out),
+                Err(e) => last_err = Some(e),
+            }
+        }
+        Err(last_err.unwrap_or_else(|| MiddlewareError::new("retry exhausted")))
+    }
+
+    fn name(&self) -> &str {
+        "RetryOnMiddlewareErrorMiddleware"
+    }
+}
+
 /// Logs every tool call's name + arg shape via `tracing::info!`.
 /// Useful as the bottom of a middleware stack (runs first, sees
 /// the unmodified args).
@@ -347,5 +403,56 @@ mod tests {
         let chain = ToolMiddlewareChain::new().push(Arc::new(Reject));
         let err = chain.dispatch_before("x", &json!({})).unwrap_err();
         assert_eq!(err.0, "nope");
+    }
+
+    #[test]
+    fn retry_middleware_succeeds_when_inner_succeeds() {
+        struct OkMw;
+        impl ToolMiddleware for OkMw {
+            fn before_tool(&self, _tn: &str, _args: &Value)
+                -> Result<Option<Value>, MiddlewareError> { Ok(None) }
+        }
+        let mw = RetryOnMiddlewareErrorMiddleware::new(OkMw, 3);
+        assert!(mw.before_tool("x", &json!({})).is_ok());
+    }
+
+    #[test]
+    fn retry_middleware_eventually_succeeds_after_transient_error() {
+        struct Flaky {
+            count: parking_lot::Mutex<usize>,
+            ok_after: usize,
+        }
+        impl ToolMiddleware for Flaky {
+            fn before_tool(&self, _tn: &str, _args: &Value)
+                -> Result<Option<Value>, MiddlewareError> {
+                let mut c = self.count.lock();
+                *c += 1;
+                if *c <= self.ok_after {
+                    Err(MiddlewareError::new("transient"))
+                } else {
+                    Ok(None)
+                }
+            }
+        }
+        let inner = Flaky {
+            count: parking_lot::Mutex::new(0),
+            ok_after: 2,
+        };
+        let mw = RetryOnMiddlewareErrorMiddleware::new(inner, 3);
+        assert!(mw.before_tool("x", &json!({})).is_ok());
+    }
+
+    #[test]
+    fn retry_middleware_exhausts_and_propagates_last_error() {
+        struct Always;
+        impl ToolMiddleware for Always {
+            fn before_tool(&self, _tn: &str, _args: &Value)
+                -> Result<Option<Value>, MiddlewareError> {
+                Err(MiddlewareError::new("perm"))
+            }
+        }
+        let mw = RetryOnMiddlewareErrorMiddleware::new(Always, 2);
+        let err = mw.before_tool("x", &json!({})).unwrap_err();
+        assert_eq!(err.0, "perm");
     }
 }

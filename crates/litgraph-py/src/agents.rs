@@ -1093,6 +1093,7 @@ impl PyTextReActAgent {
             system_prompt,
             chat_options: ChatOptions::default(),
             auto_format_instructions,
+            tool_middleware: litgraph_agents::middleware::ToolMiddlewareChain::new(),
         };
         let agent = TextReActAgent::new(chat_model, tool_vec, cfg);
         Ok(Self {
