@@ -14,7 +14,7 @@ model). The reasoning model `deepseek-reasoner` is exercised in the
 streaming + structured-output tests where its different finish
 semantics matter.
 
-**Snapshot date:** 2026-05-02 · iter 367.
+**Snapshot date:** 2026-05-02 · iter 368.
 
 ---
 
@@ -41,7 +41,7 @@ provider changes.
 
 ## Tested ✅
 
-94 live integration tests against DeepSeek pass as of iter 367.
+104 live integration tests against DeepSeek pass as of iter 368.
 10 cleanly skipped:
 - `TokenBudgetChatModel`, `CostCappedChatModel`, `PiiScrubbingChatModel`
   not exposed on the Python surface today (4 cases — the TokenBudget
@@ -105,6 +105,8 @@ provider changes.
 | `recipes.serve` stub command-renderer | `test_recipes_serve_stub.py` (3 cases) | accepts both StateGraph + CompiledGraph, rejects non-graphs (fixed a real bug — checker was looking for the wrong attrs) |
 | `evaluators.{exact_match,contains_any,jaccard_similarity,json_validity}` | `test_evaluators_string.py` (4 cases) | string-evaluator family runs against real DeepSeek output (paraphrase, list-of-landmarks, JSON-mode validity) |
 | `cache.MemoryCache` direct API | `test_cache_direct.py` (2 cases) | `with_cache` install + identical-call hit + distinct-call miss |
+| `evaluators.{regex_match,levenshtein_ratio,contains_all,PiiScrubber,evaluate_trajectory}` | `test_evaluators_more.py` (5 cases) | regex/edit-ratio matchers; PII scrub round-trip; trajectory subsequence score |
+| `parsers.{parse_react_step,parse_xml_tags,parse_markdown_list,parse_comma_list,parse_boolean}` | `test_parsers_more.py` (5 cases) | parse ReAct/XML/MD-list/comma-list/yes-no replies coaxed from real DeepSeek output |
 
 ---
 
