@@ -14,7 +14,7 @@ model). The reasoning model `deepseek-reasoner` is exercised in the
 streaming + structured-output tests where its different finish
 semantics matter.
 
-**Snapshot date:** 2026-05-02 · iter 356.
+**Snapshot date:** 2026-05-02 · iter 357.
 
 ---
 
@@ -41,7 +41,7 @@ provider changes.
 
 ## Tested ✅
 
-47 live integration tests against DeepSeek pass as of iter 356.
+56 live integration tests against DeepSeek pass as of iter 357.
 7 cleanly skipped (`TokenBudgetChatModel`, `CostCappedChatModel`,
 `PiiScrubbingChatModel` not exposed on the Python surface today;
 `test_react_agent_with_python_wrapped_tools_blocked` documented
@@ -70,6 +70,11 @@ DeepSeek rejects `response_format=json_schema` — see Gotchas).
 | `lcel.Pipe` composition | `test_lcel_pipe.py` (2 cases) | `Pipe(fn) \| model_call \| extract` runs end-to-end |
 | `MiddlewareChain` + `MiddlewareChat` via ReactAgent | `test_middleware_live.py` (2 cases) | `with_(SystemPromptMiddleware(...))` plugged into agent loop |
 | `parsers.parse_json_with_retry` + `fix_with_llm` | `test_parsers_live.py` (2 cases) | repairs malformed JSON via real DeepSeek round-trip |
+| Multi-tool `ReactAgent` selection | `test_react_multi_tool.py` (2 cases) | model picks between `add` / `subtract` correctly |
+| `StateGraph.add_conditional_edges` | `test_conditional_routing.py` (2 cases) | router callable driven by model classifier output |
+| `SupervisorAgent` worker routing | `test_supervisor_agent_live.py` (1 case) | supervisor delegates math → `math` worker |
+| `tool_dispatch_concurrent` | `test_tool_dispatch_concurrent.py` (2 cases) | parallel tool dispatch outside agent loop + per-call error sentinel |
+| `deep_agent.create_deep_agent` | `test_deep_agent_live.py` (2 cases) | factory with + without auto-injected Planning/VFS tools |
 
 ---
 
@@ -145,6 +150,12 @@ on by default.
   It is an opaque chat-protocol wrapper for use inside `ReactAgent`,
   `SupervisorAgent`, etc. Drive it through an agent — direct
   `wrapped.invoke(messages, ...)` raises `AttributeError`.
+- **`StateGraph.compile()` is single-shot per builder.** Calling
+  `.compile()` a second time on the same `StateGraph` raises
+  `RuntimeError: graph already compiled`. The returned `CompiledGraph`
+  IS reusable, so save it: `compiled = g.compile(); compiled.invoke(...)`
+  for each input. Don't call `g.compile()` inline inside the invoke
+  loop.
 - **`OpenAIChat.invoke` does NOT take `tools=` directly.** Tools
   flow through `ReactAgent` (the agent loop owns the
   `tool_calls` protocol). Don't try
