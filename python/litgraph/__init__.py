@@ -36,6 +36,15 @@ from .functional import entrypoint, task, Workflow  # noqa: E402
 from .coerce import coerce_one, coerce_stream  # noqa: E402
 from . import recipes  # noqa: E402,F401
 from . import testing  # noqa: E402,F401
+from . import tool_hooks  # noqa: E402,F401
+from . import streaming  # noqa: E402,F401
+from . import prompt_hub  # noqa: E402,F401
+# `*_extras` modules import optional third-party libs lazily (inside
+# methods), so importing the module itself is cheap. Adapter classes
+# are only constructed when the user opts in.
+from . import embeddings_extras  # noqa: E402,F401
+from . import providers_extras  # noqa: E402,F401
+from . import cache_extras  # noqa: E402,F401
 
 __all__.extend([
     "entrypoint",
@@ -45,4 +54,10 @@ __all__.extend([
     "coerce_stream",
     "recipes",
     "testing",
+    "tool_hooks",
+    "streaming",
+    "prompt_hub",
+    "embeddings_extras",
+    "providers_extras",
+    "cache_extras",
 ])

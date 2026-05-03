@@ -1,0 +1,13 @@
+"""LangChain-shaped event taxonomy on top of native litGraph streams."""
+from __future__ import annotations
+from typing import Any, AsyncIterable, AsyncIterator, Iterable, Iterator
+
+
+def stream_events(
+    stream: Iterable[Any], *, name: str = "litgraph", run_id: str | None = ...
+) -> Iterator[dict[str, Any]]: ...
+
+
+def astream_events(
+    stream: AsyncIterable[Any], *, name: str = "litgraph", run_id: str | None = ...
+) -> AsyncIterator[dict[str, Any]]: ...

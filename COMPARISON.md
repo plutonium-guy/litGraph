@@ -1,8 +1,8 @@
 # litGraph vs LangChain vs LangGraph — Feature Comparison
 
 Three-way side-by-side. Where litGraph wins, where LangChain / LangGraph
-win, where they're equivalent. Snapshot date: 2026-05-02
-(litGraph v0.1.1 · LangChain 0.3.x · LangGraph 0.4.x).
+win, where they're equivalent. Snapshot date: 2026-05-03
+(litGraph v0.1.2 · LangChain 0.3.x · LangGraph 0.4.x).
 
 **Legend:** ✅ shipped · ⏳ partial · ❌ missing · 🚫 won't do · 💰 paid /
 hosted only · 📦 via LangChain (LangGraph delegates) · 📦📦 via
@@ -92,7 +92,7 @@ already a function.
 | Feature | litGraph | LangChain | LangGraph |
 |---|---|---|---|
 | Token-level streaming | ✅ | ✅ | ✅ |
-| `astream_events` (typed event taxonomy) | ❌ (callback bus instead) | ✅ | ✅ |
+| `astream_events` (typed event taxonomy) | ✅ (`litgraph.streaming.astream_events` shim) | ✅ | ✅ |
 | Stream modes: `values`, `updates`, `messages`, `debug` | ⏳ (`values`+`updates`; `messages` via callback bus) | n/a | ✅ |
 | Multi-consumer broadcast | ✅ (`broadcast(stream, n)`) | ❌ | ❌ |
 | Race / first-wins between streams | ✅ (`race(streams)`) | ❌ | ❌ |
@@ -113,7 +113,7 @@ defines the typed event vocabulary that LangGraph inherits.
 | Postgres checkpointer | ✅ (deadpool-pooled) | ❌ | ✅ |
 | Redis checkpointer | ✅ (ZSET, O(log n) latest) | ❌ | ⏳ (community) |
 | Time-travel (resume from any checkpoint id) | ✅ | ❌ | ✅ |
-| Branch (fork a checkpoint) | ⏳ (manual: copy thread) | ❌ | ✅ (`branch()`) |
+| Branch (fork a checkpoint) | ✅ (`Checkpointer::fork_at`) | ❌ | ✅ (`branch()`) |
 | Per-thread state via `thread_id` | ✅ | ❌ | ✅ |
 | Resume registry across process restarts | ✅ | ❌ | ⏳ (cloud) |
 
@@ -156,9 +156,9 @@ back-compat.
 | Built-in: web fetch / Tavily / DuckDuckGo / webhook | ✅ | ✅ | 📦 |
 | Built-in: SQLite / virtual-fs / JSON-Patch / slugify | ✅ | ⏳ | 📦 |
 | Built-in: Whisper / TTS / DALL·E / Gmail send | ✅ | ⏳ (community) | 📦 |
-| `before_tool` / `after_tool` hooks | ❌ (planned) | ✅ (callbacks) | ✅ |
+| `before_tool` / `after_tool` hooks | ✅ (`litgraph.tool_hooks.{Before,After}ToolHook`) | ✅ (callbacks) | ✅ |
 | Streaming tool execution | 🚫 (offload pattern preferred) | ⏳ | ⏳ |
-| Tool call budget cap | ⏳ ($-cap, not call-count) | ❌ | ❌ |
+| Tool call budget cap | ✅ (`litgraph.tool_hooks.ToolBudget`) | ❌ | ❌ |
 | MCP tool adapter | ✅ | ⏳ | ✅ |
 | Total stock tool count | ~ 35 | 200+ (Community) | inherits LangChain |
 
@@ -313,7 +313,7 @@ deepest catalogue of legacy parsers.
 | Strict-undefined Jinja (catch typos) | ✅ (minijinja) | ⏳ | ⏳ |
 | from/to JSON · from/to dict | ✅ | ✅ | ✅ |
 | Compose: extend / `+` / concat | ✅ | ✅ | ✅ |
-| Hub (community-shared prompts) | ❌ | ✅ (LangChain Hub) | ✅ |
+| Hub (community-shared prompts) | ⏳ (`litgraph.prompt_hub` registry + `prompts/` folder seed) | ✅ (LangChain Hub) | ✅ |
 
 LangChain wins on the Hub ecosystem; litGraph wins on strict-Jinja
 catch-typos-at-render-time.
@@ -345,9 +345,9 @@ scattered across Core + Community; LangGraph delegates.
 |---|---|---|---|
 | In-memory cache | ✅ | ✅ | 📦 |
 | SQLite cache | ✅ | ✅ | 📦 |
-| Redis cache | ⏳ (via memory-redis) | ✅ | 📦 |
+| Redis cache | ✅ (`RedisCache`, `litgraph-cache::redis_backend`) | ✅ | 📦 |
 | Semantic cache (embedding similarity) | ✅ | ✅ | 📦 |
-| GPTCache adapter | ❌ | ✅ | 📦 |
+| GPTCache adapter | ✅ (`litgraph.cache_extras.GPTCacheAdapter`) | ✅ | 📦 |
 | Embedding cache (separate from model cache) | ✅ | ⏳ | ⏳ |
 | Composes (semantic → identity → model) | ✅ | ⏳ | ⏳ |
 
@@ -398,7 +398,7 @@ LangChain has no HITL — that's why LangGraph exists.
 | Cohere | ✅ | ✅ | 📦 |
 | Mistral | ⏳ (via OpenAI-compat) | ✅ (native) | 📦 |
 | Ollama / vLLM / Together / Groq / Fireworks / DeepSeek / xAI / LM Studio | ✅ (via OpenAI-compat) | ✅ (each native) | 📦 |
-| HuggingFace TGI · IBM watsonx · Databricks · Snowflake Cortex · Replicate · NVIDIA NIM | ❌ | ✅ (Community) | 📦 |
+| HuggingFace TGI · IBM watsonx · Databricks · Snowflake Cortex · Replicate · NVIDIA NIM | ✅ (`litgraph.providers_extras` one-liners) | ✅ (Community) | 📦 |
 | Local model via candle / mistral.rs | ❌ (planned) | ❌ | ❌ |
 | Total provider count | ~ 6 native + 8 OpenAI-compat | 50+ | inherits |
 
@@ -414,7 +414,7 @@ top-tier providers natively + everything OpenAI-compatible for free.
 | OpenAI · Cohere · Voyage · Jina | ✅ | ✅ | 📦 |
 | Bedrock · Gemini | ✅ | ✅ | 📦 |
 | FastEmbed (local ONNX) | ✅ | ✅ | 📦 |
-| HuggingFace Inference / Sentence-Transformers / Instructor / E5 / NVIDIA NIM | ❌ | ✅ | 📦 |
+| HuggingFace Inference / Sentence-Transformers / Instructor / E5 / NVIDIA NIM | ⏳ (`litgraph.embeddings_extras` adapters; ST + HF + NIM) | ✅ | 📦 |
 
 LangChain wins on integration breadth.
 
@@ -526,7 +526,7 @@ transitive deps; litGraph is ~ 13 MB.
 |---|---|---|---|
 | GitHub stars | ~ 100s (early) | 90 K+ | 12 K+ |
 | Production users | early adopters | thousands | hundreds |
-| Hub (shared prompts/agents) | ❌ | ✅ | ⏳ |
+| Hub (shared prompts/agents) | ⏳ (`prompts/` folder + `litgraph.prompt_hub`) | ✅ | ⏳ |
 | Tutorials / blog posts | small | enormous | growing |
 | Stack Overflow tag | ❌ | ✅ | ⏳ |
 | Hiring market familiarity | low | high | medium |
