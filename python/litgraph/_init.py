@@ -235,6 +235,169 @@ def test_mock_tool_records_calls():
 
 # Templates are dicts: relative-path → file content. Format strings
 # resolve against `{name, slug, template, description}`.
+_RAG_INIT = """\
+\"\"\"{name} — a RAG agent scaffolded by `litgraph init`.\"\"\"
+from __future__ import annotations
+
+from typing import Any
+
+
+SAMPLE_DOCS = [
+    {{"page_content": "The capital of France is Paris.", "metadata": {{"source": "geo"}}}},
+    {{"page_content": "Photosynthesis converts light into chemical energy.",
+     "metadata": {{"source": "bio"}}}},
+    {{"page_content": "TCP guarantees in-order delivery; UDP does not.",
+     "metadata": {{"source": "net"}}}},
+]
+
+
+def build_agent(model: Any, embeddings: Any, documents: Any = None) -> Any:
+    \"\"\"Build a RAG agent over `documents` (defaults to SAMPLE_DOCS).
+
+    Example with real providers:
+
+        from litgraph.providers import OpenAIChat
+        from litgraph.embeddings import OpenAIEmbeddings
+        from {slug} import build_agent
+
+        agent = build_agent(OpenAIChat(model="gpt-5"), OpenAIEmbeddings())
+        print(agent.invoke("What is photosynthesis?"))
+    \"\"\"
+    from litgraph.recipes import rag
+    docs = list(documents) if documents is not None else SAMPLE_DOCS
+    return rag(documents=docs, model=model, embeddings=embeddings)
+"""
+
+_RAG_MAIN = """\
+\"\"\"Hello-world entry point. Runs offline with mocks.
+
+Run:    python -m {slug}
+\"\"\"
+from litgraph.testing import MockChatModel, MockEmbeddings
+
+from {slug} import SAMPLE_DOCS, build_agent
+
+
+def main() -> None:
+    m = MockChatModel(replies=["The capital of France is Paris (per the context)."])
+    emb = MockEmbeddings(dim=8)
+    agent = build_agent(m, emb)
+    out = agent.invoke("What is the capital of France?")
+    print("answer:", out["answer"])
+    print("hits:", len(out["hits"]))
+
+
+if __name__ == "__main__":
+    main()
+"""
+
+_RAG_TEST = """\
+\"\"\"Tests for the {slug} RAG agent.\"\"\"
+from litgraph.testing import MockChatModel, MockEmbeddings
+
+from {slug} import SAMPLE_DOCS, build_agent
+
+
+def test_sample_docs_have_expected_shape():
+    assert len(SAMPLE_DOCS) >= 1
+    for d in SAMPLE_DOCS:
+        assert "page_content" in d
+
+
+def test_rag_agent_returns_answer_and_hits():
+    m = MockChatModel(replies=["mocked rag answer"])
+    emb = MockEmbeddings(dim=8)
+    agent = build_agent(m, emb)
+    out = agent.invoke("What is the capital of France?")
+    assert out["answer"] == "mocked rag answer"
+    assert isinstance(out["hits"], list)
+"""
+
+
+_EVAL_INIT = """\
+\"\"\"{name} — eval suite scaffolded by `litgraph init`.\"\"\"
+from __future__ import annotations
+
+from typing import Any, Callable, Sequence
+
+
+SAMPLE_CASES: list[dict[str, str]] = [
+    {{"input": "Capital of France?", "expected": "Paris"}},
+    {{"input": "Capital of Germany?", "expected": "Berlin"}},
+    {{"input": "Capital of Japan?", "expected": "Tokyo"}},
+]
+
+
+def run_eval(
+    target: Callable[[str], str],
+    cases: Sequence[dict[str, str]] = SAMPLE_CASES,
+) -> Any:
+    \"\"\"Run the eval against any target callable. Returns a report dict
+    with `per_case` + `aggregate.means` (exact_match, levenshtein).
+
+    Example:
+
+        from litgraph.providers import OpenAIChat
+        from {slug} import run_eval
+
+        m = OpenAIChat(model="gpt-5")
+        report = run_eval(lambda q: m.invoke([{{"role":"user","content":q}}])["content"])
+        print(report["aggregate"]["means"])
+    \"\"\"
+    from litgraph.recipes import eval as _eval
+    return _eval(target, cases)
+"""
+
+_EVAL_MAIN = """\
+\"\"\"Hello-world entry point. Runs offline with a MockChatModel.
+
+Run:    python -m {slug}
+\"\"\"
+from litgraph.testing import MockChatModel
+
+from {slug} import run_eval
+
+
+def main() -> None:
+    m = MockChatModel(replies=["Paris", "Berlin", "Tokyo"])
+
+    def predict(q: str) -> str:
+        return m.invoke([{{"role": "user", "content": q}}])["content"]
+
+    report = run_eval(predict)
+    print("=== aggregate ===")
+    for k, v in report["aggregate"]["means"].items():
+        print(f"  {{k}}: {{v:.3f}}")
+    print(f"  n_cases: {{report['aggregate']['n_cases']}}")
+
+
+if __name__ == "__main__":
+    main()
+"""
+
+_EVAL_TEST = """\
+\"\"\"Tests for the {slug} eval suite.\"\"\"
+from litgraph.testing import MockChatModel
+
+from {slug} import SAMPLE_CASES, run_eval
+
+
+def test_sample_cases_have_expected_shape():
+    for c in SAMPLE_CASES:
+        assert "input" in c
+        assert "expected" in c
+
+
+def test_run_eval_returns_aggregate():
+    m = MockChatModel(replies=["Paris", "Berlin", "Tokyo"])
+    report = run_eval(
+        lambda q: m.invoke([{{"role": "user", "content": q}}])["content"]
+    )
+    assert report["aggregate"]["n_cases"] == len(SAMPLE_CASES)
+    assert report["aggregate"]["means"]["exact_match"] == 1.0
+"""
+
+
 TEMPLATES: dict[str, dict[str, str]] = {
     "chat-agent": {
         "pyproject.toml": _PYPROJECT,
@@ -245,6 +408,26 @@ TEMPLATES: dict[str, dict[str, str]] = {
         "{slug}/__main__.py": _CHAT_AGENT_MAIN,
         "tests/__init__.py": "",
         "tests/test_agent.py": _CHAT_AGENT_TEST,
+    },
+    "rag": {
+        "pyproject.toml": _PYPROJECT,
+        ".env.example": _ENV_EXAMPLE,
+        "README.md": _README,
+        "AGENTS.md": _AGENTS_MD,
+        "{slug}/__init__.py": _RAG_INIT,
+        "{slug}/__main__.py": _RAG_MAIN,
+        "tests/__init__.py": "",
+        "tests/test_agent.py": _RAG_TEST,
+    },
+    "eval-suite": {
+        "pyproject.toml": _PYPROJECT,
+        ".env.example": _ENV_EXAMPLE,
+        "README.md": _README,
+        "AGENTS.md": _AGENTS_MD,
+        "{slug}/__init__.py": _EVAL_INIT,
+        "{slug}/__main__.py": _EVAL_MAIN,
+        "tests/__init__.py": "",
+        "tests/test_agent.py": _EVAL_TEST,
     },
 }
 

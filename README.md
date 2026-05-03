@@ -17,6 +17,7 @@ Hot paths (HTTP, SSE parsing, tokenization, vector math, graph scheduling, JSON 
 | [COMPARISON.md](COMPARISON.md) | litGraph vs LangChain vs LangGraph — feature-by-feature |
 | [AGENTS.md](AGENTS.md) | rules for AI coding agents working in this repo |
 | [AGENT_DX.md](AGENT_DX.md) | features that make Claude Code / Cursor / Cline build with litGraph easily |
+| [MIDDLEWARE.md](MIDDLEWARE.md) | tool-middleware story — Rust + Python sides + 6 built-ins |
 | [FEATURES.md](FEATURES.md) | what's done, with status legend |
 | [MISSING_FEATURES.md](MISSING_FEATURES.md) | gaps + nice-to-haves (next ~10 iters) |
 | [ROADMAP.md](ROADMAP.md) | long-form prioritisation rubric |

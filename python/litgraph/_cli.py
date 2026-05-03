@@ -27,6 +27,8 @@ commands:
                      Example: `litgraph show ReactAgent`.
   init <tmpl> <dir>  Scaffold a new project from a template
                      (chat-agent | rag | eval-suite).
+  add-tool <name>    Drop a tool stub into the current project.
+  add-node <name>    Drop a graph-node stub into the current project.
   help               Show this message.
 
 Examples:
@@ -171,12 +173,174 @@ def _cmd_init(argv: list[str]) -> int:
     return init_main(argv)
 
 
+def _cmd_add_tool(argv: list[str]) -> int:
+    """`litgraph add-tool <name> [target_dir]` — drop a tool stub +
+    test into the current project. Looks for the slug package under
+    `target_dir` (default cwd); creates `<slug>/tools/<name>.py` +
+    `tests/test_tool_<name>.py`."""
+    if not argv or argv[0] in ("-h", "--help"):
+        print("usage: litgraph add-tool <name> [target_dir]")
+        return 0
+    import os, re
+    name = argv[0]
+    target_dir = argv[1] if len(argv) > 1 else "."
+    if not re.match(r"^[a-z][a-z0-9_]*$", name):
+        print(
+            f"litgraph add-tool: name {name!r} must be lower_snake_case "
+            "(letters/digits/underscores, leading letter)",
+            file=sys.stderr,
+        )
+        return 2
+    # Find the slug package: the only top-level dir under target_dir
+    # that has __init__.py and isn't `tests`.
+    candidates = [
+        d for d in os.listdir(target_dir)
+        if os.path.isfile(os.path.join(target_dir, d, "__init__.py"))
+        and d != "tests"
+        and not d.startswith(".")
+    ]
+    if not candidates:
+        print(
+            f"litgraph add-tool: no Python package found under {target_dir!r}. "
+            "Run from a `litgraph init`-scaffolded project, or pass target_dir.",
+            file=sys.stderr,
+        )
+        return 1
+    slug = candidates[0]
+    tools_dir = os.path.join(target_dir, slug, "tools")
+    os.makedirs(tools_dir, exist_ok=True)
+    init_path = os.path.join(tools_dir, "__init__.py")
+    if not os.path.isfile(init_path):
+        with open(init_path, "w", encoding="utf-8") as f:
+            f.write('"""Tools package for this project."""\n')
+    tool_path = os.path.join(tools_dir, f"{name}.py")
+    if os.path.exists(tool_path):
+        print(
+            f"litgraph add-tool: {tool_path} already exists",
+            file=sys.stderr,
+        )
+        return 1
+    with open(tool_path, "w", encoding="utf-8") as f:
+        f.write(_render_tool_stub(name))
+    test_path = os.path.join(target_dir, "tests", f"test_tool_{name}.py")
+    os.makedirs(os.path.dirname(test_path), exist_ok=True)
+    if not os.path.isfile(test_path):
+        with open(test_path, "w", encoding="utf-8") as f:
+            f.write(_render_tool_test(slug, name))
+    print(f"litgraph add-tool: wrote {tool_path}")
+    print(f"                   wrote {test_path}")
+    return 0
+
+
+def _render_tool_stub(name: str) -> str:
+    return (
+        f'"""Tool: {name}."""\n'
+        f"from typing import Any\n\n\n"
+        f"def {name}(args: dict[str, Any]) -> dict[str, Any]:\n"
+        f'    """Implement me. Returns a JSON-serialisable result."""\n'
+        f'    return {{"echo": args}}\n\n\n'
+        f"def make_tool() -> Any:\n"
+        f'    """Build a `FunctionTool` for use with a litGraph agent."""\n'
+        f"    from litgraph.tools import FunctionTool\n"
+        f"    return FunctionTool(\n"
+        f'        "{name}",\n'
+        f'        "Describe what {name} does in one sentence.",\n'
+        f'        {{"type": "object", "properties": {{}}, "required": []}},\n'
+        f"        {name},\n"
+        f"    )\n"
+    )
+
+
+def _render_tool_test(slug: str, name: str) -> str:
+    return (
+        f'"""Tests for the {name} tool."""\n'
+        f"from {slug}.tools.{name} import {name}\n\n\n"
+        f"def test_{name}_returns_dict():\n"
+        f'    out = {name}({{"a": 1}})\n'
+        f"    assert isinstance(out, dict)\n"
+    )
+
+
+def _cmd_add_node(argv: list[str]) -> int:
+    """`litgraph add-node <name> [target_dir]` — drop a graph-node
+    stub + wiring snippet."""
+    if not argv or argv[0] in ("-h", "--help"):
+        print("usage: litgraph add-node <name> [target_dir]")
+        return 0
+    import os, re
+    name = argv[0]
+    target_dir = argv[1] if len(argv) > 1 else "."
+    if not re.match(r"^[a-z][a-z0-9_]*$", name):
+        print(
+            f"litgraph add-node: name {name!r} must be lower_snake_case",
+            file=sys.stderr,
+        )
+        return 2
+    candidates = [
+        d for d in os.listdir(target_dir)
+        if os.path.isfile(os.path.join(target_dir, d, "__init__.py"))
+        and d != "tests"
+        and not d.startswith(".")
+    ]
+    if not candidates:
+        print(
+            f"litgraph add-node: no Python package found under {target_dir!r}.",
+            file=sys.stderr,
+        )
+        return 1
+    slug = candidates[0]
+    nodes_dir = os.path.join(target_dir, slug, "nodes")
+    os.makedirs(nodes_dir, exist_ok=True)
+    init_path = os.path.join(nodes_dir, "__init__.py")
+    if not os.path.isfile(init_path):
+        with open(init_path, "w", encoding="utf-8") as f:
+            f.write('"""Graph nodes for this project."""\n')
+    node_path = os.path.join(nodes_dir, f"{name}.py")
+    if os.path.exists(node_path):
+        print(f"litgraph add-node: {node_path} already exists", file=sys.stderr)
+        return 1
+    with open(node_path, "w", encoding="utf-8") as f:
+        f.write(_render_node_stub(name))
+    test_path = os.path.join(target_dir, "tests", f"test_node_{name}.py")
+    os.makedirs(os.path.dirname(test_path), exist_ok=True)
+    if not os.path.isfile(test_path):
+        with open(test_path, "w", encoding="utf-8") as f:
+            f.write(_render_node_test(slug, name))
+    print(f"litgraph add-node: wrote {node_path}")
+    print(f"                   wrote {test_path}")
+    return 0
+
+
+def _render_node_stub(name: str) -> str:
+    return (
+        f'"""Graph node: {name}."""\n'
+        f"from typing import Any\n\n\n"
+        f"def {name}(state: dict[str, Any]) -> dict[str, Any]:\n"
+        f'    """Read from `state`, return a partial state delta. The\n'
+        f"    graph reducer merges the dict into the running state.\"\"\"\n"
+        f'    return {{"{name}_ran": True}}\n'
+    )
+
+
+def _render_node_test(slug: str, name: str) -> str:
+    return (
+        f'"""Tests for the {name} graph node."""\n'
+        f"from {slug}.nodes.{name} import {name}\n\n\n"
+        f"def test_{name}_returns_state_delta():\n"
+        f'    out = {name}({{"input": "hi"}})\n'
+        f"    assert isinstance(out, dict)\n"
+        f'    assert out.get("{name}_ran") is True\n'
+    )
+
+
 _DISPATCH = {
     "doctor": _cmd_doctor,
     "version": _cmd_version,
     "examples": _cmd_examples,
     "show": _cmd_show,
     "init": _cmd_init,
+    "add-tool": _cmd_add_tool,
+    "add-node": _cmd_add_node,
     "help": _cmd_help,
     "-h": _cmd_help,
     "--help": _cmd_help,
