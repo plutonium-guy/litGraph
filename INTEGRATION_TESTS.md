@@ -14,7 +14,7 @@ model). The reasoning model `deepseek-reasoner` is exercised in the
 streaming + structured-output tests where its different finish
 semantics matter.
 
-**Snapshot date:** 2026-05-02 · iter 370.
+**Snapshot date:** 2026-05-02 · iter 371.
 
 ---
 
@@ -41,7 +41,7 @@ provider changes.
 
 ## Tested ✅
 
-113 live integration tests against DeepSeek pass as of iter 370.
+118 live integration tests against DeepSeek pass as of iter 371.
 10 cleanly skipped:
 - `TokenBudgetChatModel`, `CostCappedChatModel`, `PiiScrubbingChatModel`
   not exposed on the Python surface today (4 cases — the TokenBudget
@@ -111,6 +111,8 @@ provider changes.
 | `tools.HttpRequestTool` via ReactAgent | `test_http_request_tool_live.py` (1 case, network-gated) | real GET to httpbin.org/uuid surfaces in agent reply (skips offline) |
 | `loaders.{TextLoader,JsonLoader,CsvLoader,MarkdownLoader}` | `test_loaders_live.py` (4 cases) | local-file ingestion with `content_field`/`content_column`, then summarise |
 | `loaders.DirectoryLoader` | `test_directory_loader.py` (1 case) | glob walk picks up multi-file tree |
+| `splitters.{CodeSplitter,JsonSplitter,TokenTextSplitter}` | `test_splitters_more.py` (3 cases) | code-boundary + recursive-JSON + token-budget chunking |
+| `testing.MockChatModel` shape parity | `test_mock_chat_model.py` (2 cases) | mock + cycle-replies match the live `invoke` shape protocol |
 
 ---
 
