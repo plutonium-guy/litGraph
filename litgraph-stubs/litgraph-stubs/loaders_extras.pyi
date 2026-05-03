@@ -1,6 +1,6 @@
 """Optional document-loader adapters (lazy imports)."""
 from __future__ import annotations
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 
 class ImapLoader:
@@ -105,6 +105,21 @@ class HuggingFaceDatasetsLoader:
         max_records: int = 1000,
         config_name: str | None = ...,
         streaming: bool = True,
+    ) -> None: ...
+    def load(self) -> list[dict[str, Any]]: ...
+
+
+class WhatsAppCloudLoader:
+    access_token: str | None
+    phone_number_id: str | None
+    messages_source: list[Mapping[str, Any]] | None
+    max_messages: int
+    def __init__(
+        self,
+        access_token: str | None = ...,
+        phone_number_id: str | None = ...,
+        messages_source: Iterable[Mapping[str, Any]] | None = ...,
+        max_messages: int = 200,
     ) -> None: ...
     def load(self) -> list[dict[str, Any]]: ...
 

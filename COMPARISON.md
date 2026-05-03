@@ -73,11 +73,11 @@ which is static fan-out only.
 
 | Feature | litGraph | LangChain | LangGraph |
 |---|---|---|---|
-| LCEL `|` operator chaining | ❌ (use graph nodes) | ✅ | ❌ (use graph nodes) |
-| `Runnable` interface | ❌ | ✅ | ✅ (StateGraph IS one) |
-| `RunnableParallel` | ⏳ (graph fan-out) | ✅ | ✅ |
-| `RunnableBranch` | ⏳ (conditional edges) | ✅ | ✅ |
-| `RunnableLambda` | ⏳ (a node IS a function) | ✅ | ✅ |
+| LCEL `|` operator chaining | ⏳ (compat shim `litgraph.lcel.Pipe`; explicit graphs are still primary) | ✅ | ❌ (use graph nodes) |
+| `Runnable` interface | ❌ (design call) | ✅ | ✅ (StateGraph IS one) |
+| `RunnableParallel` | ⏳ (`litgraph.compat.RunnableParallel` shim; graph fan-out preferred) | ✅ | ✅ |
+| `RunnableBranch` | ⏳ (`litgraph.compat.RunnableBranch` shim; conditional edges preferred) | ✅ | ✅ |
+| `RunnableLambda` | ⏳ (`litgraph.compat.RunnableLambda` shim; nodes ARE functions) | ✅ | ✅ |
 | `with_fallbacks` chain | ✅ (`FallbackChatModel`) | ✅ | ✅ |
 | Streaming chains | ✅ | ✅ | ✅ |
 
@@ -137,7 +137,7 @@ LangChain has no checkpointing — that's why LangGraph exists.
 | Swarm (handoff topology) | ✅ (`litgraph.agents_extras.SwarmAgent`) | ❌ | ✅ (`langgraph-swarm`) |
 | BigTool (large-scale tool selection) | ✅ (`litgraph.agents_extras.BigToolAgent`) | ❌ | ✅ (`langgraph-bigtool`) |
 | Deep agent factory (one-call wiring) | ✅ (`litgraph.agents.deep`) | ❌ | ✅ (`deepagents` pkg) |
-| Legacy `AgentExecutor` API | ❌ (skipped intentionally) | ✅ | ❌ |
+| Legacy `AgentExecutor` API | ⏳ (compat shim `litgraph.compat.AgentExecutor` for porting; modern `ReactAgent` preferred) | ✅ | ❌ |
 
 **Verdict:** litGraph has more research-backed patterns out of the box
 (debate, critique-revise, self-consistency); LangGraph has the swarm +
@@ -251,7 +251,7 @@ LangChain wins coverage; litGraph covers the production-relevant 6.
 | Confluence · Jira · Linear · Notion · Slack | ✅ | ✅ | 📦 |
 | GitHub (files + issues) · GitLab · Discord · Wikipedia | ✅ | ✅ | 📦 |
 | Gmail · Jupyter | ✅ | ✅ | 📦 |
-| Outlook · IMAP · WhatsApp · YouTube · Hugging Face · Airtable · Reddit · Twitter · … | ✅ (`litgraph.loaders_extras`: IMAP / Outlook / YouTube transcript / Reddit / Airtable / Twitter / HuggingFace datasets — WhatsApp Business still ❌) | ✅ (Community, ~150 total) | 📦 |
+| Outlook · IMAP · WhatsApp · YouTube · Hugging Face · Airtable · Reddit · Twitter · … | ✅ (`litgraph.loaders_extras`: IMAP / Outlook / YouTube / Reddit / Airtable / Twitter / HF Datasets / WhatsApp Cloud — all 8 named sources covered) | ✅ (Community, ~150 total) | 📦 |
 | **Parallel ingest** | ✅ (rayon, all loaders) | ⏳ (depends on loader) | 📦 |
 | Total stock loaders | ~ 25 | 150+ | inherits |
 

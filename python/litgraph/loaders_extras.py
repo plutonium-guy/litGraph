@@ -25,7 +25,7 @@ Example:
 from __future__ import annotations
 
 import os
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 
 __all__ = [
@@ -36,6 +36,7 @@ __all__ = [
     "OutlookLoader",
     "HuggingFaceDatasetsLoader",
     "TwitterLoader",
+    "WhatsAppCloudLoader",
 ]
 
 
@@ -591,4 +592,98 @@ class TwitterLoader:
                     retweets=metrics.get("retweet_count", 0),
                     likes=metrics.get("like_count", 0),
                 ))
+        return docs
+
+
+class WhatsAppCloudLoader:
+    """Pull conversation history from the WhatsApp Business Cloud API.
+
+    The Cloud API exposes message webhooks (push) — there's no read
+    endpoint for arbitrary chat history. This loader supports two
+    workflows:
+
+    1. **Webhook capture** (most common): your application stores
+       inbound messages somewhere durable (Postgres, S3); pass the
+       directory or URL via `messages_source` and this loader yields
+       Documents.
+    2. **Server-stored archives**: Meta's Cloud API exposes
+       `/{phone_number_id}/messages` for *outbound* / template-driven
+       messages and a media-fetch endpoint per message id. The
+       loader's `phone_number_id` + `access_token` mode pulls *those*
+       — see Meta's docs for the limits (no inbound history without
+       webhooks).
+
+    Args:
+        access_token: Cloud API permanent or system-user token.
+            Falls back to `WHATSAPP_CLOUD_TOKEN` env.
+        phone_number_id: phone-number id from the WhatsApp Manager.
+        messages_source: alternative — a list-of-dicts already
+            captured from your webhook (for batch ingest).
+        max_messages: cap.
+
+    Raises `ImportError` lazily when `requests` isn't installed.
+    """
+
+    def __init__(
+        self,
+        access_token: str | None = None,
+        phone_number_id: str | None = None,
+        messages_source: Iterable[Mapping[str, Any]] | None = None,
+        max_messages: int = 200,
+    ) -> None:
+        if max_messages <= 0:
+            raise ValueError("max_messages must be positive")
+        if messages_source is None and (access_token is None or phone_number_id is None):
+            self.access_token = os.environ.get("WHATSAPP_CLOUD_TOKEN") or access_token
+            if not self.access_token or not phone_number_id:
+                raise ValueError(
+                    "Provide either messages_source (webhook capture) "
+                    "or both access_token (env WHATSAPP_CLOUD_TOKEN) + phone_number_id."
+                )
+        self.access_token = access_token or os.environ.get("WHATSAPP_CLOUD_TOKEN")
+        self.phone_number_id = phone_number_id
+        self.messages_source = list(messages_source) if messages_source is not None else None
+        self.max_messages = max_messages
+
+    def load(self) -> list[dict[str, Any]]:
+        # Webhook-captured path — pure Python, no network.
+        if self.messages_source is not None:
+            return [
+                _doc(
+                    str(m.get("text", {}).get("body") if isinstance(m.get("text"), dict) else m.get("body", "")),
+                    source="whatsapp_cloud",
+                    message_id=m.get("id", ""),
+                    sender=m.get("from", ""),
+                    timestamp=m.get("timestamp", ""),
+                )
+                for m in self.messages_source[: self.max_messages]
+                if m.get("type") in (None, "text")
+            ]
+        # Cloud-API path — pulls outbound message records (Cloud API
+        # does NOT expose inbound chat history; capture via webhooks).
+        try:
+            import requests  # type: ignore[import-not-found]
+        except ImportError as e:
+            raise ImportError(
+                "requests not installed. Run `pip install requests`."
+            ) from e
+        url = f"https://graph.facebook.com/v20.0/{self.phone_number_id}/messages"
+        headers = {"Authorization": f"Bearer {self.access_token}"}
+        r = requests.get(url, headers=headers, params={"limit": self.max_messages}, timeout=30)
+        r.raise_for_status()
+        payload = r.json()
+        docs: list[dict[str, Any]] = []
+        for item in payload.get("data", [])[: self.max_messages]:
+            text = ""
+            if isinstance(item.get("text"), dict):
+                text = item["text"].get("body", "")
+            elif isinstance(item.get("body"), str):
+                text = item["body"]
+            docs.append(_doc(
+                text,
+                source="whatsapp_cloud",
+                message_id=item.get("id", ""),
+                direction=item.get("direction", "outbound"),
+                timestamp=item.get("timestamp", ""),
+            ))
         return docs

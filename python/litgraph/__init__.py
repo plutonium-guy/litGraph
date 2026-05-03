@@ -50,6 +50,8 @@ from . import splitters_extras  # noqa: E402,F401
 from . import memory_extras  # noqa: E402,F401
 from . import stores_extras  # noqa: E402,F401
 from . import agents_extras  # noqa: E402,F401
+from . import lcel  # noqa: E402,F401
+from . import compat  # noqa: E402,F401
 
 __all__.extend([
     "entrypoint",
@@ -70,4 +72,6 @@ __all__.extend([
     "memory_extras",
     "stores_extras",
     "agents_extras",
+    "lcel",
+    "compat",
 ])

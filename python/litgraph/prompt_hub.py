@@ -35,6 +35,8 @@ __all__ = [
     "list_prompts",
     "clear",
     "HUB_URL",
+    "fetch_from_url",
+    "load_directory",
 ]
 
 
@@ -118,3 +120,106 @@ def list_prompts() -> list[Prompt]:
 def clear() -> None:
     """Drop every registered prompt. Mostly for tests."""
     _REGISTRY.clear()
+
+
+def _parse_front_matter(src: str, name_hint: str = "") -> Prompt:
+    """Parse a YAML-front-matter prompt file (the format used by
+    `prompts/*.md`). Front matter is a `---`-delimited key:value
+    block; everything after is the template body."""
+    if src.startswith("---"):
+        try:
+            _, fm, body = src.split("---", 2)
+        except ValueError:
+            return Prompt(name=name_hint, template=src.strip())
+        meta: dict[str, str] = {}
+        for line in fm.strip().splitlines():
+            k, _, v = line.partition(":")
+            if k.strip():
+                meta[k.strip()] = v.strip().strip("'\"")
+        return Prompt(
+            name=meta.get("name", name_hint),
+            template=body.strip(),
+            tags=tuple(meta.get("tags", "").split()),
+            version=meta.get("version", "1"),
+            description=meta.get("description", ""),
+        )
+    return Prompt(name=name_hint, template=src.strip())
+
+
+def fetch_from_url(url: str, *, register_as: str | None = None) -> Prompt:
+    """Fetch a prompt from any HTTP(S) URL. The body may be:
+
+    - Plain text — registered as-is, name = `register_as` or the
+      URL's last path segment.
+    - YAML-front-matter Markdown (the `prompts/*.md` shape).
+    - A LangChain Hub JSON export (`{name, template, ...}`) — flat
+      fields are mapped to the Prompt dataclass.
+
+    Lazy-imports `requests`. Refuses overwrite by default
+    (matches `register`'s contract); pass `overwrite=True` via the
+    returned Prompt's `register_as` if you re-pull.
+
+    Example:
+
+        from litgraph.prompt_hub import fetch_from_url, get
+
+        fetch_from_url(
+            "https://raw.githubusercontent.com/plutonium-guy/litGraph/main/prompts/rag_qa.md",
+        )
+        print(get("rag_qa").template[:80])
+    """
+    try:
+        import requests  # type: ignore[import-not-found]
+    except ImportError as e:
+        raise ImportError(
+            "requests not installed. Run `pip install requests`."
+        ) from e
+    r = requests.get(url, timeout=15)
+    r.raise_for_status()
+    body = r.text
+    name = register_as or url.rsplit("/", 1)[-1].rsplit(".", 1)[0]
+    # JSON-shape (LangChain Hub export)?
+    import json as _json
+    if body.lstrip().startswith("{"):
+        try:
+            payload = _json.loads(body)
+            p = Prompt(
+                name=payload.get("name", name),
+                template=payload.get("template") or payload.get("prompt") or "",
+                tags=tuple(payload.get("tags", []) or ()),
+                version=str(payload.get("version", "1")),
+                description=payload.get("description", ""),
+            )
+            _REGISTRY[p.name] = p
+            return p
+        except (_json.JSONDecodeError, KeyError):
+            pass
+    p = _parse_front_matter(body, name_hint=name)
+    _REGISTRY[p.name] = p
+    return p
+
+
+def load_directory(path: str) -> list[Prompt]:
+    """Walk a directory of `*.md` prompts (front-matter shape) and
+    register every one. Returns the list of registered Prompts.
+    Useful for bootstrapping the registry from the bundled
+    `prompts/` folder.
+    """
+    import os
+    out: list[Prompt] = []
+    if not os.path.isdir(path):
+        raise FileNotFoundError(f"prompts directory not found: {path}")
+    for name in sorted(os.listdir(path)):
+        # Skip macOS AppleDouble sidecars + the README itself.
+        if name.startswith(".") or name.startswith("_") or name == "README.md":
+            continue
+        if not name.endswith(".md"):
+            continue
+        full = os.path.join(path, name)
+        with open(full, "r", encoding="utf-8") as f:
+            src = f.read()
+        stem = os.path.splitext(name)[0]
+        p = _parse_front_matter(src, name_hint=stem)
+        _REGISTRY[p.name] = p
+        out.append(p)
+    return out
