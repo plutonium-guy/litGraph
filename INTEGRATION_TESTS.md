@@ -14,7 +14,7 @@ model). The reasoning model `deepseek-reasoner` is exercised in the
 streaming + structured-output tests where its different finish
 semantics matter.
 
-**Snapshot date:** 2026-05-02 · iter 375.
+**Snapshot date:** 2026-05-02 · iter 376.
 
 ---
 
@@ -41,15 +41,11 @@ provider changes.
 
 ## Tested ✅
 
-125 live integration tests against DeepSeek pass as of iter 374.
-8 cleanly skipped:
-- `test_react_agent_with_python_wrapped_tools_blocked` — documented
-  Python `HookedTool` blocker (1 case).
+132 live integration tests against DeepSeek pass as of iter 376.
+6 cleanly skipped:
 - `LlmJudge` (2 cases) and `synthesize_eval_cases` (2 cases) — both
   use `StructuredChatModel` → `response_format=json_schema`, which
   DeepSeek does not support today. See Gotchas.
-- `broadcast_chat_stream` (1 case) — Python binding fix landed in
-  iter 360; re-enable after the next maturin build picks it up.
 - `agents_extras.BigToolAgent` (1 case) — needs an embeddings
   provider; DeepSeek has none.
 - `memory_extras.NamespacedMemory` (1 case) — needs a metadata-
@@ -73,7 +69,7 @@ provider changes.
 | `@entrypoint` / `@task` functional API | `test_functional_api.py` (2 cases) | async workflow + 2-task combine |
 | `ChatPromptTemplate.from_messages` | `test_prompts_memory.py` (2 cases) | minijinja `{{ var }}` substitution |
 | `TokenBufferMemory` round-trip | `test_prompts_memory.py` (2 cases) | recall + clear |
-| `tool_hooks.{Before,After,ToolBudget,wrap_tool}` | `test_tool_hooks_live.py` (1 case) | hooks fire on a real-derived input |
+| `tool_hooks.{Before,After,ToolBudget,wrap_tool}` | `test_tool_hooks_live.py` (2 cases) | standalone hooks + `HookedTool.to_function_tool(callable, schema=)` plugs into native ReactAgent (added iter 376) |
 | `lcel.Pipe` composition | `test_lcel_pipe.py` (2 cases) | `Pipe(fn) \| model_call \| extract` runs end-to-end |
 | `MiddlewareChain` + `MiddlewareChat` via ReactAgent | `test_middleware_live.py` (2 cases) | `with_(SystemPromptMiddleware(...))` plugged into agent loop |
 | `parsers.parse_json_with_retry` + `fix_with_llm` | `test_parsers_live.py` (2 cases) | repairs malformed JSON via real DeepSeek round-trip |
@@ -192,6 +188,14 @@ on by default.
   against DeepSeek. Workarounds: use `json_object` mode + manual
   validation, or use a provider that supports schema mode (OpenAI,
   Anthropic via tool-calls).
+- **`HookedTool.to_function_tool(callable, schema=, description=)`**
+  bridges the Python tool-hooks chain into the native `ReactAgent`
+  loop (added iter 376). The native agent's `extract_tools` rejects
+  Python wrappers, so the adapter builds a fresh native `FunctionTool`
+  whose body fires `before` → `python_callable(**args)` → `after`.
+  Caller MUST supply `python_callable` and `schema` explicitly when
+  the inner tool is a native `FunctionTool` — its body and schema
+  aren't reachable from Python.
 - **Per-call wrappers are exposed WITHOUT the `Model` suffix.** The
   Rust trait is `ChatModel`; the Python classes drop the suffix:
   `TokenBudgetChat`, `CostCappedChat`, `PiiScrubbingChat`,

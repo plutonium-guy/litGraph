@@ -157,6 +157,73 @@ class HookedTool:
     def __call__(self, args: Mapping[str, Any]) -> Any:
         return self.invoke(args)
 
+    def to_function_tool(
+        self,
+        python_callable: Any,
+        *,
+        schema: Mapping[str, Any] | None = None,
+        description: str | None = None,
+    ) -> Any:
+        """Return a native Rust `FunctionTool` whose callable fires the
+        Python before/after/budget hooks around `python_callable`. Use
+        this to plug a `HookedTool` into the native `ReactAgent` loop,
+        which only accepts registered Rust tool types via
+        `extract_tools`.
+
+        Why explicit `python_callable` + `schema` args? The wrapped
+        inner `tool` may be a native `FunctionTool`, which does NOT
+        expose `.invoke()`, `.schema`, or `.description` on the Python
+        surface — those live in Rust. To bridge into a freshly-built
+        `FunctionTool` for the agent loop, the caller passes the
+        underlying function and JSON schema directly.
+
+        The new tool's `name` defaults to this `HookedTool`'s name.
+        Hooks fire on every dispatch identically to a free-standing
+        `wrapped.invoke(...)` call.
+
+        ```python
+        from litgraph.tools import FunctionTool
+        from litgraph.tool_hooks import wrap_tool, BeforeToolHook
+
+        def add(a, b):
+            return {"sum": a + b}
+
+        schema = {"type":"object","properties":{"a":{"type":"integer"},
+                  "b":{"type":"integer"}},"required":["a","b"]}
+        inner = FunctionTool("add", "add two ints", schema, add)
+        hooked = wrap_tool(inner, before=BeforeToolHook(...))
+        agent_tool = hooked.to_function_tool(add, schema=schema,
+                                              description="add two ints")
+        ReactAgent(model, [agent_tool], ...)
+        ```
+        """
+        from litgraph.tools import FunctionTool  # late import — avoid cycle
+
+        before = self._before
+        after = self._after
+        budget = self._budget
+        name = self.name
+        effective_schema = schema or self.schema or {
+            "type": "object",
+            "properties": {},
+        }
+        effective_desc = description or self.description or ""
+
+        def _hooked(**kwargs: Any) -> Any:
+            if budget is not None:
+                budget.consume(name)
+            args = kwargs
+            if before is not None:
+                got = before(name, args)
+                if got is not None:
+                    args = got
+            result = python_callable(**args)
+            if after is not None:
+                result = after(name, args, result)
+            return result
+
+        return FunctionTool(name, effective_desc, effective_schema, _hooked)
+
 
 def wrap_tool(
     tool: Any,

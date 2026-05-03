@@ -38,8 +38,10 @@ def test_multiplex_chat_streams_two_labels(deepseek_chat):
     assert "ds-b" in labels
 
 
-@pytest.mark.skip(reason="BroadcastHandle.subscribe() — re-enable after maturin rebuild picks up iter-360 binding fix")
-def test_broadcast_chat_stream_two_subscribers(deepseek_chat):  # pragma: no cover
+def test_broadcast_chat_stream_two_subscribers(deepseek_chat):
+    """Fixed in iter 360 (binding) + iter 376 (rebuilt). `subscribe()`
+    now enters the bridge tokio runtime before spawning the upstream
+    pump, so calling from sync Python no longer panics."""
     from litgraph.agents import broadcast_chat_stream
 
     handle = broadcast_chat_stream(
@@ -53,5 +55,9 @@ def test_broadcast_chat_stream_two_subscribers(deepseek_chat):  # pragma: no cov
 
     a_events = list(sub_a)
     b_events = list(sub_b)
-    assert a_events and b_events
-    assert len(a_events) == len(b_events)
+    assert a_events, "subscriber A got no events"
+    assert b_events, "subscriber B got no events"
+    # Both subscribers should see the same number of events (fan-out).
+    assert len(a_events) == len(b_events), (
+        f"a={len(a_events)} != b={len(b_events)}"
+    )
