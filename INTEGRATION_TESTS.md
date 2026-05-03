@@ -14,7 +14,7 @@ model). The reasoning model `deepseek-reasoner` is exercised in the
 streaming + structured-output tests where its different finish
 semantics matter.
 
-**Snapshot date:** 2026-05-02 · iter 358.
+**Snapshot date:** 2026-05-02 · iter 359.
 
 ---
 
@@ -41,7 +41,7 @@ provider changes.
 
 ## Tested ✅
 
-60 live integration tests against DeepSeek pass as of iter 358.
+64 live integration tests against DeepSeek pass as of iter 359.
 9 cleanly skipped:
 - `TokenBudgetChatModel`, `CostCappedChatModel`, `PiiScrubbingChatModel`
   not exposed on the Python surface today (3 cases).
@@ -81,6 +81,10 @@ provider changes.
 | `tools.PythonReplTool` via ReactAgent | `test_python_repl_tool_live.py` (1 case) | sandboxed subprocess + agent loop computes `19*23*17 = 7429` |
 | `compat.{RunnableLambda,RunnableParallel}` | `test_compat_runnables.py` (2 cases) | LangChain shims compose with `Pipe` + a real model |
 | `streaming.stream_events` translator | `test_streaming_translator.py` (1 case) | LCEL-style `{event,name,run_id,data}` lifecycle records over real stream |
+| Built-in `CalculatorTool` via ReactAgent | `test_react_calculator.py` (1 case) | sandboxed math expression eval (no FunctionTool wrap needed) |
+| `PlanningTool` + `VirtualFilesystemTool` attach | `test_react_planning_vfs.py` (1 case) | both deep-agents primitives accepted by ReactAgent; `snapshot()` accessors |
+| `lcel.parallel(...)` over multiple steps | `test_lcel_parallel.py` (1 case) | result list aligned 1:1 with step order; mix model-call + pure fn |
+| `ReactAgent.max_iterations` cap | `test_react_max_iterations.py` (1 case) | agent terminates even if instructed to loop forever |
 
 ---
 
