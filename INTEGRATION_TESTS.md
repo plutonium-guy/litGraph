@@ -14,7 +14,7 @@ model). The reasoning model `deepseek-reasoner` is exercised in the
 streaming + structured-output tests where its different finish
 semantics matter.
 
-**Snapshot date:** 2026-05-02 · iter 372.
+**Snapshot date:** 2026-05-02 · iter 373.
 
 ---
 
@@ -41,8 +41,8 @@ provider changes.
 
 ## Tested ✅
 
-121 live integration tests against DeepSeek pass as of iter 372.
-12 cleanly skipped:
+122 live integration tests against DeepSeek pass as of iter 373.
+11 cleanly skipped:
 - `TokenBudgetChatModel`, `CostCappedChatModel`, `PiiScrubbingChatModel`
   not exposed on the Python surface today (4 cases — the TokenBudget
   wrapper has two cases).
@@ -53,8 +53,6 @@ provider changes.
   DeepSeek does not support today. See Gotchas.
 - `broadcast_chat_stream` (1 case) — Python binding fix landed in
   iter 360; re-enable after the next maturin build picks it up.
-- `agents_extras.SwarmAgent` (1 case) — list/str invoke contract
-  mismatch with `ReactAgent` (see Gotchas / Blocked).
 - `agents_extras.BigToolAgent` (1 case) — needs an embeddings
   provider; DeepSeek has none.
 
@@ -118,6 +116,7 @@ provider changes.
 | `splitters.{CodeSplitter,JsonSplitter,TokenTextSplitter}` | `test_splitters_more.py` (3 cases) | code-boundary + recursive-JSON + token-budget chunking |
 | `testing.MockChatModel` shape parity | `test_mock_chat_model.py` (2 cases) | mock + cycle-replies match the live `invoke` shape protocol |
 | `splitters.HtmlHeaderSplitter` + `tools.{DuckDuckGoSearchTool,WebFetchTool}` | `test_html_splitter_and_websearch.py` (3 cases) | HTML structure split + zero-key web search + URL→clean-text fetch |
+| `agents_extras.SwarmAgent` entry-agent invoke | `test_agents_extras_swarm.py` (1 case) | swarm delegates to entry ReactAgent (fixed in iter 372 — SwarmAgent now extracts latest user message into a str when inner agent is a native ReactAgent) |
 
 ---
 
@@ -142,7 +141,6 @@ Features deliberately not exercised against DeepSeek. Reason in each row.
 | **Free-threaded Python 3.13t** | Build matrix, not a per-call thing. Tested by running the full suite on 3.13t in CI. |
 | **Vision / multimodal** | DeepSeek-VL is a separate model + endpoint shape; current tests use `deepseek-chat` only. |
 | **Evaluator `LlmJudge` live** | Uses `StructuredChatModel` → `response_format=json_schema`. DeepSeek rejects schema-mode (`"This response_format type is unavailable now"`). Re-enable when DeepSeek adds it OR when `StructuredChatModel` falls back to `json_object` + post-validate. Test stubs are in `test_evaluators_llm_judge.py` (skipped). |
-| **`agents_extras.SwarmAgent` live** | SwarmAgent's invoke loop calls `agent.invoke(messages)` with a list-of-dicts, but `ReactAgent.invoke(user)` only accepts a string. Running raises `TypeError: argument 'user': 'list' object cannot be converted to 'PyString'`. Fix path: either SwarmAgent extracts the latest user content and passes the string, or ReactAgent.invoke gains list-input support. Test stub in `test_agents_extras_swarm.py` (skipped). |
 | **`agents_extras.BigToolAgent` live** | Requires an embeddings provider to score the tool catalogue. DeepSeek has no embeddings — gated on a separate provider key. Stub in `test_agents_extras_swarm.py`. |
 
 ---

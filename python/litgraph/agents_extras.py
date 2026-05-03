@@ -25,6 +25,23 @@ from typing import Any, Callable, Iterable, Mapping
 __all__ = ["SwarmAgent", "BigToolAgent", "Handoff"]
 
 
+def _expects_string_user(agent: Any) -> bool:
+    """Heuristic: is `agent.invoke` a method that takes a string `user`
+    arg? Native `ReactAgent` (PyO3 class) is the canonical case — its
+    invoke signature is `invoke(self, user)` and rejects list inputs.
+
+    We check the class qualified name; if it's one of the known native
+    agent types, return True. Custom Python dispatchers fall through
+    and receive the full message list."""
+    cls = agent.__class__
+    qual = f"{cls.__module__}.{cls.__name__}"
+    return qual in {
+        "litgraph.agents.ReactAgent",
+        "litgraph.agents.TextReActAgent",
+        "litgraph.agents.PlanAndExecuteAgent",
+    }
+
+
 @dataclass(frozen=True)
 class Handoff:
     """Marker returned from an agent's `invoke` to switch control to
@@ -94,7 +111,23 @@ class SwarmAgent:
         history: list[str] = [current]
         for _ in range(self.max_handoffs + 1):
             agent = self.agents[current]
-            result = agent.invoke(messages)
+            # Native `ReactAgent.invoke(user)` takes a string, not a
+            # list-of-messages. If the inner agent matches that shape,
+            # extract the latest user content; otherwise pass the full
+            # message list (custom dispatchers may want it).
+            invoke_arg: Any
+            if _expects_string_user(agent):
+                # Find the last user message and pass its content.
+                last_user = next(
+                    (m for m in reversed(messages) if m.get("role") == "user"),
+                    None,
+                )
+                invoke_arg = (
+                    last_user.get("content", "") if last_user is not None else ""
+                )
+            else:
+                invoke_arg = messages
+            result = agent.invoke(invoke_arg)
             # Native ReactAgent returns dict with `messages` key; update.
             new_msgs = result.get("messages") if isinstance(result, dict) else None
             if new_msgs:

@@ -31,18 +31,39 @@ def _add_tool():
     )
 
 
-@pytest.mark.skip(reason="SwarmAgent invokes inner agents with a list of messages but ReactAgent.invoke takes a str — contract mismatch; would need a shim agent or a fix in agents_extras.py")
-def test_swarm_agent_invoke_entry_agent(deepseek_chat):  # pragma: no cover
-    """`SwarmAgent` calls `agent.invoke(messages)` with a list, but
-    `ReactAgent.invoke(user)` only accepts a string. Running this
-    raises `TypeError: argument 'user': 'list' object cannot be
-    converted to 'PyString'`. Re-enable once either:
-    - SwarmAgent extracts the latest user message and passes the
-      string in, OR
-    - ReactAgent.invoke accepts both string AND list-of-messages.
+def test_swarm_agent_invoke_entry_agent(deepseek_chat):
+    """`SwarmAgent` delegates to its `entry` agent. Fixed in iter 372:
+    SwarmAgent now extracts the latest user message and passes a
+    string when the inner agent is a known native ReactAgent (which
+    only accepts `invoke(user: str)`)."""
+    from litgraph.agents import ReactAgent
+    from litgraph.agents_extras import SwarmAgent
 
-    Tracked via INTEGRATION_TESTS.md → Gotchas."""
-    pass
+    math_agent = ReactAgent(
+        deepseek_chat,
+        [_add_tool()],
+        system_prompt="You answer arithmetic. Use the add tool. Be terse.",
+        max_iterations=3,
+    )
+    chitchat = ReactAgent(
+        deepseek_chat,
+        [],
+        system_prompt="You handle non-math. Be terse.",
+        max_iterations=2,
+    )
+
+    swarm = SwarmAgent(
+        agents={"math": math_agent, "chitchat": chitchat},
+        entry="math",
+    )
+
+    out = swarm.invoke("What is 17 + 25?")
+    msgs = out["messages"] if isinstance(out, dict) else []
+    last = msgs[-1] if msgs else out
+    text = last.get("content", "") if isinstance(last, dict) else str(last)
+    if isinstance(text, list):
+        text = " ".join(p.get("text", "") for p in text if isinstance(p, dict))
+    assert "42" in (text or ""), f"swarm entry agent failed: {out!r}"
 
 
 @pytest.mark.skip(reason="BigToolAgent needs an embeddings provider; DeepSeek has none — covered when an embedding key is supplied")
