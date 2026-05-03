@@ -14,7 +14,7 @@ model). The reasoning model `deepseek-reasoner` is exercised in the
 streaming + structured-output tests where its different finish
 semantics matter.
 
-**Snapshot date:** 2026-05-02 · iter 368.
+**Snapshot date:** 2026-05-02 · iter 369.
 
 ---
 
@@ -41,7 +41,7 @@ provider changes.
 
 ## Tested ✅
 
-104 live integration tests against DeepSeek pass as of iter 368.
+108 live integration tests against DeepSeek pass as of iter 369.
 10 cleanly skipped:
 - `TokenBudgetChatModel`, `CostCappedChatModel`, `PiiScrubbingChatModel`
   not exposed on the Python surface today (4 cases — the TokenBudget
@@ -107,6 +107,8 @@ provider changes.
 | `cache.MemoryCache` direct API | `test_cache_direct.py` (2 cases) | `with_cache` install + identical-call hit + distinct-call miss |
 | `evaluators.{regex_match,levenshtein_ratio,contains_all,PiiScrubber,evaluate_trajectory}` | `test_evaluators_more.py` (5 cases) | regex/edit-ratio matchers; PII scrub round-trip; trajectory subsequence score |
 | `parsers.{parse_react_step,parse_xml_tags,parse_markdown_list,parse_comma_list,parse_boolean}` | `test_parsers_more.py` (5 cases) | parse ReAct/XML/MD-list/comma-list/yes-no replies coaxed from real DeepSeek output |
+| `splitters.{Recursive,MarkdownHeader}` + `tokenizers.{count_tokens,trim_messages}` | `test_splitters_tokenizers.py` (3 cases) | chunk a long doc + summarise; trim long history before invoke |
+| `tools.HttpRequestTool` via ReactAgent | `test_http_request_tool_live.py` (1 case, network-gated) | real GET to httpbin.org/uuid surfaces in agent reply (skips offline) |
 
 ---
 
