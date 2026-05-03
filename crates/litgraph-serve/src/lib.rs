@@ -64,7 +64,15 @@ use tracing::{debug, error};
 #[cfg(feature = "studio")]
 pub mod studio;
 
+pub mod auth;
 pub mod resume;
+
+#[cfg(feature = "ws")]
+pub mod ws;
+#[cfg(feature = "ws")]
+mod ws_compat;
+#[cfg(feature = "ws")]
+pub use ws::router_for_ws;
 
 /// Wraps the model + any per-instance config the handlers need. Cheap
 /// to clone (Arc inside).

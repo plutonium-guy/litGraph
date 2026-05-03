@@ -28,6 +28,10 @@ default = []
 # of any `Arc<dyn Checkpointer>`. Off by default so the serve crate
 # stays light when only /invoke + /stream are needed.
 studio = ["dep:litgraph-graph", "dep:base64"]
+# Mounts /ws (WebSocket) on top of the HTTP routes for full-duplex
+# streaming + client-driven cancellation. Off by default; pulls
+# axum's `ws` feature (tokio-tungstenite).
+ws = ["axum/ws"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "time"] }

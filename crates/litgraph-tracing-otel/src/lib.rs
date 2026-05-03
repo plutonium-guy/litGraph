@@ -39,6 +39,8 @@
 //!
 //! Explicit args to `init_otlp` override env vars.
 
+pub mod exemplars;
+
 use std::env;
 use std::time::Duration;
 

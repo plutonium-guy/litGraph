@@ -364,7 +364,7 @@ LangChain's cache backend catalogue is wider; litGraph composes cleaner.
 | `on_request` raw HTTP hook | ✅ | ❌ | ❌ |
 | OTel exporter (OTLP gRPC + HTTP) | ✅ | ⏳ (community) | ⏳ |
 | LangSmith integration | ⏳ (shim) | ✅ (first-class) | ✅ (first-class) |
-| Trace exemplars (link span ↔ prompt) | ❌ (planned) | ✅ (LangSmith) | ✅ |
+| Trace exemplars (link span ↔ prompt) | ✅ (`litgraph_tracing_otel::exemplars::attach_*`) | ✅ (LangSmith) | ✅ |
 | GraphEvent / NodeEvent stream | ✅ | n/a | ✅ |
 | Stdout / file logger out of the box | ✅ | ✅ | ✅ |
 
@@ -466,8 +466,8 @@ litGraph + LangGraph both ship first-class MCP; LangChain Core hasn't.
 | LangGraph Cloud-API compatible | ✅ (Studio router behind feature flag) | ❌ | ✅ (native) |
 | Managed cloud hosting | ❌ (self-host only) | 💰 (LangSmith deploy) | 💰 (LangGraph Cloud) |
 | Studio UI (visual debugger) | ⏳ (cloud-API surface; no local UI) | ⏳ (LangServe Playground) | ✅ |
-| Multi-tenant auth scaffolding | ❌ (planned) | ❌ | 💰 |
-| WebSocket endpoint | ❌ (SSE covers it) | ⏳ (LangServe) | ⏳ |
+| Multi-tenant auth scaffolding | ✅ (`litgraph_serve::auth::{bearer_layer,forwarded_user_layer}`) | ❌ | 💰 |
+| WebSocket endpoint | ✅ (`litgraph_serve::ws`, feature `ws`) | ⏳ (LangServe) | ⏳ |
 | Single binary deploy (no Python at edge) | ✅ (Rust binary) | ❌ | ❌ |
 
 LangGraph wins for managed deploy; litGraph wins for self-hosted
