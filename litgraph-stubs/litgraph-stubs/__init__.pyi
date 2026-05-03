@@ -1,5 +1,6 @@
 from . import (
     agents as agents,
+    agents_extras as agents_extras,
     cache as cache,
     cache_extras as cache_extras,
     deep_agent as deep_agent,

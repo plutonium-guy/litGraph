@@ -134,8 +134,8 @@ LangChain has no checkpointing — that's why LangGraph exists.
 | Critique-Revise (self-improvement) | ✅ (`CritiqueReviseAgent`) | ❌ | ❌ |
 | Self-Consistency (sample N → vote) | ✅ (`SelfConsistencyChatModel`) | ❌ | ❌ |
 | Subagent tool (delegate to another agent) | ✅ (`SubagentTool`) | ⏳ | ⏳ |
-| Swarm (handoff topology) | ❌ | ❌ | ✅ (`langgraph-swarm`) |
-| BigTool (large-scale tool selection) | ⏳ (RAG over tool descs, manual) | ❌ | ✅ (`langgraph-bigtool`) |
+| Swarm (handoff topology) | ✅ (`litgraph.agents_extras.SwarmAgent`) | ❌ | ✅ (`langgraph-swarm`) |
+| BigTool (large-scale tool selection) | ✅ (`litgraph.agents_extras.BigToolAgent`) | ❌ | ✅ (`langgraph-bigtool`) |
 | Deep agent factory (one-call wiring) | ✅ (`litgraph.agents.deep`) | ❌ | ✅ (`deepagents` pkg) |
 | Legacy `AgentExecutor` API | ❌ (skipped intentionally) | ✅ | ❌ |
 
@@ -178,7 +178,7 @@ LangChain Community: largest *catalogue* but spread across N packages.
 | Backend: SQLite | ✅ | ✅ | ⏳ |
 | Backend: Postgres | ✅ | ✅ | ✅ |
 | Backend: Redis | ✅ | ✅ | ⏳ |
-| Backend: DynamoDB / MongoDB / Cassandra / … | ❌ | ✅ (Community) | 📦📦 |
+| Backend: DynamoDB / MongoDB / Cassandra / … | ⏳ (`litgraph.memory_extras.{DynamoDB,Mongo}ChatMemory`; Cassandra still ❌) | ✅ (Community) | 📦📦 |
 | Hierarchical / namespaced memory | ✅ (`litgraph.memory_extras.NamespacedMemory`) | ⏳ | ✅ |
 | Vector-backed long-term memory | ✅ (postgres + sqlite) | ✅ | ✅ |
 
@@ -230,11 +230,11 @@ LangGraph inherits LangChain's wrappers wholesale.
 | Weaviate | ✅ | ✅ | 📦 |
 | LanceDB | 🚫 | ✅ | 📦 |
 | Pinecone | 🚫 | ✅ | 📦 |
-| Milvus | ❌ | ✅ | 📦 |
-| Redis-search | ❌ | ✅ | 📦 |
-| Neo4j (vector) | ❌ | ✅ | 📦 |
-| MongoDB Atlas Vector | ❌ | ✅ | 📦 |
-| Total | 6 | 80+ | inherits |
+| Milvus | ✅ (`litgraph.stores_extras.MilvusVectorStore`) | ✅ | 📦 |
+| Redis-search | ✅ (`litgraph.stores_extras.RedisSearchVectorStore`) | ✅ | 📦 |
+| Neo4j (vector) | ✅ (`litgraph.stores_extras.Neo4jVectorStore`) | ✅ | 📦 |
+| MongoDB Atlas Vector | ✅ (`litgraph.stores_extras.MongoAtlasVectorStore`) | ✅ | 📦 |
+| Total | 6 native + 5 via `stores_extras` (FAISS / Milvus / Redis-search / Neo4j / Mongo Atlas) | 80+ | inherits |
 
 LangChain wins coverage; litGraph covers the production-relevant 6.
 

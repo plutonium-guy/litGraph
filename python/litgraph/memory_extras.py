@@ -30,7 +30,12 @@ from __future__ import annotations
 from typing import Any, Iterable, Mapping
 
 
-__all__ = ["NamespacedMemory", "NS_KEY"]
+__all__ = [
+    "NamespacedMemory",
+    "NS_KEY",
+    "DynamoDBChatMemory",
+    "MongoChatMemory",
+]
 
 
 NS_KEY = "__litgraph_ns__"
@@ -157,3 +162,192 @@ class NamespacedMemory:
 
     def __repr__(self) -> str:
         return f"NamespacedMemory(ns={self._ns!r}, inner={type(self._inner).__name__})"
+
+
+# ---- DynamoDB chat-history backend ----
+
+
+class DynamoDBChatMemory:
+    """Persistent chat history in a DynamoDB table.
+
+    Lazy-imports `boto3`; install with `pip install boto3`.
+
+    Schema: partition key `session_id` (string), sort key `ts` (number,
+    epoch micros). All messages for a session are written / read in
+    sort-key order; range query gives full history.
+
+    Args:
+        table_name: existing DynamoDB table.
+        session_id: chat session identifier.
+        region_name: AWS region.
+        endpoint_url: optional override (e.g. local DynamoDB).
+    """
+
+    def __init__(
+        self,
+        table_name: str,
+        session_id: str,
+        region_name: str | None = None,
+        endpoint_url: str | None = None,
+    ) -> None:
+        try:
+            import boto3  # type: ignore[import-not-found]
+        except ImportError as e:
+            raise ImportError(
+                "boto3 not installed. Run `pip install boto3`."
+            ) from e
+        if not session_id:
+            raise ValueError("session_id required")
+        self.table_name = table_name
+        self.session_id = session_id
+        self._table = boto3.resource(
+            "dynamodb",
+            region_name=region_name,
+            endpoint_url=endpoint_url,
+        ).Table(table_name)
+        self._system_pin: Mapping[str, Any] | None = None
+
+    def _now_us(self) -> int:
+        import time
+        return int(time.time() * 1_000_000)
+
+    def _put(self, role: str, text: str, metadata: Mapping[str, Any] | None = None) -> None:
+        item: dict[str, Any] = {
+            "session_id": self.session_id,
+            "ts": self._now_us(),
+            "role": role,
+            "content": text,
+        }
+        if metadata:
+            item["metadata"] = dict(metadata)
+        self._table.put_item(Item=item)
+
+    def add_user(self, text: str, metadata: Mapping[str, Any] | None = None) -> None:
+        self._put("user", text, metadata)
+
+    def add_ai(self, text: str, metadata: Mapping[str, Any] | None = None) -> None:
+        self._put("assistant", text, metadata)
+
+    def add_tool(self, text: str, metadata: Mapping[str, Any] | None = None) -> None:
+        self._put("tool", text, metadata)
+
+    def set_system(self, message: Mapping[str, Any] | str | None) -> None:
+        if isinstance(message, str):
+            self._system_pin = {"role": "system", "content": message}
+        else:
+            self._system_pin = dict(message) if message is not None else None
+
+    def messages(self) -> list[Mapping[str, Any]]:
+        resp = self._table.query(
+            KeyConditionExpression="session_id = :sid",
+            ExpressionAttributeValues={":sid": self.session_id},
+            ScanIndexForward=True,
+        )
+        out: list[Mapping[str, Any]] = []
+        if self._system_pin is not None:
+            out.append(self._system_pin)
+        for item in resp.get("Items", []):
+            out.append({
+                "role": item.get("role", "user"),
+                "content": item.get("content", ""),
+                "metadata": item.get("metadata", {}),
+            })
+        return out
+
+    def clear(self) -> None:
+        # Range-delete: query, batch-delete the keys.
+        resp = self._table.query(
+            KeyConditionExpression="session_id = :sid",
+            ExpressionAttributeValues={":sid": self.session_id},
+        )
+        with self._table.batch_writer() as batch:
+            for item in resp.get("Items", []):
+                batch.delete_item(Key={"session_id": item["session_id"], "ts": item["ts"]})
+        self._system_pin = None
+
+
+# ---- MongoDB chat-history backend ----
+
+
+class MongoChatMemory:
+    """Persistent chat history in a MongoDB collection. Uses
+    `(session_id, ts)` as the natural key; one document per turn.
+
+    Lazy-imports `pymongo`; install with `pip install pymongo`.
+
+    Args:
+        uri: MongoDB connection string (or `MONGODB_URI` env).
+        database: database name.
+        collection_name: collection name.
+        session_id: chat session id.
+    """
+
+    def __init__(
+        self,
+        session_id: str,
+        uri: str | None = None,
+        database: str = "litgraph",
+        collection_name: str = "chat_messages",
+    ) -> None:
+        try:
+            from pymongo import ASCENDING, MongoClient  # type: ignore[import-not-found]
+        except ImportError as e:
+            raise ImportError(
+                "pymongo not installed. Run `pip install pymongo`."
+            ) from e
+        import os as _os
+        connection = uri or _os.environ.get("MONGODB_URI")
+        if not connection:
+            raise ValueError("MongoDB URI required (env MONGODB_URI)")
+        if not session_id:
+            raise ValueError("session_id required")
+        self.session_id = session_id
+        self._client = MongoClient(connection)
+        self._coll = self._client[database][collection_name]
+        # Idempotent compound index for fast per-session range read.
+        self._coll.create_index([("session_id", ASCENDING), ("ts", ASCENDING)])
+        self._system_pin: Mapping[str, Any] | None = None
+
+    def _now_us(self) -> int:
+        import time
+        return int(time.time() * 1_000_000)
+
+    def _put(self, role: str, text: str, metadata: Mapping[str, Any] | None = None) -> None:
+        self._coll.insert_one({
+            "session_id": self.session_id,
+            "ts": self._now_us(),
+            "role": role,
+            "content": text,
+            "metadata": dict(metadata or {}),
+        })
+
+    def add_user(self, text: str, metadata: Mapping[str, Any] | None = None) -> None:
+        self._put("user", text, metadata)
+
+    def add_ai(self, text: str, metadata: Mapping[str, Any] | None = None) -> None:
+        self._put("assistant", text, metadata)
+
+    def add_tool(self, text: str, metadata: Mapping[str, Any] | None = None) -> None:
+        self._put("tool", text, metadata)
+
+    def set_system(self, message: Mapping[str, Any] | str | None) -> None:
+        if isinstance(message, str):
+            self._system_pin = {"role": "system", "content": message}
+        else:
+            self._system_pin = dict(message) if message is not None else None
+
+    def messages(self) -> list[Mapping[str, Any]]:
+        out: list[Mapping[str, Any]] = []
+        if self._system_pin is not None:
+            out.append(self._system_pin)
+        for doc in self._coll.find({"session_id": self.session_id}).sort("ts", 1):
+            out.append({
+                "role": doc.get("role", "user"),
+                "content": doc.get("content", ""),
+                "metadata": doc.get("metadata", {}),
+            })
+        return out
+
+    def clear(self) -> None:
+        self._coll.delete_many({"session_id": self.session_id})
+        self._system_pin = None

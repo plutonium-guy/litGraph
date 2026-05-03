@@ -49,6 +49,7 @@ from . import loaders_extras  # noqa: E402,F401
 from . import splitters_extras  # noqa: E402,F401
 from . import memory_extras  # noqa: E402,F401
 from . import stores_extras  # noqa: E402,F401
+from . import agents_extras  # noqa: E402,F401
 
 __all__.extend([
     "entrypoint",
@@ -68,4 +69,5 @@ __all__.extend([
     "splitters_extras",
     "memory_extras",
     "stores_extras",
+    "agents_extras",
 ])
