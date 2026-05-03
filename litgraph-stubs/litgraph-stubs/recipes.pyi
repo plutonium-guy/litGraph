@@ -33,3 +33,14 @@ def multi_agent(
     supervisor_model: Any,
     system_prompt: str | None = ...,
 ) -> Any: ...
+
+
+def summarize(
+    text: str,
+    *,
+    model: Any,
+    chunk_size: int = 4000,
+    chunk_overlap: int = 200,
+    map_prompt: str | None = ...,
+    reduce_prompt: str | None = ...,
+) -> dict[str, Any]: ...

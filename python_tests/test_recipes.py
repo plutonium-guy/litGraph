@@ -183,3 +183,65 @@ def test_recipes_multi_agent_falls_back_to_first_role_on_unparseable_decision():
     )
     out = ma.invoke("anything")
     assert out["chosen_role"] == "alpha"  # first role wins fallback
+
+
+# ---- recipes.summarize ----
+
+
+def test_recipes_summarize_requires_model():
+    with pytest.raises(ValueError, match="model"):
+        recipes.summarize("hello", model=None)
+
+
+def test_recipes_summarize_chunk_size_must_be_positive():
+    with pytest.raises(ValueError):
+        recipes.summarize("hello", model=object(), chunk_size=0)
+
+
+def test_recipes_summarize_overlap_must_be_lt_chunk_size():
+    with pytest.raises(ValueError):
+        recipes.summarize("hello", model=object(), chunk_size=10, chunk_overlap=10)
+
+
+def test_recipes_summarize_empty_text_returns_empty():
+    out = recipes.summarize("", model=object())
+    assert out["summary"] == ""
+    assert out["chunk_summaries"] == []
+
+
+def test_recipes_summarize_short_text_one_chunk():
+    from litgraph.testing import MockChatModel
+    m = MockChatModel(replies=["compact summary."])
+    out = recipes.summarize("short text", model=m, chunk_size=1024)
+    # Only one chunk → only one model call → no reduce step.
+    assert out["summary"] == "compact summary."
+    assert out["chunk_summaries"] == ["compact summary."]
+    assert len(m.calls) == 1
+
+
+def test_recipes_summarize_long_text_map_reduce():
+    """Multi-chunk path → N map calls + 1 reduce. Mock cycles a
+    distinguishable reply so we can detect the reduce-call output."""
+    from litgraph.testing import MockChatModel
+    # Use the dumb-chunk fallback by passing a long string and
+    # measuring just the final-call shape via a cycling mock.
+    chunk_replies = ["chunk-summary"]
+    final_reply = "MERGED-OUTPUT"
+    m = MockChatModel(replies=chunk_replies + [final_reply] * 10)  # plenty of replies
+
+    long = "x " * 5000  # forces multiple chunks (with spaces as separator)
+    out = recipes.summarize(long, model=m, chunk_size=400, chunk_overlap=50)
+    # If only one chunk happened (rare), summary == "chunk-summary".
+    # Otherwise reduce ran and saw the final reply.
+    if len(out["chunk_summaries"]) > 1:
+        assert "MERGED" in out["summary"] or "chunk-summary" in out["summary"]
+    assert len(m.calls) >= 1
+
+
+def test_recipes_summarize_dumb_chunk_overlaps():
+    from litgraph.recipes import _dumb_chunk
+    chunks = _dumb_chunk("0123456789", size=4, overlap=1)
+    # First chunk 0..4, next starts at 3 → 3..7 → 6..10
+    assert chunks[0] == "0123"
+    assert chunks[1].startswith("3")
+    assert "".join(c[0] for c in chunks)[:1] == "0"

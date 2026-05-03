@@ -30,6 +30,7 @@ __all__ = [
     "serve",
     "rag",
     "multi_agent",
+    "summarize",
 ]
 
 
@@ -299,3 +300,122 @@ class _SupervisorAgent:
         worker = self.workers[chosen]
         result = worker.invoke(query)
         return {"chosen_role": chosen, "result": result}
+
+
+# ---- One-call map-reduce summariser ----
+
+
+def summarize(
+    text: str,
+    *,
+    model: Any,
+    chunk_size: int = 4_000,
+    chunk_overlap: int = 200,
+    map_prompt: str | None = None,
+    reduce_prompt: str | None = None,
+) -> dict[str, Any]:
+    """Map-reduce summarise a long document.
+
+    Splits `text` into overlapping chunks, summarises each chunk
+    independently (map), then summarises the concatenated chunk
+    summaries (reduce). For documents that fit in the model's context
+    window this is overkill — `summarize` exists for the long-doc
+    case where one-shot summarisation truncates input.
+
+    Args:
+        text: source document.
+        model: any litGraph ChatModel.
+        chunk_size: max bytes per chunk before splitting.
+        chunk_overlap: bytes of overlap between adjacent chunks (helps
+            preserve cross-chunk references).
+        map_prompt: override the per-chunk system prompt.
+        reduce_prompt: override the final-merge system prompt.
+
+    Returns: `{summary: str, chunk_summaries: list[str]}`.
+
+    Example:
+
+        from litgraph.providers import OpenAIChat
+        from litgraph.recipes import summarize
+
+        text = open("long.md").read()
+        result = summarize(text, model=OpenAIChat(model="gpt-5"))
+        print(result["summary"])
+    """
+    if not text or not text.strip():
+        return {"summary": "", "chunk_summaries": []}
+    if model is None:
+        raise ValueError("summarize(model=...) is required")
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be positive")
+    if chunk_overlap < 0 or chunk_overlap >= chunk_size:
+        raise ValueError("chunk_overlap must be in [0, chunk_size)")
+
+    # Lazy-import the native splitter; recipes are importable on a
+    # build without the .so but `summarize` itself needs it.
+    try:
+        from litgraph.splitters import RecursiveCharacterSplitter  # type: ignore[attr-defined]
+    except (ImportError, AttributeError):
+        # Fallback: dumb byte-window split. Good enough when the
+        # native module isn't loaded (tests use this path).
+        chunks = _dumb_chunk(text, chunk_size, chunk_overlap)
+    else:
+        sp = RecursiveCharacterSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+        chunks = sp.split_text(text) if hasattr(sp, "split_text") else _dumb_chunk(text, chunk_size, chunk_overlap)
+
+    map_sys = map_prompt or (
+        "Summarise the following passage in 2-3 sentences. "
+        "Preserve named entities, numbers, and dates. No fluff."
+    )
+    reduce_sys = reduce_prompt or (
+        "You'll receive a sequence of summaries from contiguous "
+        "passages of one document. Merge them into a single coherent "
+        "summary, ~5-8 sentences. Preserve key entities + numbers."
+    )
+
+    chunk_summaries: list[str] = []
+    for i, chunk in enumerate(chunks):
+        msgs = [
+            {"role": "system", "content": map_sys},
+            {"role": "user", "content": f"Passage {i+1}/{len(chunks)}:\n\n{chunk}"},
+        ]
+        resp = model.invoke(msgs)
+        chunk_summaries.append(_content_of(resp))
+
+    if len(chunk_summaries) == 1:
+        return {"summary": chunk_summaries[0], "chunk_summaries": chunk_summaries}
+
+    joined = "\n\n".join(f"[{i+1}] {s}" for i, s in enumerate(chunk_summaries))
+    final_msgs = [
+        {"role": "system", "content": reduce_sys},
+        {"role": "user", "content": joined},
+    ]
+    final_resp = model.invoke(final_msgs)
+    return {
+        "summary": _content_of(final_resp),
+        "chunk_summaries": chunk_summaries,
+    }
+
+
+def _content_of(resp: Any) -> str:
+    if isinstance(resp, dict):
+        return str(resp.get("content", ""))
+    if hasattr(resp, "content"):
+        return str(getattr(resp, "content"))
+    return str(resp)
+
+
+def _dumb_chunk(text: str, size: int, overlap: int) -> list[str]:
+    """Pure-Python overlapping window splitter. Used as fallback when
+    the native splitter isn't importable (test mode)."""
+    if not text:
+        return []
+    out: list[str] = []
+    pos = 0
+    while pos < len(text):
+        end = min(pos + size, len(text))
+        out.append(text[pos:end])
+        if end >= len(text):
+            break
+        pos = end - overlap
+    return out
