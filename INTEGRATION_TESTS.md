@@ -14,7 +14,7 @@ model). The reasoning model `deepseek-reasoner` is exercised in the
 streaming + structured-output tests where its different finish
 semantics matter.
 
-**Snapshot date:** 2026-05-02 · iter 360.
+**Snapshot date:** 2026-05-02 · iter 361.
 
 ---
 
@@ -41,7 +41,7 @@ provider changes.
 
 ## Tested ✅
 
-67 live integration tests against DeepSeek pass as of iter 360.
+74 live integration tests against DeepSeek pass as of iter 361.
 10 cleanly skipped:
 - `TokenBudgetChatModel`, `CostCappedChatModel`, `PiiScrubbingChatModel`
   not exposed on the Python surface today (4 cases — the TokenBudget
@@ -91,6 +91,9 @@ provider changes.
 | `multiplex_chat_streams` fan-in | `test_broadcast_multiplex.py` (1 case) | two-label tagged stream interleaved (broadcast variant skipped) |
 | `compat.AgentExecutor` LangChain shim | `test_compat_agent_executor.py` (1 case) | `agent.llm + tools` constructor maps to ReactAgent loop |
 | `ReactAgent.stream` lifecycle | `test_react_agent_event_stream.py` (1 case) | iterator yields iteration→final without stream_tokens=True |
+| Chat-options shaping (`temperature`, `max_tokens`) | `test_chat_options.py` (2 cases) | temperature=0 reproducibility + max_tokens cap signals via `finish_reason` |
+| Tool wrappers `Cached` / `Timeout` / `Retry` | `test_tool_wrappers.py` (3 cases) | wrappers compose around `FunctionTool` and survive ReactAgent dispatch |
+| `coerce_one` (dataclass) + `coerce_stream` (TypedDict) | `test_coerce_adapters.py` (2 cases) | typed-state coercion over real DeepSeek output (stream needs an async wrapper) |
 
 ---
 
@@ -172,6 +175,16 @@ on by default.
   IS reusable, so save it: `compiled = g.compile(); compiled.invoke(...)`
   for each input. Don't call `g.compile()` inline inside the invoke
   loop.
+- **`OpenAIChat.invoke()` accepts only `temperature`, `max_tokens`,
+  `response_format`** as kwargs today. No `stop`, `top_p`, `seed`,
+  `presence_penalty`, etc. To shape requests further, drop down to
+  the underlying provider crate or add support in
+  `crates/litgraph-providers-openai`.
+- **`coerce_stream` requires an async iterable**, but
+  `model.stream(...)` returns a SYNC `ChatStream`. To pipe model
+  deltas through `coerce_stream`, wrap with a one-line async
+  generator (`async def to_async(it): for x in it: yield x`).
+  `coerce_one` works directly on dict outputs without any wrapping.
 - **`streaming.stream_events` only emits lifecycle events**
   (`on_chat_model_start`, `on_chat_model_end`) for a raw chat stream.
   The intermediate `delta` chunks are NOT bridged into the LCEL-event
