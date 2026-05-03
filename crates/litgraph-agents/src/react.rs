@@ -54,6 +54,11 @@ pub struct ReactAgentConfig {
     pub max_iterations: u32,
     pub chat_options: ChatOptions,
     pub max_parallel_tools: usize,
+    /// Optional chain of [`crate::middleware::ToolMiddleware`] hooks
+    /// run around every tool dispatch. Default empty (no middleware
+    /// — same fast path as before this field was added). Pass to
+    /// `ReactAgent::with_config(...)` to attach.
+    pub tool_middleware: crate::middleware::ToolMiddlewareChain,
 }
 
 impl Default for ReactAgentConfig {
@@ -63,6 +68,7 @@ impl Default for ReactAgentConfig {
             max_iterations: 10,
             chat_options: ChatOptions::default(),
             max_parallel_tools: 16,
+            tool_middleware: crate::middleware::ToolMiddlewareChain::new(),
         }
     }
 }
@@ -129,6 +135,7 @@ pub struct ReactAgent {
     system_prompt: Option<String>,
     max_iterations: u32,
     max_parallel_tools: usize,
+    tool_middleware: crate::middleware::ToolMiddlewareChain,
 }
 
 impl ReactAgent {
@@ -150,6 +157,8 @@ impl ReactAgent {
         let system_prompt = cfg.system_prompt.clone();
         let max_iters = cfg.max_iterations;
         let sem_size = cfg.max_parallel_tools;
+        let middleware_for_node = cfg.tool_middleware.clone();
+        let middleware_retained = cfg.tool_middleware.clone();
 
         let mut g = StateGraph::<AgentState>::new();
 
@@ -201,6 +210,7 @@ impl ReactAgent {
         // ----- TOOLS NODE --------------------------------------------------
         g.add_fallible_node("tools", move |state: AgentState| {
             let tools_by_name = tools_for_node.clone();
+            let middleware = middleware_for_node.clone();
             Box::pin(async move {
                 let last = state.messages.last().cloned();
                 let Some(last) = last else {
@@ -217,12 +227,13 @@ impl ReactAgent {
                 for tc in calls {
                     let tools_by_name = tools_by_name.clone();
                     let sem = sem.clone();
+                    let mw = middleware.clone();
                     set.spawn(async move {
                         let _permit = match sem.acquire_owned().await {
                             Ok(p) => p,
                             Err(_) => return tool_error_message(&tc, "semaphore closed"),
                         };
-                        run_one_tool(&tools_by_name, &tc).await
+                        run_one_tool(&tools_by_name, &tc, &mw).await
                     });
                 }
 
@@ -253,6 +264,7 @@ impl ReactAgent {
             system_prompt,
             max_iterations: max_iters,
             max_parallel_tools: sem_size,
+            tool_middleware: middleware_retained,
         })
     }
 
@@ -300,6 +312,7 @@ impl ReactAgent {
         let system_prompt = self.system_prompt.clone();
         let max_iters = self.max_iterations;
         let sem_size = self.max_parallel_tools;
+        let middleware = self.tool_middleware.clone();
 
         Box::pin(async_stream::try_stream! {
             let mut msgs = initial;
@@ -362,6 +375,7 @@ impl ReactAgent {
                 for tc in calls {
                     let tools = tools_by_name.clone();
                     let sem = sem.clone();
+                    let mw = middleware.clone();
                     set.spawn(async move {
                         let _permit = match sem.acquire_owned().await {
                             Ok(p) => p,
@@ -374,12 +388,30 @@ impl ReactAgent {
                             }
                         };
                         let start = Instant::now();
-                        let result = match tools.get(&tc.name) {
-                            Some(tool) => tool.run(tc.arguments.clone()).await,
+                        // before-hooks: may mutate args or short-circuit.
+                        let args = match mw.dispatch_before(&tc.name, &tc.arguments) {
+                            Ok(a) => a,
+                            Err(e) => {
+                                return (
+                                    tc.clone(),
+                                    Err(litgraph_core::Error::other(e.0)),
+                                    start.elapsed(),
+                                );
+                            }
+                        };
+                        let raw = match tools.get(&tc.name) {
+                            Some(tool) => tool.run(args.clone()).await,
                             None => Err(litgraph_core::Error::other(format!(
                                 "unknown tool `{}`",
                                 tc.name
                             ))),
+                        };
+                        // after-hooks: may rewrite result.
+                        let result = match raw {
+                            Ok(v) => mw
+                                .dispatch_after(&tc.name, &args, &v)
+                                .map_err(|e| litgraph_core::Error::other(e.0)),
+                            Err(e) => Err(e),
                         };
                         (tc, result, start.elapsed())
                     });
@@ -424,6 +456,7 @@ impl ReactAgent {
         let system_prompt = self.system_prompt.clone();
         let max_iters = self.max_iterations;
         let sem_size = self.max_parallel_tools;
+        let middleware = self.tool_middleware.clone();
 
         Box::pin(async_stream::try_stream! {
             let mut msgs = initial;
@@ -513,6 +546,7 @@ impl ReactAgent {
                 for tc in calls {
                     let tools = tools_by_name.clone();
                     let sem = sem.clone();
+                    let mw = middleware.clone();
                     set.spawn(async move {
                         let _permit = match sem.acquire_owned().await {
                             Ok(p) => p,
@@ -525,12 +559,28 @@ impl ReactAgent {
                             }
                         };
                         let start = Instant::now();
-                        let result = match tools.get(&tc.name) {
-                            Some(tool) => tool.run(tc.arguments.clone()).await,
+                        let args = match mw.dispatch_before(&tc.name, &tc.arguments) {
+                            Ok(a) => a,
+                            Err(e) => {
+                                return (
+                                    tc.clone(),
+                                    Err(litgraph_core::Error::other(e.0)),
+                                    start.elapsed(),
+                                );
+                            }
+                        };
+                        let raw = match tools.get(&tc.name) {
+                            Some(tool) => tool.run(args.clone()).await,
                             None => Err(litgraph_core::Error::other(format!(
                                 "unknown tool `{}`",
                                 tc.name
                             ))),
+                        };
+                        let result = match raw {
+                            Ok(v) => mw
+                                .dispatch_after(&tc.name, &args, &v)
+                                .map_err(|e| litgraph_core::Error::other(e.0)),
+                            Err(e) => Err(e),
                         };
                         (tc, result, start.elapsed())
                     });
@@ -564,20 +614,33 @@ impl ReactAgent {
     }
 }
 
-async fn run_one_tool(tools: &HashMap<String, Arc<dyn Tool>>, tc: &ToolCall) -> Message {
+async fn run_one_tool(
+    tools: &HashMap<String, Arc<dyn Tool>>,
+    tc: &ToolCall,
+    middleware: &crate::middleware::ToolMiddlewareChain,
+) -> Message {
     let Some(tool) = tools.get(&tc.name) else {
         return tool_error_message(tc, &format!("unknown tool `{}`", tc.name));
     };
-    match tool.run(tc.arguments.clone()).await {
-        Ok(v) => {
-            let text = match v {
-                serde_json::Value::String(s) => s,
-                other => other.to_string(),
-            };
-            Message::tool_response(&tc.id, text)
-        }
-        Err(e) => tool_error_message(tc, &e.to_string()),
-    }
+    // before-hooks: may mutate args or short-circuit.
+    let args = match middleware.dispatch_before(&tc.name, &tc.arguments) {
+        Ok(a) => a,
+        Err(e) => return tool_error_message(tc, &e.0),
+    };
+    let result = match tool.run(args.clone()).await {
+        Ok(v) => v,
+        Err(e) => return tool_error_message(tc, &e.to_string()),
+    };
+    // after-hooks: may rewrite result (PII scrub, redaction, …).
+    let final_value = match middleware.dispatch_after(&tc.name, &args, &result) {
+        Ok(v) => v,
+        Err(e) => return tool_error_message(tc, &e.0),
+    };
+    let text = match final_value {
+        serde_json::Value::String(s) => s,
+        other => other.to_string(),
+    };
+    Message::tool_response(&tc.id, text)
 }
 
 fn tool_error_message(tc: &ToolCall, err: &str) -> Message {

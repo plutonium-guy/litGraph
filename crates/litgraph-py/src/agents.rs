@@ -796,6 +796,7 @@ impl PyReactAgent {
             max_iterations,
             chat_options: ChatOptions::default(),
             max_parallel_tools: 16,
+            tool_middleware: litgraph_agents::middleware::ToolMiddlewareChain::new(),
         };
 
         let agent = ReactAgent::new(chat_model, tool_vec, cfg)

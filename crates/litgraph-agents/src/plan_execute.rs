@@ -181,6 +181,7 @@ impl PlanAndExecuteAgent {
             max_iterations: self.cfg.max_iterations_per_step,
             chat_options: self.cfg.executor_chat_options.clone(),
             max_parallel_tools: 16,
+            tool_middleware: crate::middleware::ToolMiddlewareChain::new(),
         };
         let agent = ReactAgent::new(self.executor.clone(), self.tools.clone(), cfg)
             .map_err(|e| litgraph_core::Error::other(format!("plan_execute: build executor: {e}")))?;
