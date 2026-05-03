@@ -2135,6 +2135,7 @@ dependencies = [
  "litgraph-core",
  "litgraph-graph",
  "parking_lot",
+ "regex",
  "serde",
  "serde_json",
  "thiserror 1.0.69",

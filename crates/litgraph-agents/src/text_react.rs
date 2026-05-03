@@ -196,6 +196,24 @@ impl Default for TextReactAgentConfig {
     }
 }
 
+impl TextReactAgentConfig {
+    /// Builder: replace the middleware chain. See
+    /// [`crate::middleware::ToolMiddlewareChain`].
+    pub fn with_middleware(mut self, chain: crate::middleware::ToolMiddlewareChain) -> Self {
+        self.tool_middleware = chain;
+        self
+    }
+
+    /// Builder: append a single middleware to the existing chain.
+    pub fn add_middleware(
+        mut self,
+        mw: std::sync::Arc<dyn crate::middleware::ToolMiddleware>,
+    ) -> Self {
+        self.tool_middleware = self.tool_middleware.push(mw);
+        self
+    }
+}
+
 pub struct TextReActAgent {
     model: Arc<dyn ChatModel>,
     tools: HashMap<String, Arc<dyn Tool>>,

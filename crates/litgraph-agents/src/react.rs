@@ -73,6 +73,25 @@ impl Default for ReactAgentConfig {
     }
 }
 
+impl ReactAgentConfig {
+    /// Builder: replace the middleware chain. Returns `self` so
+    /// callers can chain `.with_middleware(chain).with_max_iters(5)`.
+    pub fn with_middleware(mut self, chain: crate::middleware::ToolMiddlewareChain) -> Self {
+        self.tool_middleware = chain;
+        self
+    }
+
+    /// Builder: append a single middleware to the existing chain.
+    /// Cheap because the chain is `Arc<dyn ToolMiddleware>`-backed.
+    pub fn add_middleware(
+        mut self,
+        mw: std::sync::Arc<dyn crate::middleware::ToolMiddleware>,
+    ) -> Self {
+        self.tool_middleware = self.tool_middleware.push(mw);
+        self
+    }
+}
+
 /// High-level event surfaced by `ReactAgent::stream()`. Variants are stable
 /// (tagged with `type` in JSON) so downstream consumers — Python iterators,
 /// WebSocket bridges, log aggregators — can match on them.

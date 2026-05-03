@@ -258,6 +258,147 @@ impl<M: ToolMiddleware> ToolMiddleware for RetryOnMiddlewareErrorMiddleware<M> {
     }
 }
 
+/// Scrubs PII patterns from tool args + results. Default patterns
+/// catch email addresses, US SSNs, and credit-card-shape digits.
+/// Pass extra regexes via [`PiiScrubMiddleware::with_extra_patterns`]
+/// for app-specific identifiers (employee IDs, internal account
+/// numbers, etc.).
+///
+/// Walks JSON values: replaces every matching substring inside
+/// `String` leaves with `[REDACTED]`. Numbers / bools / arrays /
+/// nested objects are traversed.
+///
+/// Mirrors `PiiScrubbingChatModel` (the chat-side scrubber) so
+/// agents using both get end-to-end PII protection without holes
+/// at the tool boundary.
+pub struct PiiScrubMiddleware {
+    patterns: Vec<regex::Regex>,
+    /// When true, scrub args before the tool runs (good default —
+    /// keeps PII out of upstream APIs). When false, args pass
+    /// through unchanged.
+    scrub_args: bool,
+    /// When true, scrub results after the tool runs (good default).
+    scrub_results: bool,
+}
+
+impl PiiScrubMiddleware {
+    /// New scrubber with the standard pattern set.
+    pub fn new() -> Self {
+        let patterns = vec![
+            // Email
+            regex::Regex::new(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}").unwrap(),
+            // US SSN
+            regex::Regex::new(r"\b\d{3}-\d{2}-\d{4}\b").unwrap(),
+            // Credit-card-shape digits (13–16 digits, optional spaces / dashes)
+            regex::Regex::new(r"\b(?:\d[ -]?){13,16}\b").unwrap(),
+        ];
+        Self {
+            patterns,
+            scrub_args: true,
+            scrub_results: true,
+        }
+    }
+
+    /// Append app-specific patterns to the scrubber. Each input is
+    /// compiled at construction; invalid regex panics with a clear
+    /// message (use [`with_compiled_patterns`] for fallible input).
+    pub fn with_extra_patterns<I>(mut self, patterns: I) -> Self
+    where
+        I: IntoIterator<Item = String>,
+    {
+        for src in patterns {
+            self.patterns.push(
+                regex::Regex::new(&src)
+                    .unwrap_or_else(|e| panic!("PiiScrubMiddleware: bad regex {src:?}: {e}")),
+            );
+        }
+        self
+    }
+
+    /// Append already-compiled patterns. Use when the regex source
+    /// is dynamic / user-provided and you want to handle `regex::Error`
+    /// upstream.
+    pub fn with_compiled_patterns<I>(mut self, patterns: I) -> Self
+    where
+        I: IntoIterator<Item = regex::Regex>,
+    {
+        self.patterns.extend(patterns);
+        self
+    }
+
+    /// Disable args scrubbing (results-only). Useful when the
+    /// upstream API needs the unredacted PII to do its job
+    /// (e.g., a user-lookup tool by email).
+    pub fn args_unscrubbed(mut self) -> Self {
+        self.scrub_args = false;
+        self
+    }
+
+    /// Disable results scrubbing (args-only). Pairs with the above
+    /// for the inverse: scrub the prompt-bound args but pass the
+    /// tool's response through untouched.
+    pub fn results_unscrubbed(mut self) -> Self {
+        self.scrub_results = false;
+        self
+    }
+
+    fn scrub_value(&self, v: &Value) -> Value {
+        match v {
+            Value::String(s) => {
+                let mut out = s.clone();
+                for re in &self.patterns {
+                    out = re.replace_all(&out, "[REDACTED]").into_owned();
+                }
+                Value::String(out)
+            }
+            Value::Array(arr) => Value::Array(arr.iter().map(|x| self.scrub_value(x)).collect()),
+            Value::Object(map) => Value::Object(
+                map.iter()
+                    .map(|(k, x)| (k.clone(), self.scrub_value(x)))
+                    .collect(),
+            ),
+            _ => v.clone(),
+        }
+    }
+}
+
+impl Default for PiiScrubMiddleware {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ToolMiddleware for PiiScrubMiddleware {
+    fn before_tool(
+        &self,
+        _tool_name: &str,
+        args: &Value,
+    ) -> Result<Option<Value>, MiddlewareError> {
+        if self.scrub_args {
+            Ok(Some(self.scrub_value(args)))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn after_tool(
+        &self,
+        _tool_name: &str,
+        _args: &Value,
+        result: &Value,
+    ) -> Result<Option<Value>, MiddlewareError> {
+        if self.scrub_results {
+            Ok(Some(self.scrub_value(result)))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn name(&self) -> &str {
+        "PiiScrubMiddleware"
+    }
+}
+
 /// Logs every tool call's name + arg shape via `tracing::info!`.
 /// Useful as the bottom of a middleware stack (runs first, sees
 /// the unmodified args).
@@ -454,5 +595,96 @@ mod tests {
         let mw = RetryOnMiddlewareErrorMiddleware::new(Always, 2);
         let err = mw.before_tool("x", &json!({})).unwrap_err();
         assert_eq!(err.0, "perm");
+    }
+
+    // ---- PiiScrubMiddleware ----
+
+    #[test]
+    fn pii_scrubs_email_in_string_arg() {
+        let mw = PiiScrubMiddleware::new();
+        let args = json!({"q": "contact alice@example.com please"});
+        let out = mw.before_tool("any", &args).unwrap().unwrap();
+        let q = out["q"].as_str().unwrap();
+        assert!(!q.contains("alice@example.com"));
+        assert!(q.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn pii_scrubs_ssn() {
+        let mw = PiiScrubMiddleware::new();
+        let args = json!({"text": "SSN 123-45-6789 here"});
+        let out = mw.before_tool("any", &args).unwrap().unwrap();
+        assert!(out["text"].as_str().unwrap().contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn pii_traverses_nested_objects() {
+        let mw = PiiScrubMiddleware::new();
+        let args = json!({
+            "user": {
+                "name": "alice",
+                "email": "alice@example.com",
+            },
+            "tags": ["greet", "send-to bob@example.com"]
+        });
+        let out = mw.before_tool("any", &args).unwrap().unwrap();
+        assert!(out["user"]["email"].as_str().unwrap().contains("[REDACTED]"));
+        assert!(out["tags"][1].as_str().unwrap().contains("[REDACTED]"));
+        // Non-PII text untouched.
+        assert_eq!(out["user"]["name"], "alice");
+    }
+
+    #[test]
+    fn pii_scrubs_results_too_by_default() {
+        let mw = PiiScrubMiddleware::new();
+        let args = json!({});
+        let result = json!({"answer": "Their email is bob@x.com"});
+        let out = mw.after_tool("any", &args, &result).unwrap().unwrap();
+        assert!(out["answer"].as_str().unwrap().contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn pii_args_unscrubbed_passes_through() {
+        let mw = PiiScrubMiddleware::new().args_unscrubbed();
+        let args = json!({"email": "alice@example.com"});
+        // before returns None ⇒ args_unscrubbed
+        assert!(mw.before_tool("any", &args).unwrap().is_none());
+    }
+
+    #[test]
+    fn pii_results_unscrubbed_passes_through() {
+        let mw = PiiScrubMiddleware::new().results_unscrubbed();
+        let args = json!({});
+        let result = json!({"email": "bob@example.com"});
+        assert!(mw.after_tool("any", &args, &result).unwrap().is_none());
+    }
+
+    #[test]
+    fn pii_extra_pattern_catches_app_specific_id() {
+        let mw = PiiScrubMiddleware::new()
+            .with_extra_patterns(vec![r"EMP-\d{6}".to_string()]);
+        let args = json!({"text": "ID EMP-123456 here"});
+        let out = mw.before_tool("any", &args).unwrap().unwrap();
+        assert!(out["text"].as_str().unwrap().contains("[REDACTED]"));
+    }
+
+    // ---- Builder API ----
+
+    #[test]
+    fn react_agent_config_with_middleware_replaces_chain() {
+        use crate::ReactAgentConfig;
+        let chain = ToolMiddlewareChain::new()
+            .push(Arc::new(LogToolCallsMiddleware));
+        let cfg = ReactAgentConfig::default().with_middleware(chain);
+        assert_eq!(cfg.tool_middleware.len(), 1);
+    }
+
+    #[test]
+    fn react_agent_config_add_middleware_appends() {
+        use crate::ReactAgentConfig;
+        let cfg = ReactAgentConfig::default()
+            .add_middleware(Arc::new(LogToolCallsMiddleware))
+            .add_middleware(Arc::new(ToolBudgetMiddleware::new(5)));
+        assert_eq!(cfg.tool_middleware.len(), 2);
     }
 }
