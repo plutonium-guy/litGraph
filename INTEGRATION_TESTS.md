@@ -14,7 +14,7 @@ model). The reasoning model `deepseek-reasoner` is exercised in the
 streaming + structured-output tests where its different finish
 semantics matter.
 
-**Snapshot date:** 2026-05-03 · iter 353.
+**Snapshot date:** 2026-05-02 · iter 356.
 
 ---
 
@@ -41,11 +41,12 @@ provider changes.
 
 ## Tested ✅
 
-41 live integration tests against DeepSeek pass as of iter 355.
-5 cleanly skipped (`TokenBudgetChatModel`, `CostCappedChatModel`,
+47 live integration tests against DeepSeek pass as of iter 356.
+7 cleanly skipped (`TokenBudgetChatModel`, `CostCappedChatModel`,
 `PiiScrubbingChatModel` not exposed on the Python surface today;
 `test_react_agent_with_python_wrapped_tools_blocked` documented
-limitation — see Tool-hooks note below).
+limitation — see Tool-hooks note below; `LlmJudge` blocked because
+DeepSeek rejects `response_format=json_schema` — see Gotchas).
 
 | Feature | Test file | Notes |
 |---|---|---|
@@ -66,6 +67,9 @@ limitation — see Tool-hooks note below).
 | `ChatPromptTemplate.from_messages` | `test_prompts_memory.py` (2 cases) | minijinja `{{ var }}` substitution |
 | `TokenBufferMemory` round-trip | `test_prompts_memory.py` (2 cases) | recall + clear |
 | `tool_hooks.{Before,After,ToolBudget,wrap_tool}` | `test_tool_hooks_live.py` (1 case) | hooks fire on a real-derived input |
+| `lcel.Pipe` composition | `test_lcel_pipe.py` (2 cases) | `Pipe(fn) \| model_call \| extract` runs end-to-end |
+| `MiddlewareChain` + `MiddlewareChat` via ReactAgent | `test_middleware_live.py` (2 cases) | `with_(SystemPromptMiddleware(...))` plugged into agent loop |
+| `parsers.parse_json_with_retry` + `fix_with_llm` | `test_parsers_live.py` (2 cases) | repairs malformed JSON via real DeepSeek round-trip |
 
 ---
 
@@ -89,7 +93,7 @@ Features deliberately not exercised against DeepSeek. Reason in each row.
 | **`litgraph-serve` HTTP** | Needs to spawn the binary; covered by Rust integration tests in `crates/litgraph-serve/tests/`. |
 | **Free-threaded Python 3.13t** | Build matrix, not a per-call thing. Tested by running the full suite on 3.13t in CI. |
 | **Vision / multimodal** | DeepSeek-VL is a separate model + endpoint shape; current tests use `deepseek-chat` only. |
-| **Evaluator LLM-judge** | Would call the model recursively; covered by mock unit tests. Add a smoke test once eval-suite is wired. |
+| **Evaluator `LlmJudge` live** | Uses `StructuredChatModel` → `response_format=json_schema`. DeepSeek rejects schema-mode (`"This response_format type is unavailable now"`). Re-enable when DeepSeek adds it OR when `StructuredChatModel` falls back to `json_object` + post-validate. Test stubs are in `test_evaluators_llm_judge.py` (skipped). |
 
 ---
 
@@ -131,6 +135,16 @@ on by default.
   the substring `"json"`** (case-insensitive). DeepSeek rejects
   the request with `400 invalid_request_error` otherwise. Tests
   set the system prompt to e.g. `'Reply with valid json: {...}'`.
+- **`response_format=json_schema` is not supported on DeepSeek**
+  (`"This response_format type is unavailable now"`). This blocks
+  `LlmJudge` and any consumer of `StructuredChatModel.with_strict(true)`
+  against DeepSeek. Workarounds: use `json_object` mode + manual
+  validation, or use a provider that supports schema mode (OpenAI,
+  Anthropic via tool-calls).
+- **`MiddlewareChat` does NOT expose `.invoke()` on the Python surface.**
+  It is an opaque chat-protocol wrapper for use inside `ReactAgent`,
+  `SupervisorAgent`, etc. Drive it through an agent — direct
+  `wrapped.invoke(messages, ...)` raises `AttributeError`.
 - **`OpenAIChat.invoke` does NOT take `tools=` directly.** Tools
   flow through `ReactAgent` (the agent loop owns the
   `tool_calls` protocol). Don't try
