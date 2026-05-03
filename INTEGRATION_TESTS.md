@@ -14,7 +14,7 @@ model). The reasoning model `deepseek-reasoner` is exercised in the
 streaming + structured-output tests where its different finish
 semantics matter.
 
-**Snapshot date:** 2026-05-02 · iter 361.
+**Snapshot date:** 2026-05-02 · iter 362.
 
 ---
 
@@ -41,7 +41,7 @@ provider changes.
 
 ## Tested ✅
 
-74 live integration tests against DeepSeek pass as of iter 361.
+78 live integration tests against DeepSeek pass as of iter 362.
 10 cleanly skipped:
 - `TokenBudgetChatModel`, `CostCappedChatModel`, `PiiScrubbingChatModel`
   not exposed on the Python surface today (4 cases — the TokenBudget
@@ -94,6 +94,9 @@ provider changes.
 | Chat-options shaping (`temperature`, `max_tokens`) | `test_chat_options.py` (2 cases) | temperature=0 reproducibility + max_tokens cap signals via `finish_reason` |
 | Tool wrappers `Cached` / `Timeout` / `Retry` | `test_tool_wrappers.py` (3 cases) | wrappers compose around `FunctionTool` and survive ReactAgent dispatch |
 | `coerce_one` (dataclass) + `coerce_stream` (TypedDict) | `test_coerce_adapters.py` (2 cases) | typed-state coercion over real DeepSeek output (stream needs an async wrapper) |
+| `prompt_hub.{register,get,search,render}` | `test_prompt_hub_live.py` (2 cases) | round-trip register → render → invoke; substring/tag search |
+| `compat.RunnableBranch` conditional dispatch | `test_compat_runnable_branch.py` (1 case) | first-truthy-predicate routing + default fall-through |
+| `tools.SubagentTool` parent → child delegation | `test_subagent_tool_live.py` (1 case) | parent agent dispatches a math question to a sub-`ReactAgent` |
 
 ---
 
@@ -175,6 +178,11 @@ on by default.
   IS reusable, so save it: `compiled = g.compile(); compiled.invoke(...)`
   for each input. Don't call `g.compile()` inline inside the invoke
   loop.
+- **`prompt_hub.Prompt.render(**vars)` uses Python `str.format()`**
+  (single-brace `{var}`), NOT minijinja. For full Jinja semantics
+  use `litgraph.prompts.ChatPromptTemplate.from_messages([...])`.
+  `prompt_hub.search(query)` is a positional substring/tag matcher;
+  no `tag=` kwarg.
 - **`OpenAIChat.invoke()` accepts only `temperature`, `max_tokens`,
   `response_format`** as kwargs today. No `stop`, `top_p`, `seed`,
   `presence_penalty`, etc. To shape requests further, drop down to
