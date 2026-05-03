@@ -14,7 +14,7 @@ model). The reasoning model `deepseek-reasoner` is exercised in the
 streaming + structured-output tests where its different finish
 semantics matter.
 
-**Snapshot date:** 2026-05-02 · iter 373.
+**Snapshot date:** 2026-05-02 · iter 374.
 
 ---
 
@@ -41,8 +41,8 @@ provider changes.
 
 ## Tested ✅
 
-122 live integration tests against DeepSeek pass as of iter 373.
-11 cleanly skipped:
+125 live integration tests against DeepSeek pass as of iter 374.
+12 cleanly skipped:
 - `TokenBudgetChatModel`, `CostCappedChatModel`, `PiiScrubbingChatModel`
   not exposed on the Python surface today (4 cases — the TokenBudget
   wrapper has two cases).
@@ -55,6 +55,8 @@ provider changes.
   iter 360; re-enable after the next maturin build picks it up.
 - `agents_extras.BigToolAgent` (1 case) — needs an embeddings
   provider; DeepSeek has none.
+- `memory_extras.NamespacedMemory` (1 case) — needs a metadata-
+  preserving inner backend; native memories drop metadata.
 
 | Feature | Test file | Notes |
 |---|---|---|
@@ -117,6 +119,8 @@ provider changes.
 | `testing.MockChatModel` shape parity | `test_mock_chat_model.py` (2 cases) | mock + cycle-replies match the live `invoke` shape protocol |
 | `splitters.HtmlHeaderSplitter` + `tools.{DuckDuckGoSearchTool,WebFetchTool}` | `test_html_splitter_and_websearch.py` (3 cases) | HTML structure split + zero-key web search + URL→clean-text fetch |
 | `agents_extras.SwarmAgent` entry-agent invoke | `test_agents_extras_swarm.py` (1 case) | swarm delegates to entry ReactAgent (fixed in iter 372 — SwarmAgent now extracts latest user message into a str when inner agent is a native ReactAgent) |
+| `tools.SqliteQueryTool` via ReactAgent | `test_sqlite_query_tool_live.py` (1 case) | sandboxed SELECT-only tool over an allowlisted table; agent counts rows |
+| `StateGraph.interrupt_before/after` | `test_state_graph_interrupts.py` (2 cases) | interrupt raises `RuntimeError: interrupted at node ...`; graph without interrupt runs cleanly |
 
 ---
 
@@ -142,6 +146,7 @@ Features deliberately not exercised against DeepSeek. Reason in each row.
 | **Vision / multimodal** | DeepSeek-VL is a separate model + endpoint shape; current tests use `deepseek-chat` only. |
 | **Evaluator `LlmJudge` live** | Uses `StructuredChatModel` → `response_format=json_schema`. DeepSeek rejects schema-mode (`"This response_format type is unavailable now"`). Re-enable when DeepSeek adds it OR when `StructuredChatModel` falls back to `json_object` + post-validate. Test stubs are in `test_evaluators_llm_judge.py` (skipped). |
 | **`agents_extras.BigToolAgent` live** | Requires an embeddings provider to score the tool catalogue. DeepSeek has no embeddings — gated on a separate provider key. Stub in `test_agents_extras_swarm.py`. |
+| **`memory_extras.NamespacedMemory` against native backends** | Requires `add_user(text, metadata=...)` AND a backend that PRESERVES `metadata` on read. Native litGraph memories (`BufferMemory`, `TokenBufferMemory`, …) only expose `append({"role","content"})` and silently drop metadata. NamespacedMemory either raises `AttributeError: ... does not support 'add_user'` or returns an empty `messages()`. Re-enable once a metadata-preserving native memory backend lands or with a LangChain-compat backend. |
 
 ---
 
