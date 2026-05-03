@@ -14,7 +14,7 @@ model). The reasoning model `deepseek-reasoner` is exercised in the
 streaming + structured-output tests where its different finish
 semantics matter.
 
-**Snapshot date:** 2026-05-02 · iter 374.
+**Snapshot date:** 2026-05-02 · iter 375.
 
 ---
 
@@ -42,10 +42,7 @@ provider changes.
 ## Tested ✅
 
 125 live integration tests against DeepSeek pass as of iter 374.
-12 cleanly skipped:
-- `TokenBudgetChatModel`, `CostCappedChatModel`, `PiiScrubbingChatModel`
-  not exposed on the Python surface today (4 cases — the TokenBudget
-  wrapper has two cases).
+8 cleanly skipped:
 - `test_react_agent_with_python_wrapped_tools_blocked` — documented
   Python `HookedTool` blocker (1 case).
 - `LlmJudge` (2 cases) and `synthesize_eval_cases` (2 cases) — both
@@ -120,6 +117,7 @@ provider changes.
 | `splitters.HtmlHeaderSplitter` + `tools.{DuckDuckGoSearchTool,WebFetchTool}` | `test_html_splitter_and_websearch.py` (3 cases) | HTML structure split + zero-key web search + URL→clean-text fetch |
 | `agents_extras.SwarmAgent` entry-agent invoke | `test_agents_extras_swarm.py` (1 case) | swarm delegates to entry ReactAgent (fixed in iter 372 — SwarmAgent now extracts latest user message into a str when inner agent is a native ReactAgent) |
 | `tools.SqliteQueryTool` via ReactAgent | `test_sqlite_query_tool_live.py` (1 case) | sandboxed SELECT-only tool over an allowlisted table; agent counts rows |
+| `providers.{TokenBudgetChat,CostCappedChat,PiiScrubbingChat}` | `test_model_wrappers.py` (5 cases) | per-call wrappers — strict + auto_trim, USD ceiling, PII scrub before send |
 | `StateGraph.interrupt_before/after` | `test_state_graph_interrupts.py` (2 cases) | interrupt raises `RuntimeError: interrupted at node ...`; graph without interrupt runs cleanly |
 
 ---
@@ -194,6 +192,11 @@ on by default.
   against DeepSeek. Workarounds: use `json_object` mode + manual
   validation, or use a provider that supports schema mode (OpenAI,
   Anthropic via tool-calls).
+- **Per-call wrappers are exposed WITHOUT the `Model` suffix.** The
+  Rust trait is `ChatModel`; the Python classes drop the suffix:
+  `TokenBudgetChat`, `CostCappedChat`, `PiiScrubbingChat`,
+  `PromptCachingChat`, `FallbackChat`, `SelfConsistencyChat`,
+  `StructuredChatModel`. Importing `*Model` raises `ImportError`.
 - **`MiddlewareChat` does NOT expose `.invoke()` on the Python surface.**
   It is an opaque chat-protocol wrapper for use inside `ReactAgent`,
   `SupervisorAgent`, etc. Drive it through an agent — direct
