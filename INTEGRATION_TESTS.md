@@ -14,7 +14,7 @@ model). The reasoning model `deepseek-reasoner` is exercised in the
 streaming + structured-output tests where its different finish
 semantics matter.
 
-**Snapshot date:** 2026-05-02 · iter 362.
+**Snapshot date:** 2026-05-02 · iter 363.
 
 ---
 
@@ -41,7 +41,7 @@ provider changes.
 
 ## Tested ✅
 
-78 live integration tests against DeepSeek pass as of iter 362.
+82 live integration tests against DeepSeek pass as of iter 363.
 10 cleanly skipped:
 - `TokenBudgetChatModel`, `CostCappedChatModel`, `PiiScrubbingChatModel`
   not exposed on the Python surface today (4 cases — the TokenBudget
@@ -97,6 +97,8 @@ provider changes.
 | `prompt_hub.{register,get,search,render}` | `test_prompt_hub_live.py` (2 cases) | round-trip register → render → invoke; substring/tag search |
 | `compat.RunnableBranch` conditional dispatch | `test_compat_runnable_branch.py` (1 case) | first-truthy-predicate routing + default fall-through |
 | `tools.SubagentTool` parent → child delegation | `test_subagent_tool_live.py` (1 case) | parent agent dispatches a math question to a sub-`ReactAgent` |
+| `ReadFileTool` + `WriteFileTool` + `ListDirectoryTool` via agent | `test_filesystem_tools_live.py` (2 cases) | sandbox-rooted FS access; agent reads seed file + write→read round-trip |
+| `Workflow(fn)` direct construction | `test_workflow_direct.py` (2 cases) | sync `invoke` and async `ainvoke` paths without `@entrypoint` decorator |
 
 ---
 
