@@ -45,6 +45,10 @@ from . import prompt_hub  # noqa: E402,F401
 from . import embeddings_extras  # noqa: E402,F401
 from . import providers_extras  # noqa: E402,F401
 from . import cache_extras  # noqa: E402,F401
+from . import loaders_extras  # noqa: E402,F401
+from . import splitters_extras  # noqa: E402,F401
+from . import memory_extras  # noqa: E402,F401
+from . import stores_extras  # noqa: E402,F401
 
 __all__.extend([
     "entrypoint",
@@ -60,4 +64,8 @@ __all__.extend([
     "embeddings_extras",
     "providers_extras",
     "cache_extras",
+    "loaders_extras",
+    "splitters_extras",
+    "memory_extras",
+    "stores_extras",
 ])

@@ -30,6 +30,8 @@ __all__ = [
     "SentenceTransformersEmbeddings",
     "HuggingFaceInferenceEmbeddings",
     "NimEmbeddings",
+    "InstructorEmbeddings",
+    "E5Embeddings",
 ]
 
 
@@ -175,12 +177,114 @@ class NimEmbeddings:
         return self.embed([text])[0]
 
 
+class InstructorEmbeddings:
+    """Instructor (Su et al., 2022) — task-conditioned embeddings.
+    Wraps `InstructorEmbedding` (which itself sits on
+    sentence-transformers) so each `embed` call carries an instruction
+    prefix that biases the vector toward the downstream task.
+
+    Lazy-imports `InstructorEmbedding`; install with
+    `pip install InstructorEmbedding sentence-transformers`.
+
+    Args:
+        model_name: e.g. "hkunlp/instructor-large" or "...-base".
+        instruction: prompt prefixed to every input, e.g.
+            "Represent the science paragraph for retrieval:".
+        device: "cpu" or "cuda".
+    """
+
+    def __init__(
+        self,
+        model_name: str = "hkunlp/instructor-base",
+        instruction: str = "Represent the document for retrieval:",
+        device: str = "cpu",
+    ) -> None:
+        try:
+            from InstructorEmbedding import INSTRUCTOR  # type: ignore[import-not-found]
+        except ImportError as e:
+            raise ImportError(
+                "InstructorEmbedding not installed. "
+                "Run `pip install InstructorEmbedding sentence-transformers` "
+                "to use this adapter."
+            ) from e
+        self._model = INSTRUCTOR(model_name, device=device)
+        self._instruction = instruction
+        self.dim: int | None = None
+
+    def embed(self, texts: Iterable[str]) -> list[list[float]]:
+        ts = list(texts)
+        if not ts:
+            return []
+        pairs = [[self._instruction, t] for t in ts]
+        vecs = self._model.encode(pairs)
+        out = [list(map(float, v)) for v in vecs]
+        if out and self.dim is None:
+            self.dim = len(out[0])
+        return out
+
+    def embed_query(self, text: str) -> list[float]:
+        return self.embed([text])[0]
+
+
+class E5Embeddings:
+    """E5 family ("intfloat/e5-base-v2", "...-large-v2", multilingual).
+    Built on sentence-transformers but requires a `query: ` /
+    `passage: ` prefix to differentiate retrieval inputs — this
+    wrapper applies the prefix automatically.
+
+    Lazy-imports `sentence-transformers`. Install with
+    `pip install sentence-transformers`.
+
+    Args:
+        model_name: e.g. "intfloat/e5-base-v2".
+        device: "cpu" or "cuda".
+        normalize: L2-normalise output (E5 paper recommends).
+    """
+
+    def __init__(
+        self,
+        model_name: str = "intfloat/e5-base-v2",
+        device: str = "cpu",
+        normalize: bool = True,
+    ) -> None:
+        try:
+            from sentence_transformers import SentenceTransformer  # type: ignore[import-not-found]
+        except ImportError as e:
+            raise ImportError(
+                "sentence-transformers not installed. "
+                "Run `pip install sentence-transformers` to use this adapter."
+            ) from e
+        self._model = SentenceTransformer(model_name, device=device)
+        self._normalize = normalize
+        self.dim = int(self._model.get_sentence_embedding_dimension() or 0)
+
+    def _encode(self, texts: list[str], prefix: str) -> list[list[float]]:
+        prefixed = [f"{prefix}: {t}" for t in texts]
+        vecs = self._model.encode(
+            prefixed,
+            normalize_embeddings=self._normalize,
+            convert_to_numpy=True,
+            show_progress_bar=False,
+        )
+        return [list(map(float, v)) for v in vecs]
+
+    def embed(self, texts: Iterable[str]) -> list[list[float]]:
+        ts = list(texts)
+        if not ts:
+            return []
+        return self._encode(ts, "passage")
+
+    def embed_query(self, text: str) -> list[float]:
+        return self._encode([text], "query")[0]
+
+
 # Convenience: catch the most common typos / aliases for `from_env`.
 def from_env(name: str, /, **overrides: Any) -> Any:
     """Pick an embeddings adapter by name. Convenience for recipes
     that read config from env / yaml.
 
-    Names: "sentence-transformers", "hf-inference", "nim".
+    Names: "sentence-transformers", "hf-inference", "nim",
+    "instructor", "e5".
     """
     n = name.replace("_", "-").lower()
     if n in ("sentence-transformers", "st", "sbert"):
@@ -189,4 +293,8 @@ def from_env(name: str, /, **overrides: Any) -> Any:
         return HuggingFaceInferenceEmbeddings(**overrides)
     if n in ("nim", "nvidia-nim"):
         return NimEmbeddings(**overrides)
+    if n in ("instructor",):
+        return InstructorEmbeddings(**overrides)
+    if n in ("e5",):
+        return E5Embeddings(**overrides)
     raise ValueError(f"unknown embeddings adapter: {name!r}")

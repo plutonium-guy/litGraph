@@ -28,6 +28,30 @@ class HuggingFaceInferenceEmbeddings:
     def embed_query(self, text: str) -> list[float]: ...
 
 
+class InstructorEmbeddings:
+    dim: int | None
+    def __init__(
+        self,
+        model_name: str = "hkunlp/instructor-base",
+        instruction: str = "Represent the document for retrieval:",
+        device: str = "cpu",
+    ) -> None: ...
+    def embed(self, texts: Iterable[str]) -> list[list[float]]: ...
+    def embed_query(self, text: str) -> list[float]: ...
+
+
+class E5Embeddings:
+    dim: int
+    def __init__(
+        self,
+        model_name: str = "intfloat/e5-base-v2",
+        device: str = "cpu",
+        normalize: bool = True,
+    ) -> None: ...
+    def embed(self, texts: Iterable[str]) -> list[list[float]]: ...
+    def embed_query(self, text: str) -> list[float]: ...
+
+
 class NimEmbeddings:
     dim: int | None
     def __init__(

@@ -179,7 +179,7 @@ LangChain Community: largest *catalogue* but spread across N packages.
 | Backend: Postgres | ✅ | ✅ | ✅ |
 | Backend: Redis | ✅ | ✅ | ⏳ |
 | Backend: DynamoDB / MongoDB / Cassandra / … | ❌ | ✅ (Community) | 📦📦 |
-| Hierarchical / namespaced memory | ⏳ (filter-based) | ⏳ | ✅ |
+| Hierarchical / namespaced memory | ✅ (`litgraph.memory_extras.NamespacedMemory`) | ⏳ | ✅ |
 | Vector-backed long-term memory | ✅ (postgres + sqlite) | ✅ | ✅ |
 
 **Verdict:** LangChain's memory backend catalogue is unmatched.
@@ -223,7 +223,7 @@ LangGraph inherits LangChain's wrappers wholesale.
 |---|---|---|---|
 | In-memory | ✅ | ✅ | 📦 |
 | HNSW (embedded) | ✅ (instant-distance, Rust) | ✅ (faiss / hnswlib via Community) | 📦 |
-| FAISS | ❌ (HNSW covers it) | ✅ | 📦 |
+| FAISS | ✅ (`litgraph.stores_extras.FaissVectorStore`, lazy-imports `faiss-cpu`) | ✅ | 📦 |
 | Qdrant | ✅ (REST, no gRPC) | ✅ | 📦 |
 | pgvector | ✅ | ✅ | 📦 |
 | Chroma | ✅ | ✅ | 📦 |
@@ -251,7 +251,7 @@ LangChain wins coverage; litGraph covers the production-relevant 6.
 | Confluence · Jira · Linear · Notion · Slack | ✅ | ✅ | 📦 |
 | GitHub (files + issues) · GitLab · Discord · Wikipedia | ✅ | ✅ | 📦 |
 | Gmail · Jupyter | ✅ | ✅ | 📦 |
-| Outlook · IMAP · WhatsApp · YouTube · Hugging Face · Airtable · Reddit · Twitter · … | ❌ | ✅ (Community, ~150 total) | 📦 |
+| Outlook · IMAP · WhatsApp · YouTube · Hugging Face · Airtable · Reddit · Twitter · … | ⏳ (`litgraph.loaders_extras`: IMAP / YouTube transcript / Reddit / Airtable) | ✅ (Community, ~150 total) | 📦 |
 | **Parallel ingest** | ✅ (rayon, all loaders) | ⏳ (depends on loader) | 📦 |
 | Total stock loaders | ~ 25 | 150+ | inherits |
 
@@ -272,7 +272,7 @@ default, not a per-loader feature.
 | Token splitter (tiktoken / HF) | ✅ | ✅ | 📦 |
 | Semantic chunker | ✅ | ✅ | 📦 |
 | Code-aware (tree-sitter, definition-level) | ✅ | ⏳ (language-specific) | 📦 |
-| NLTK / SpaCy sentence splitter | ❌ | ✅ | 📦 |
+| NLTK / SpaCy sentence splitter | ✅ (`litgraph.splitters_extras.{Nltk,Spacy}SentenceSplitter`) | ✅ | 📦 |
 
 **Verdict:** Near-parity, with LangChain edging out on NLP-toolkit
 splitters.
@@ -414,7 +414,7 @@ top-tier providers natively + everything OpenAI-compatible for free.
 | OpenAI · Cohere · Voyage · Jina | ✅ | ✅ | 📦 |
 | Bedrock · Gemini | ✅ | ✅ | 📦 |
 | FastEmbed (local ONNX) | ✅ | ✅ | 📦 |
-| HuggingFace Inference / Sentence-Transformers / Instructor / E5 / NVIDIA NIM | ⏳ (`litgraph.embeddings_extras` adapters; ST + HF + NIM) | ✅ | 📦 |
+| HuggingFace Inference / Sentence-Transformers / Instructor / E5 / NVIDIA NIM | ✅ (`litgraph.embeddings_extras` — all 5 adapters) | ✅ | 📦 |
 
 LangChain wins on integration breadth.
 
