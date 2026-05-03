@@ -14,3 +14,22 @@ def eval(
 
 
 def serve(graph: Any, port: int = 8080, host: str = "0.0.0.0") -> str: ...
+
+
+def rag(
+    documents: Iterable[Mapping[str, Any]] | None = ...,
+    *,
+    model: Any = ...,
+    embeddings: Any = ...,
+    store: Any = ...,
+    retriever_k: int = 5,
+    system_prompt: str | None = ...,
+) -> Any: ...
+
+
+def multi_agent(
+    workers: Mapping[str, Any],
+    *,
+    supervisor_model: Any,
+    system_prompt: str | None = ...,
+) -> Any: ...

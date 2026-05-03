@@ -2134,6 +2134,7 @@ dependencies = [
  "futures-util",
  "litgraph-core",
  "litgraph-graph",
+ "parking_lot",
  "serde",
  "serde_json",
  "thiserror 1.0.69",

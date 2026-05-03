@@ -25,6 +25,9 @@ __all__ = [
     "RedisSearchVectorStore",
     "Neo4jVectorStore",
     "MongoAtlasVectorStore",
+    "PineconeVectorStore",
+    "LanceDBVectorStore",
+    "CassandraVectorStore",
 ]
 
 
@@ -697,3 +700,363 @@ class MongoAtlasVectorStore:
 
     def __len__(self) -> int:
         return self._coll.estimated_document_count()
+
+
+# ---- Pinecone ----
+
+
+class PineconeVectorStore:
+    """Pinecone serverless / pod adapter. Lazy-imports
+    `pinecone-client` (v4+); install with `pip install pinecone-client`.
+
+    Note on litGraph design: native vector stores prefer
+    self-hostable backends (HNSW / pgvector / Qdrant / Chroma /
+    Weaviate). Pinecone is a hosted, paid service; this adapter is a
+    courtesy for projects already on Pinecone — for new projects on
+    litGraph, prefer one of the natives.
+
+    Args:
+        index_name: existing Pinecone index name (must already be
+            created via the Pinecone console / `pc.create_index`).
+        dim: embedding dimensionality (informational; Pinecone
+            validates against the index def).
+        api_key: Pinecone API key. Falls back to `PINECONE_API_KEY` env.
+        namespace: Pinecone namespace (default ""). Useful for
+            multi-tenant.
+    """
+
+    def __init__(
+        self,
+        index_name: str,
+        dim: int,
+        api_key: str | None = None,
+        namespace: str = "",
+    ) -> None:
+        try:
+            from pinecone import Pinecone  # type: ignore[import-not-found]
+        except ImportError as e:
+            raise ImportError(
+                "pinecone-client (v4+) not installed. "
+                "Run `pip install pinecone-client`."
+            ) from e
+        import os as _os
+        if dim <= 0:
+            raise ValueError("dim must be positive")
+        self.index_name = index_name
+        self.dim = dim
+        self.namespace = namespace
+        self._pc = Pinecone(api_key=api_key or _os.environ.get("PINECONE_API_KEY", ""))
+        self._index = self._pc.Index(index_name)
+
+    def add(
+        self,
+        docs: Iterable[Mapping[str, Any]],
+        embeddings: Iterable[Iterable[float]],
+    ) -> list[str]:
+        docs_list = list(docs)
+        emb_list = [list(e) for e in embeddings]
+        if len(docs_list) != len(emb_list):
+            raise ValueError("docs and embeddings must have equal length")
+        vectors: list[dict[str, Any]] = []
+        ids: list[str] = []
+        for d, e in zip(docs_list, emb_list):
+            doc_id = str(d.get("id") or uuid.uuid4())
+            vectors.append({
+                "id": doc_id,
+                "values": e,
+                "metadata": {
+                    "page_content": d.get("page_content", ""),
+                    **{k: v for k, v in (d.get("metadata") or {}).items() if isinstance(v, (str, int, float, bool))},
+                },
+            })
+            ids.append(doc_id)
+        if vectors:
+            self._index.upsert(vectors=vectors, namespace=self.namespace)
+        return ids
+
+    def similarity_search(
+        self,
+        query_embedding: Iterable[float],
+        k: int = 5,
+        filter: Mapping[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        q = list(query_embedding)
+        if len(q) != self.dim:
+            raise ValueError(f"query embedding must have length {self.dim}, got {len(q)}")
+        kwargs: dict[str, Any] = {
+            "vector": q,
+            "top_k": k,
+            "include_metadata": True,
+            "namespace": self.namespace,
+        }
+        if filter:
+            kwargs["filter"] = dict(filter)
+        result = self._index.query(**kwargs)
+        out: list[dict[str, Any]] = []
+        for match in result.get("matches", []) if isinstance(result, dict) else result.matches:
+            md = (match.metadata if hasattr(match, "metadata") else match.get("metadata", {})) or {}
+            content = md.pop("page_content", "")
+            out.append({
+                "id": match.id if hasattr(match, "id") else match.get("id", ""),
+                "page_content": content,
+                "metadata": dict(md),
+                "score": float(match.score if hasattr(match, "score") else match.get("score", 0.0)),
+            })
+        return out
+
+    def delete(self, ids: Iterable[str]) -> None:
+        self._index.delete(ids=list(ids), namespace=self.namespace)
+
+    def __len__(self) -> int:
+        try:
+            stats = self._index.describe_index_stats()
+            ns = stats.get("namespaces", {}).get(self.namespace, {})
+            return int(ns.get("vector_count", 0))
+        except Exception:
+            return 0
+
+
+# ---- LanceDB ----
+
+
+class LanceDBVectorStore:
+    """LanceDB embedded columnar vector DB. Lazy-imports `lancedb`;
+    install with `pip install lancedb`.
+
+    LanceDB's design point: embedded (no server), columnar storage
+    on disk, fast scans. Use for: local dev, edge deploys, projects
+    already on Lance / Arrow.
+
+    Args:
+        table_name: LanceDB table name (created if missing).
+        dim: embedding dimensionality.
+        uri: LanceDB connection URI — local path (`./lance.db`) or
+            remote (`s3://...`, `gs://...`).
+    """
+
+    def __init__(
+        self,
+        table_name: str,
+        dim: int,
+        uri: str = "./lance.db",
+    ) -> None:
+        try:
+            import lancedb  # type: ignore[import-not-found]
+        except ImportError as e:
+            raise ImportError(
+                "lancedb not installed. Run `pip install lancedb`."
+            ) from e
+        if dim <= 0:
+            raise ValueError("dim must be positive")
+        self.table_name = table_name
+        self.dim = dim
+        self._db = lancedb.connect(uri)
+        # LanceDB needs a schema sample to create the table. Use a
+        # zero-row DataFrame-like dict.
+        if table_name not in self._db.table_names():
+            schema = [{"id": "_seed", "vector": [0.0] * dim, "page_content": ""}]
+            self._table = self._db.create_table(table_name, data=schema)
+            # Drop the seed row.
+            try:
+                self._table.delete("id = '_seed'")
+            except Exception:
+                pass
+        else:
+            self._table = self._db.open_table(table_name)
+
+    def add(
+        self,
+        docs: Iterable[Mapping[str, Any]],
+        embeddings: Iterable[Iterable[float]],
+    ) -> list[str]:
+        docs_list = list(docs)
+        emb_list = [list(e) for e in embeddings]
+        if len(docs_list) != len(emb_list):
+            raise ValueError("docs and embeddings must have equal length")
+        rows: list[dict[str, Any]] = []
+        ids: list[str] = []
+        for d, e in zip(docs_list, emb_list):
+            doc_id = str(d.get("id") or uuid.uuid4())
+            row = {
+                "id": doc_id,
+                "vector": e,
+                "page_content": d.get("page_content", ""),
+            }
+            for k, v in (d.get("metadata") or {}).items():
+                if isinstance(v, (str, int, float, bool)):
+                    row[k] = v
+            rows.append(row)
+            ids.append(doc_id)
+        if rows:
+            self._table.add(rows)
+        return ids
+
+    def similarity_search(
+        self,
+        query_embedding: Iterable[float],
+        k: int = 5,
+        filter: Mapping[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        q = list(query_embedding)
+        if len(q) != self.dim:
+            raise ValueError(f"query embedding must have length {self.dim}, got {len(q)}")
+        builder = self._table.search(q).limit(k)
+        if filter:
+            # LanceDB accepts SQL-WHERE-style filter strings.
+            parts = []
+            for fk, fv in filter.items():
+                if isinstance(fv, str):
+                    parts.append(f"{fk} = '{fv}'")
+                else:
+                    parts.append(f"{fk} = {fv}")
+            builder = builder.where(" AND ".join(parts))
+        df = builder.to_pandas()
+        out: list[dict[str, Any]] = []
+        for _, row in df.iterrows():
+            d = row.to_dict()
+            doc_id = str(d.pop("id", ""))
+            content = d.pop("page_content", "")
+            score = float(d.pop("_distance", 0.0))
+            d.pop("vector", None)
+            out.append({
+                "id": doc_id,
+                "page_content": content,
+                "score": -score,  # _distance is L2; lower = better. Flip sign for cosine-feel.
+                "metadata": d,
+            })
+        return out
+
+    def delete(self, ids: Iterable[str]) -> None:
+        id_list = list(ids)
+        if not id_list:
+            return
+        quoted = ", ".join(f"'{i}'" for i in id_list)
+        self._table.delete(f"id IN ({quoted})")
+
+    def __len__(self) -> int:
+        try:
+            return int(self._table.count_rows())
+        except Exception:
+            return 0
+
+
+# ---- Cassandra (CassIO) ----
+
+
+class CassandraVectorStore:
+    """Cassandra / DataStax Astra vector store via `cassio`. Lazy-
+    imports `cassio` + `cassandra-driver`; install with
+    `pip install cassio cassandra-driver`.
+
+    Args:
+        table_name: target table (created if missing).
+        dim: embedding dimensionality.
+        keyspace: keyspace (must exist).
+        contact_points: list of node hostnames.
+        port: native protocol port.
+        username, password: auth (or env `CASSANDRA_USERNAME` /
+            `CASSANDRA_PASSWORD`).
+        astra_bundle: optional path to a DataStax Astra secure-connect
+            zip — when set, contact_points / port are ignored.
+    """
+
+    def __init__(
+        self,
+        table_name: str,
+        dim: int,
+        keyspace: str = "litgraph",
+        contact_points: tuple[str, ...] = ("127.0.0.1",),
+        port: int = 9042,
+        username: str | None = None,
+        password: str | None = None,
+        astra_bundle: str | None = None,
+    ) -> None:
+        try:
+            import cassio  # type: ignore[import-not-found]
+            from cassandra.auth import PlainTextAuthProvider  # type: ignore[import-not-found]
+            from cassandra.cluster import Cluster  # type: ignore[import-not-found]
+        except ImportError as e:
+            raise ImportError(
+                "cassio + cassandra-driver not installed. "
+                "Run `pip install cassio cassandra-driver`."
+            ) from e
+        import os as _os
+        if dim <= 0:
+            raise ValueError("dim must be positive")
+        user = username or _os.environ.get("CASSANDRA_USERNAME")
+        pwd = password or _os.environ.get("CASSANDRA_PASSWORD")
+        auth = PlainTextAuthProvider(username=user, password=pwd) if user else None
+        if astra_bundle:
+            self._cluster = Cluster(
+                cloud={"secure_connect_bundle": astra_bundle},
+                auth_provider=auth,
+            )
+        else:
+            self._cluster = Cluster(
+                contact_points=list(contact_points),
+                port=port,
+                auth_provider=auth,
+            )
+        self._session = self._cluster.connect(keyspace)
+        cassio.init(session=self._session, keyspace=keyspace)
+        from cassio.table import MetadataVectorCassandraTable  # type: ignore[import-not-found]
+        self.dim = dim
+        self.table_name = table_name
+        self._table = MetadataVectorCassandraTable(
+            table=table_name, vector_dimension=dim
+        )
+
+    def add(
+        self,
+        docs: Iterable[Mapping[str, Any]],
+        embeddings: Iterable[Iterable[float]],
+    ) -> list[str]:
+        docs_list = list(docs)
+        emb_list = [list(e) for e in embeddings]
+        if len(docs_list) != len(emb_list):
+            raise ValueError("docs and embeddings must have equal length")
+        ids: list[str] = []
+        for d, e in zip(docs_list, emb_list):
+            doc_id = str(d.get("id") or uuid.uuid4())
+            self._table.put(
+                row_id=doc_id,
+                body_blob=d.get("page_content", ""),
+                vector=e,
+                metadata={k: str(v) for k, v in (d.get("metadata") or {}).items() if isinstance(v, (str, int, float, bool))},
+            )
+            ids.append(doc_id)
+        return ids
+
+    def similarity_search(
+        self,
+        query_embedding: Iterable[float],
+        k: int = 5,
+        filter: Mapping[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        q = list(query_embedding)
+        if len(q) != self.dim:
+            raise ValueError(f"query embedding must have length {self.dim}, got {len(q)}")
+        kwargs: dict[str, Any] = {"vector": q, "n": k}
+        if filter:
+            kwargs["metadata"] = {k: str(v) for k, v in filter.items()}
+        out: list[dict[str, Any]] = []
+        for hit in self._table.metric_ann_search(**kwargs):
+            out.append({
+                "id": str(hit["row_id"]),
+                "page_content": hit.get("body_blob", ""),
+                "score": float(hit.get("distance", 0.0)),
+                "metadata": dict(hit.get("metadata", {})),
+            })
+        return out
+
+    def delete(self, ids: Iterable[str]) -> None:
+        for doc_id in ids:
+            self._table.delete(row_id=doc_id)
+
+    def __len__(self) -> int:
+        # CassIO doesn't expose a row-count directly; SELECT COUNT is
+        # expensive on Cassandra anyway. Return -1 to signal "unknown".
+        return -1
+
+    def close(self) -> None:
+        self._cluster.shutdown()

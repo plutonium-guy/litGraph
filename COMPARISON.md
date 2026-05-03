@@ -228,13 +228,13 @@ LangGraph inherits LangChain's wrappers wholesale.
 | pgvector | ✅ | ✅ | 📦 |
 | Chroma | ✅ | ✅ | 📦 |
 | Weaviate | ✅ | ✅ | 📦 |
-| LanceDB | 🚫 | ✅ | 📦 |
-| Pinecone | 🚫 | ✅ | 📦 |
+| LanceDB | ⏳ (`litgraph.stores_extras.LanceDBVectorStore` courtesy adapter — natives preferred) | ✅ | 📦 |
+| Pinecone | ⏳ (`litgraph.stores_extras.PineconeVectorStore` courtesy adapter — natives preferred) | ✅ | 📦 |
 | Milvus | ✅ (`litgraph.stores_extras.MilvusVectorStore`) | ✅ | 📦 |
 | Redis-search | ✅ (`litgraph.stores_extras.RedisSearchVectorStore`) | ✅ | 📦 |
 | Neo4j (vector) | ✅ (`litgraph.stores_extras.Neo4jVectorStore`) | ✅ | 📦 |
 | MongoDB Atlas Vector | ✅ (`litgraph.stores_extras.MongoAtlasVectorStore`) | ✅ | 📦 |
-| Total | 6 native + 5 via `stores_extras` (FAISS / Milvus / Redis-search / Neo4j / Mongo Atlas) | 80+ | inherits |
+| Total | 6 native + 8 via `stores_extras` (FAISS / Milvus / Redis-search / Neo4j / Mongo Atlas / Pinecone / LanceDB / Cassandra) | 80+ | inherits |
 
 LangChain wins coverage; litGraph covers the production-relevant 6.
 

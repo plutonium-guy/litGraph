@@ -112,6 +112,86 @@ class Neo4jVectorStore:
     def close(self) -> None: ...
 
 
+class PineconeVectorStore:
+    index_name: str
+    dim: int
+    namespace: str
+    def __init__(
+        self,
+        index_name: str,
+        dim: int,
+        api_key: str | None = ...,
+        namespace: str = "",
+    ) -> None: ...
+    def add(
+        self,
+        docs: Iterable[Mapping[str, Any]],
+        embeddings: Iterable[Iterable[float]],
+    ) -> list[str]: ...
+    def similarity_search(
+        self,
+        query_embedding: Iterable[float],
+        k: int = 5,
+        filter: Mapping[str, Any] | None = ...,
+    ) -> list[dict[str, Any]]: ...
+    def delete(self, ids: Iterable[str]) -> None: ...
+    def __len__(self) -> int: ...
+
+
+class LanceDBVectorStore:
+    table_name: str
+    dim: int
+    def __init__(
+        self,
+        table_name: str,
+        dim: int,
+        uri: str = "./lance.db",
+    ) -> None: ...
+    def add(
+        self,
+        docs: Iterable[Mapping[str, Any]],
+        embeddings: Iterable[Iterable[float]],
+    ) -> list[str]: ...
+    def similarity_search(
+        self,
+        query_embedding: Iterable[float],
+        k: int = 5,
+        filter: Mapping[str, Any] | None = ...,
+    ) -> list[dict[str, Any]]: ...
+    def delete(self, ids: Iterable[str]) -> None: ...
+    def __len__(self) -> int: ...
+
+
+class CassandraVectorStore:
+    dim: int
+    table_name: str
+    def __init__(
+        self,
+        table_name: str,
+        dim: int,
+        keyspace: str = "litgraph",
+        contact_points: tuple[str, ...] = ...,
+        port: int = 9042,
+        username: str | None = ...,
+        password: str | None = ...,
+        astra_bundle: str | None = ...,
+    ) -> None: ...
+    def add(
+        self,
+        docs: Iterable[Mapping[str, Any]],
+        embeddings: Iterable[Iterable[float]],
+    ) -> list[str]: ...
+    def similarity_search(
+        self,
+        query_embedding: Iterable[float],
+        k: int = 5,
+        filter: Mapping[str, Any] | None = ...,
+    ) -> list[dict[str, Any]]: ...
+    def delete(self, ids: Iterable[str]) -> None: ...
+    def __len__(self) -> int: ...
+    def close(self) -> None: ...
+
+
 class MongoAtlasVectorStore:
     collection_name: str
     dim: int

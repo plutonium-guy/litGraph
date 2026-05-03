@@ -6,6 +6,7 @@
 //! This is the 80% use case — native provider tool-calling is faster and more
 //! reliable than any regex-parsed ReAct pattern. No regex. No text parsing.
 
+pub mod middleware;
 pub mod react;
 pub mod supervisor;
 pub mod text_react;
