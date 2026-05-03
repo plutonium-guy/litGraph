@@ -11,6 +11,8 @@ from litgraph.loaders_extras import (
     ImapLoader,
     YouTubeTranscriptLoader,
     AirtableLoader,
+    OutlookLoader,
+    TwitterLoader,
     _doc,
     _extract_email_body,
 )
@@ -63,3 +65,59 @@ def test_airtable_requires_api_key_at_load():
     # Cheap to construct without the key:
     assert loader.base_id == "appX"
     assert loader.table_name == "t"
+
+
+# ---- Outlook ----
+
+def test_outlook_requires_token():
+    """No env var, no constructor arg → eager error."""
+    import os
+    saved = os.environ.pop("MS_GRAPH_TOKEN", None)
+    try:
+        with pytest.raises(ValueError, match="access_token required"):
+            OutlookLoader()
+    finally:
+        if saved is not None:
+            os.environ["MS_GRAPH_TOKEN"] = saved
+
+
+def test_outlook_max_messages_must_be_positive():
+    with pytest.raises(ValueError):
+        OutlookLoader(access_token="x", max_messages=0)
+
+
+def test_outlook_reads_token_from_env(monkeypatch):
+    monkeypatch.setenv("MS_GRAPH_TOKEN", "env-token-xyz")
+    loader = OutlookLoader()
+    assert loader.access_token == "env-token-xyz"
+
+
+# ---- Twitter ----
+
+def test_twitter_requires_query_xor_user_id():
+    with pytest.raises(ValueError, match="exactly one of"):
+        TwitterLoader(query="x", user_id="u", bearer_token="t")
+    with pytest.raises(ValueError, match="exactly one of"):
+        TwitterLoader(bearer_token="t")  # neither set
+
+
+def test_twitter_max_results_must_be_positive():
+    with pytest.raises(ValueError):
+        TwitterLoader(query="x", bearer_token="t", max_results=0)
+
+
+def test_twitter_bearer_token_required():
+    import os
+    saved = os.environ.pop("TWITTER_BEARER_TOKEN", None)
+    try:
+        with pytest.raises(ValueError, match="bearer_token required"):
+            TwitterLoader(query="x")
+    finally:
+        if saved is not None:
+            os.environ["TWITTER_BEARER_TOKEN"] = saved
+
+
+def test_twitter_user_id_form_is_valid():
+    loader = TwitterLoader(user_id="123", bearer_token="t")
+    assert loader.user_id == "123"
+    assert loader.query is None

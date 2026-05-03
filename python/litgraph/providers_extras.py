@@ -33,6 +33,9 @@ __all__ = [
     "snowflake_cortex_chat",
     "databricks_chat",
     "replicate_chat",
+    "mistralrs_chat",
+    "vllm_chat",
+    "llamacpp_chat",
 ]
 
 
@@ -150,3 +153,45 @@ def replicate_chat(
     `REPLICATE_API_TOKEN`."""
     key = api_key or os.environ.get("REPLICATE_API_TOKEN", "")
     return _openai_compat(model, api_key=key, base_url=base_url, **kwargs)
+
+
+# ---- Local-model HTTP servers (OpenAI-compat) ----
+
+
+def mistralrs_chat(
+    model: str,
+    base_url: str = "http://127.0.0.1:1234/v1",
+    api_key: str = "no-key",
+    **kwargs: Any,
+) -> Any:
+    """Chat against a `mistral.rs` server. mistral.rs ships an
+    OpenAI-compatible REST endpoint, so this is a thin wrapper around
+    `OpenAIChat(base_url=...)`. Run the server with
+    `mistralrs-server -p 1234 plain -m <model> -a mistral`. No API
+    key required; pass any string."""
+    return _openai_compat(model, api_key=api_key, base_url=base_url, **kwargs)
+
+
+def vllm_chat(
+    model: str,
+    base_url: str = "http://127.0.0.1:8000/v1",
+    api_key: str = "no-key",
+    **kwargs: Any,
+) -> Any:
+    """Chat against a vLLM `--api-server` instance. vLLM ships
+    OpenAI-compat by default at `/v1/chat/completions`. Run with
+    `vllm serve <model>` to start a local instance."""
+    return _openai_compat(model, api_key=api_key, base_url=base_url, **kwargs)
+
+
+def llamacpp_chat(
+    model: str = "llama",
+    base_url: str = "http://127.0.0.1:8080/v1",
+    api_key: str = "no-key",
+    **kwargs: Any,
+) -> Any:
+    """Chat against `llama.cpp`'s server (`./server -m model.gguf
+    --port 8080`). The server speaks the OpenAI Chat Completions API
+    via the `--api` flag. `model` is a label; llama.cpp ignores it
+    in single-model mode."""
+    return _openai_compat(model, api_key=api_key, base_url=base_url, **kwargs)

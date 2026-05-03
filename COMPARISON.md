@@ -178,7 +178,7 @@ LangChain Community: largest *catalogue* but spread across N packages.
 | Backend: SQLite | ✅ | ✅ | ⏳ |
 | Backend: Postgres | ✅ | ✅ | ✅ |
 | Backend: Redis | ✅ | ✅ | ⏳ |
-| Backend: DynamoDB / MongoDB / Cassandra / … | ⏳ (`litgraph.memory_extras.{DynamoDB,Mongo}ChatMemory`; Cassandra still ❌) | ✅ (Community) | 📦📦 |
+| Backend: DynamoDB / MongoDB / Cassandra / … | ✅ (`litgraph.memory_extras.{DynamoDB,Mongo,Cassandra}ChatMemory`) | ✅ (Community) | 📦📦 |
 | Hierarchical / namespaced memory | ✅ (`litgraph.memory_extras.NamespacedMemory`) | ⏳ | ✅ |
 | Vector-backed long-term memory | ✅ (postgres + sqlite) | ✅ | ✅ |
 
@@ -251,7 +251,7 @@ LangChain wins coverage; litGraph covers the production-relevant 6.
 | Confluence · Jira · Linear · Notion · Slack | ✅ | ✅ | 📦 |
 | GitHub (files + issues) · GitLab · Discord · Wikipedia | ✅ | ✅ | 📦 |
 | Gmail · Jupyter | ✅ | ✅ | 📦 |
-| Outlook · IMAP · WhatsApp · YouTube · Hugging Face · Airtable · Reddit · Twitter · … | ⏳ (`litgraph.loaders_extras`: IMAP / YouTube transcript / Reddit / Airtable) | ✅ (Community, ~150 total) | 📦 |
+| Outlook · IMAP · WhatsApp · YouTube · Hugging Face · Airtable · Reddit · Twitter · … | ✅ (`litgraph.loaders_extras`: IMAP / Outlook / YouTube transcript / Reddit / Airtable / Twitter / HuggingFace datasets — WhatsApp Business still ❌) | ✅ (Community, ~150 total) | 📦 |
 | **Parallel ingest** | ✅ (rayon, all loaders) | ⏳ (depends on loader) | 📦 |
 | Total stock loaders | ~ 25 | 150+ | inherits |
 
@@ -399,7 +399,7 @@ LangChain has no HITL — that's why LangGraph exists.
 | Mistral | ⏳ (via OpenAI-compat) | ✅ (native) | 📦 |
 | Ollama / vLLM / Together / Groq / Fireworks / DeepSeek / xAI / LM Studio | ✅ (via OpenAI-compat) | ✅ (each native) | 📦 |
 | HuggingFace TGI · IBM watsonx · Databricks · Snowflake Cortex · Replicate · NVIDIA NIM | ✅ (`litgraph.providers_extras` one-liners) | ✅ (Community) | 📦 |
-| Local model via candle / mistral.rs | ❌ (planned) | ❌ | ❌ |
+| Local model via candle / mistral.rs | ✅ via OpenAI-compat (`providers_extras.{mistralrs,vllm,llamacpp}_chat`); native candle Rust crate still planned | ❌ | ❌ |
 | Total provider count | ~ 6 native + 8 OpenAI-compat | 50+ | inherits |
 
 LangChain wins on native-integration breadth; litGraph hits the

@@ -35,6 +35,7 @@ __all__ = [
     "NS_KEY",
     "DynamoDBChatMemory",
     "MongoChatMemory",
+    "CassandraChatMemory",
 ]
 
 
@@ -351,3 +352,152 @@ class MongoChatMemory:
     def clear(self) -> None:
         self._coll.delete_many({"session_id": self.session_id})
         self._system_pin = None
+
+
+# ---- Cassandra chat-history backend ----
+
+
+class CassandraChatMemory:
+    """Persistent chat history in a Cassandra / ScyllaDB / AstraDB
+    cluster. Lazy-imports `cassandra-driver`; install with
+    `pip install cassandra-driver`.
+
+    Schema:
+        CREATE TABLE chat_messages (
+            session_id text,
+            ts timeuuid,
+            role text,
+            content text,
+            metadata text,
+            PRIMARY KEY (session_id, ts)
+        ) WITH CLUSTERING ORDER BY (ts ASC);
+
+    The wrapper auto-creates the table if missing.
+
+    Args:
+        session_id: chat session id.
+        keyspace: target keyspace (must exist).
+        contact_points: list of node hostnames.
+        port: native protocol port.
+        username, password: auth (or env `CASSANDRA_USERNAME` / `CASSANDRA_PASSWORD`).
+        table_name: chat-message table.
+        astra_bundle: optional path to a DataStax Astra secure-connect
+            zip — when set, contact_points / port are ignored.
+    """
+
+    def __init__(
+        self,
+        session_id: str,
+        keyspace: str = "litgraph",
+        contact_points: tuple[str, ...] = ("127.0.0.1",),
+        port: int = 9042,
+        username: str | None = None,
+        password: str | None = None,
+        table_name: str = "chat_messages",
+        astra_bundle: str | None = None,
+    ) -> None:
+        try:
+            from cassandra.auth import PlainTextAuthProvider  # type: ignore[import-not-found]
+            from cassandra.cluster import Cluster  # type: ignore[import-not-found]
+        except ImportError as e:
+            raise ImportError(
+                "cassandra-driver not installed. "
+                "Run `pip install cassandra-driver`."
+            ) from e
+        import os as _os
+        if not session_id:
+            raise ValueError("session_id required")
+        self.session_id = session_id
+        self.keyspace = keyspace
+        self.table_name = table_name
+        user = username or _os.environ.get("CASSANDRA_USERNAME")
+        pwd = password or _os.environ.get("CASSANDRA_PASSWORD")
+        auth = PlainTextAuthProvider(username=user, password=pwd) if user else None
+        if astra_bundle:
+            self._cluster = Cluster(
+                cloud={"secure_connect_bundle": astra_bundle},
+                auth_provider=auth,
+            )
+        else:
+            self._cluster = Cluster(
+                contact_points=list(contact_points),
+                port=port,
+                auth_provider=auth,
+            )
+        self._session = self._cluster.connect(keyspace)
+        self._session.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {keyspace}.{table_name} (
+                session_id text,
+                ts timeuuid,
+                role text,
+                content text,
+                metadata text,
+                PRIMARY KEY (session_id, ts)
+            ) WITH CLUSTERING ORDER BY (ts ASC)
+            """
+        )
+        self._system_pin: Mapping[str, Any] | None = None
+
+    def _put(self, role: str, text: str, metadata: Mapping[str, Any] | None = None) -> None:
+        import json as _json
+        from cassandra.util import uuid_from_time  # type: ignore[import-not-found]
+        import time as _time
+        self._session.execute(
+            f"INSERT INTO {self.keyspace}.{self.table_name} "
+            "(session_id, ts, role, content, metadata) VALUES (%s, %s, %s, %s, %s)",
+            (
+                self.session_id,
+                uuid_from_time(_time.time()),
+                role,
+                text,
+                _json.dumps(metadata or {}),
+            ),
+        )
+
+    def add_user(self, text: str, metadata: Mapping[str, Any] | None = None) -> None:
+        self._put("user", text, metadata)
+
+    def add_ai(self, text: str, metadata: Mapping[str, Any] | None = None) -> None:
+        self._put("assistant", text, metadata)
+
+    def add_tool(self, text: str, metadata: Mapping[str, Any] | None = None) -> None:
+        self._put("tool", text, metadata)
+
+    def set_system(self, message: Mapping[str, Any] | str | None) -> None:
+        if isinstance(message, str):
+            self._system_pin = {"role": "system", "content": message}
+        else:
+            self._system_pin = dict(message) if message is not None else None
+
+    def messages(self) -> list[Mapping[str, Any]]:
+        import json as _json
+        out: list[Mapping[str, Any]] = []
+        if self._system_pin is not None:
+            out.append(self._system_pin)
+        rows = self._session.execute(
+            f"SELECT role, content, metadata FROM {self.keyspace}.{self.table_name} "
+            "WHERE session_id = %s",
+            (self.session_id,),
+        )
+        for row in rows:
+            try:
+                md = _json.loads(row.metadata) if row.metadata else {}
+            except (TypeError, ValueError):
+                md = {}
+            out.append({
+                "role": row.role,
+                "content": row.content,
+                "metadata": md,
+            })
+        return out
+
+    def clear(self) -> None:
+        self._session.execute(
+            f"DELETE FROM {self.keyspace}.{self.table_name} WHERE session_id = %s",
+            (self.session_id,),
+        )
+        self._system_pin = None
+
+    def close(self) -> None:
+        self._cluster.shutdown()

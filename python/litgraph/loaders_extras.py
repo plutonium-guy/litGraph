@@ -33,6 +33,9 @@ __all__ = [
     "YouTubeTranscriptLoader",
     "RedditLoader",
     "AirtableLoader",
+    "OutlookLoader",
+    "HuggingFaceDatasetsLoader",
+    "TwitterLoader",
 ]
 
 
@@ -358,4 +361,234 @@ class AirtableLoader:
                 record_id=row.get("id", ""),
                 created_time=row.get("createdTime", ""),
             ))
+        return docs
+
+
+class OutlookLoader:
+    """Pull emails from Outlook / Microsoft 365 via the Microsoft
+    Graph API. Lazy-imports `requests`; install with
+    `pip install requests`.
+
+    Auth: uses an OAuth2 access token (passed in or read from
+    `MS_GRAPH_TOKEN`). Acquire via the `msal` library or device-code
+    flow — out of scope for this loader; the token is the only input.
+
+    Args:
+        access_token: Bearer token with `Mail.Read` (or
+            `Mail.ReadBasic`) scope.
+        folder: Outlook folder to fetch (default "inbox"). Use
+            `mailFolders/{id}` for nested folders.
+        max_messages: cap.
+        select: comma-separated `$select` fields. Default covers the
+            ones used in the document body.
+        filter: optional Graph `$filter` clause (e.g.
+            "receivedDateTime ge 2025-01-01T00:00:00Z").
+    """
+
+    def __init__(
+        self,
+        access_token: str | None = None,
+        folder: str = "inbox",
+        max_messages: int = 50,
+        select: str = "subject,from,receivedDateTime,bodyPreview,body",
+        filter: str | None = None,
+    ) -> None:
+        if max_messages <= 0:
+            raise ValueError("max_messages must be positive")
+        self.access_token = access_token or os.environ.get("MS_GRAPH_TOKEN")
+        if not self.access_token:
+            raise ValueError(
+                "access_token required (env MS_GRAPH_TOKEN). "
+                "Acquire via msal or the device-code flow."
+            )
+        self.folder = folder
+        self.max_messages = max_messages
+        self.select = select
+        self.filter = filter
+
+    def load(self) -> list[dict[str, Any]]:
+        try:
+            import requests  # type: ignore[import-not-found]
+        except ImportError as e:
+            raise ImportError("requests not installed. Run `pip install requests`.") from e
+        import re
+
+        url = f"https://graph.microsoft.com/v1.0/me/{self.folder}/messages"
+        params: dict[str, Any] = {
+            "$top": min(self.max_messages, 100),
+            "$select": self.select,
+            "$orderby": "receivedDateTime desc",
+        }
+        if self.filter:
+            params["$filter"] = self.filter
+        headers = {"Authorization": f"Bearer {self.access_token}"}
+
+        docs: list[dict[str, Any]] = []
+        fetched = 0
+        while url and fetched < self.max_messages:
+            r = requests.get(url, headers=headers, params=params if "$select" in (params or {}) else None, timeout=30)
+            r.raise_for_status()
+            payload = r.json()
+            for item in payload.get("value", []):
+                if fetched >= self.max_messages:
+                    break
+                body = item.get("body") or {}
+                content = body.get("content", "") or item.get("bodyPreview", "")
+                # Strip HTML if returned as html.
+                if body.get("contentType", "").lower() == "html":
+                    content = re.sub(r"<[^>]+>", " ", content)
+                sender = (item.get("from") or {}).get("emailAddress", {}).get("address", "")
+                docs.append(_doc(
+                    content,
+                    source="outlook",
+                    folder=self.folder,
+                    message_id=item.get("id", ""),
+                    subject=item.get("subject", ""),
+                    sender=sender,
+                    received=item.get("receivedDateTime", ""),
+                ))
+                fetched += 1
+            url = payload.get("@odata.nextLink")
+            params = {}  # nextLink already encodes the params
+        return docs
+
+
+class HuggingFaceDatasetsLoader:
+    """Iterate a HuggingFace dataset and emit Documents. Lazy-imports
+    `datasets`; install with `pip install datasets`.
+
+    Args:
+        dataset_name: the canonical HF id (e.g. "squad", "imdb").
+        split: "train" / "validation" / "test".
+        text_column: column whose value becomes `page_content`.
+        max_records: cap.
+        config_name: dataset config / subset (optional).
+        streaming: use streaming mode (recommended for large datasets;
+            doesn't materialise the full table in RAM).
+    """
+
+    def __init__(
+        self,
+        dataset_name: str,
+        split: str = "train",
+        text_column: str = "text",
+        max_records: int = 1000,
+        config_name: str | None = None,
+        streaming: bool = True,
+    ) -> None:
+        self.dataset_name = dataset_name
+        self.split = split
+        self.text_column = text_column
+        self.max_records = max_records
+        self.config_name = config_name
+        self.streaming = streaming
+
+    def load(self) -> list[dict[str, Any]]:
+        try:
+            from datasets import load_dataset  # type: ignore[import-not-found]
+        except ImportError as e:
+            raise ImportError(
+                "datasets not installed. Run `pip install datasets`."
+            ) from e
+        ds = load_dataset(
+            self.dataset_name,
+            self.config_name,
+            split=self.split,
+            streaming=self.streaming,
+        )
+        docs: list[dict[str, Any]] = []
+        for i, row in enumerate(ds):
+            if i >= self.max_records:
+                break
+            text = row.get(self.text_column, "") or ""
+            md = {k: v for k, v in row.items() if k != self.text_column and isinstance(v, (str, int, float, bool))}
+            docs.append(_doc(
+                str(text),
+                source="huggingface_datasets",
+                dataset=self.dataset_name,
+                split=self.split,
+                row_index=i,
+                **md,
+            ))
+        return docs
+
+
+class TwitterLoader:
+    """Pull tweets via the X (Twitter) API v2. Lazy-imports `tweepy`;
+    install with `pip install tweepy`. Requires a bearer token from
+    a paid X developer account — Twitter retired free tiers in 2023.
+
+    Args:
+        bearer_token: X API v2 bearer token. Falls back to
+            `TWITTER_BEARER_TOKEN` env.
+        query: search query (X API v2 search syntax).
+        max_results: cap (X enforces 10–100 per page; the loader
+            paginates up to this total).
+        tweet_fields: comma-separated `tweet.fields` parameter.
+        user_id: alternative to `query` — fetch a specific user's
+            timeline. Mutually exclusive with `query`.
+    """
+
+    def __init__(
+        self,
+        query: str | None = None,
+        bearer_token: str | None = None,
+        max_results: int = 100,
+        tweet_fields: str = "id,text,created_at,author_id,public_metrics",
+        user_id: str | None = None,
+    ) -> None:
+        if (query is None) == (user_id is None):
+            raise ValueError("specify exactly one of `query` or `user_id`")
+        if max_results <= 0:
+            raise ValueError("max_results must be positive")
+        self.query = query
+        self.user_id = user_id
+        self.bearer_token = bearer_token or os.environ.get("TWITTER_BEARER_TOKEN")
+        if not self.bearer_token:
+            raise ValueError("bearer_token required (env TWITTER_BEARER_TOKEN)")
+        self.max_results = max_results
+        self.tweet_fields = tweet_fields
+
+    def load(self) -> list[dict[str, Any]]:
+        try:
+            import tweepy  # type: ignore[import-not-found]
+        except ImportError as e:
+            raise ImportError(
+                "tweepy not installed. Run `pip install tweepy`."
+            ) from e
+        client = tweepy.Client(bearer_token=self.bearer_token)
+        per_page = min(self.max_results, 100)
+        per_page = max(per_page, 10)  # X API minimum
+        docs: list[dict[str, Any]] = []
+        # tweepy.Paginator handles next-token cursors transparently.
+        if self.query:
+            paginator = tweepy.Paginator(
+                client.search_recent_tweets,
+                query=self.query,
+                tweet_fields=self.tweet_fields,
+                max_results=per_page,
+                limit=(self.max_results + per_page - 1) // per_page,
+            )
+        else:
+            paginator = tweepy.Paginator(
+                client.get_users_tweets,
+                id=self.user_id,
+                tweet_fields=self.tweet_fields,
+                max_results=per_page,
+                limit=(self.max_results + per_page - 1) // per_page,
+            )
+        for response in paginator:
+            for tweet in (response.data or []):
+                if len(docs) >= self.max_results:
+                    return docs
+                metrics = getattr(tweet, "public_metrics", {}) or {}
+                docs.append(_doc(
+                    tweet.text or "",
+                    source="twitter",
+                    tweet_id=str(tweet.id),
+                    author_id=str(getattr(tweet, "author_id", "")),
+                    created_at=str(getattr(tweet, "created_at", "")),
+                    retweets=metrics.get("retweet_count", 0),
+                    likes=metrics.get("like_count", 0),
+                ))
         return docs

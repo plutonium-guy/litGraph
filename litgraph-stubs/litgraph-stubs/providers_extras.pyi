@@ -50,3 +50,27 @@ def replicate_chat(
     base_url: str = "https://openai-proxy.replicate.com/v1",
     **kwargs: Any,
 ) -> Any: ...
+
+
+def mistralrs_chat(
+    model: str,
+    base_url: str = "http://127.0.0.1:1234/v1",
+    api_key: str = "no-key",
+    **kwargs: Any,
+) -> Any: ...
+
+
+def vllm_chat(
+    model: str,
+    base_url: str = "http://127.0.0.1:8000/v1",
+    api_key: str = "no-key",
+    **kwargs: Any,
+) -> Any: ...
+
+
+def llamacpp_chat(
+    model: str = "llama",
+    base_url: str = "http://127.0.0.1:8080/v1",
+    api_key: str = "no-key",
+    **kwargs: Any,
+) -> Any: ...
