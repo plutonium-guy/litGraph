@@ -99,7 +99,10 @@ def serve(graph: Any, port: int = 8080, host: str = "0.0.0.0") -> str:
     AGENT_DX.md §13); the stub is here so coding-agent autocomplete
     finds the symbol.
     """
-    if not hasattr(graph, "graph_id") and not hasattr(graph, "compile"):
+    # Accept either a `StateGraph` (has `.compile`) or a `CompiledGraph`
+    # (has `.invoke`). Both are wireable into `litgraph-serve` once the
+    # binary side learns to ingest them.
+    if not hasattr(graph, "compile") and not hasattr(graph, "invoke"):
         raise TypeError(
             "recipes.serve expects a CompiledGraph or a StateGraph; "
             "got "

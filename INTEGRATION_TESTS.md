@@ -14,7 +14,7 @@ model). The reasoning model `deepseek-reasoner` is exercised in the
 streaming + structured-output tests where its different finish
 semantics matter.
 
-**Snapshot date:** 2026-05-02 · iter 365.
+**Snapshot date:** 2026-05-02 · iter 366.
 
 ---
 
@@ -41,7 +41,7 @@ provider changes.
 
 ## Tested ✅
 
-85 live integration tests against DeepSeek pass as of iter 365.
+88 live integration tests against DeepSeek pass as of iter 366.
 10 cleanly skipped:
 - `TokenBudgetChatModel`, `CostCappedChatModel`, `PiiScrubbingChatModel`
   not exposed on the Python surface today (4 cases — the TokenBudget
@@ -102,6 +102,7 @@ provider changes.
 | `Workflow.astream` final-chunk contract | `test_workflow_astream.py` (1 case) | v1 yields `{"final": <result>}` chunk after a real model call |
 | `compat.RunnablePassthrough` in parallel | `test_compat_runnable_passthrough.py` (1 case) | identity-branch alongside model-call branch in `RunnableParallel` |
 | Multi-turn context preservation | `test_chat_long_messages.py` (1 case) | system + 2 user/assistant turns + dependent follow-up |
+| `recipes.serve` stub command-renderer | `test_recipes_serve_stub.py` (3 cases) | accepts both StateGraph + CompiledGraph, rejects non-graphs (fixed a real bug — checker was looking for the wrong attrs) |
 
 ---
 
