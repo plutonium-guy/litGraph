@@ -14,7 +14,7 @@ model). The reasoning model `deepseek-reasoner` is exercised in the
 streaming + structured-output tests where its different finish
 semantics matter.
 
-**Snapshot date:** 2026-05-02 · iter 369.
+**Snapshot date:** 2026-05-02 · iter 370.
 
 ---
 
@@ -41,7 +41,7 @@ provider changes.
 
 ## Tested ✅
 
-108 live integration tests against DeepSeek pass as of iter 369.
+113 live integration tests against DeepSeek pass as of iter 370.
 10 cleanly skipped:
 - `TokenBudgetChatModel`, `CostCappedChatModel`, `PiiScrubbingChatModel`
   not exposed on the Python surface today (4 cases — the TokenBudget
@@ -109,6 +109,8 @@ provider changes.
 | `parsers.{parse_react_step,parse_xml_tags,parse_markdown_list,parse_comma_list,parse_boolean}` | `test_parsers_more.py` (5 cases) | parse ReAct/XML/MD-list/comma-list/yes-no replies coaxed from real DeepSeek output |
 | `splitters.{Recursive,MarkdownHeader}` + `tokenizers.{count_tokens,trim_messages}` | `test_splitters_tokenizers.py` (3 cases) | chunk a long doc + summarise; trim long history before invoke |
 | `tools.HttpRequestTool` via ReactAgent | `test_http_request_tool_live.py` (1 case, network-gated) | real GET to httpbin.org/uuid surfaces in agent reply (skips offline) |
+| `loaders.{TextLoader,JsonLoader,CsvLoader,MarkdownLoader}` | `test_loaders_live.py` (4 cases) | local-file ingestion with `content_field`/`content_column`, then summarise |
+| `loaders.DirectoryLoader` | `test_directory_loader.py` (1 case) | glob walk picks up multi-file tree |
 
 ---
 
