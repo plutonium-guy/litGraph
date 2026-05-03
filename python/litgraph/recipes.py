@@ -219,7 +219,7 @@ class _RagAgent:
         ]
         response = self.model.invoke(messages)
         return {
-            "answer": response.get("content", "") if isinstance(response, dict) else str(response),
+            "answer": _content_of(response),
             "hits": hits,
             "messages": messages + [response if isinstance(response, dict) else {"role": "assistant", "content": str(response)}],
         }
@@ -294,7 +294,7 @@ class _SupervisorAgent:
             },
         ]
         decision = self.model.invoke(messages)
-        text = decision.get("content", "") if isinstance(decision, dict) else str(decision)
+        text = _content_of(decision)
         # Pick the role whose name appears in the model's reply.
         chosen = next((r for r in roles if r in text), roles[0])
         worker = self.workers[chosen]
@@ -398,10 +398,17 @@ def summarize(
 
 
 def _content_of(resp: Any) -> str:
+    """Pull the assistant's text out of a ChatModel response.
+    Native litGraph providers return `{text, finish_reason, usage,
+    model}`; some shims return `{role, content}`. Tolerate both."""
     if isinstance(resp, dict):
-        return str(resp.get("content", ""))
-    if hasattr(resp, "content"):
-        return str(getattr(resp, "content"))
+        for key in ("text", "content"):
+            if key in resp and resp[key] is not None:
+                return str(resp[key])
+        return ""
+    for attr in ("text", "content"):
+        if hasattr(resp, attr):
+            return str(getattr(resp, attr))
     return str(resp)
 
 

@@ -41,16 +41,22 @@ provider changes.
 
 ## Tested ✅
 
-19 live integration tests against DeepSeek pass as of iter 353.
+30 live integration tests against DeepSeek pass as of iter 354.
 
 | Feature | Test file | Notes |
 |---|---|---|
 | `OpenAIChat.invoke` (single + multi-turn) | `test_chat_basic.py` (5 cases) | text / usage / model / finish_reason shapes |
 | `OpenAIChat.stream` | `test_chat_stream.py` (4 cases) | SSE → `delta` events + `done` event with usage |
 | Native tool calling via `ReactAgent` | `test_tool_calling.py` (2 cases) | full agent loop: tool_call → tool result → final |
+| `ReactAgent.stream` + `stream_tokens` | `test_react_stream.py` (2 cases) | iteration / final / token_delta events |
 | Structured output (`json_object` mode) | `test_structured_output.py` (2 cases) | DeepSeek requires "json" in prompt — see Gotchas |
 | `CostTracker` instrumentation | `test_cost_tracker.py` (3 cases) | per-call + per-model breakdown + USD helper |
 | `batch_chat` fan-out | `test_batch.py` (3 cases) | order preservation + concurrency = 1/3/4 |
+| `model.with_cache(...)` | `test_caching.py` (2 cases) | hit returns identical text; miss differs |
+| `model.with_retry()` / `with_rate_limit()` | `test_resilience.py` (3 cases) | wrappers compose; happy path passes through |
+| `StateGraph` with model node | `test_state_graph.py` (2 cases) | linear + parallel-branches both call DeepSeek |
+| `recipes.summarize` (map-reduce) | `test_recipes_live.py::test_summarize` | short text → 1 chunk → real summary |
+| `recipes.multi_agent` supervisor | `test_recipes_live.py::test_multi_agent_routes` | live routing decision |
 
 ---
 
@@ -132,7 +138,15 @@ on by default.
   text: ...}`. The `done` event carries the assembled text +
   `finish_reason` + `usage` + `model`.
 - **`max_tokens=10` is plenty** for the smoke tests. Whole suite
-  runs at < 1 cent on DeepSeek's published rates.
+  (30 cases) runs in ~ 30s at < 1 cent on DeepSeek's published
+  rates.
+- **All `model.with_*(...)` wrappers mutate in place + return None.**
+  `with_cache(cache)`, `with_retry(...)`, `with_rate_limit(...)`,
+  `instrument(tracker)` — keep using the original `model`
+  reference; the side-effect installs the wrapper inside.
+- **`recipes.summarize._content_of`** was reading `content` (LangChain
+  shape) but native litGraph providers return `text`. Fixed in
+  iter 354 — now tolerates both keys.
 
 ## Failure triage
 
