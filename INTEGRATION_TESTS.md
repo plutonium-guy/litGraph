@@ -14,7 +14,7 @@ model). The reasoning model `deepseek-reasoner` is exercised in the
 streaming + structured-output tests where its different finish
 semantics matter.
 
-**Snapshot date:** 2026-05-02 · iter 357.
+**Snapshot date:** 2026-05-02 · iter 358.
 
 ---
 
@@ -41,12 +41,15 @@ provider changes.
 
 ## Tested ✅
 
-56 live integration tests against DeepSeek pass as of iter 357.
-7 cleanly skipped (`TokenBudgetChatModel`, `CostCappedChatModel`,
-`PiiScrubbingChatModel` not exposed on the Python surface today;
-`test_react_agent_with_python_wrapped_tools_blocked` documented
-limitation — see Tool-hooks note below; `LlmJudge` blocked because
-DeepSeek rejects `response_format=json_schema` — see Gotchas).
+60 live integration tests against DeepSeek pass as of iter 358.
+9 cleanly skipped:
+- `TokenBudgetChatModel`, `CostCappedChatModel`, `PiiScrubbingChatModel`
+  not exposed on the Python surface today (3 cases).
+- `test_react_agent_with_python_wrapped_tools_blocked` — documented
+  Python `HookedTool` blocker (1 case).
+- `LlmJudge` (2 cases) and `synthesize_eval_cases` (2 cases) — both
+  use `StructuredChatModel` → `response_format=json_schema`, which
+  DeepSeek does not support today. See Gotchas.
 
 | Feature | Test file | Notes |
 |---|---|---|
@@ -75,6 +78,9 @@ DeepSeek rejects `response_format=json_schema` — see Gotchas).
 | `SupervisorAgent` worker routing | `test_supervisor_agent_live.py` (1 case) | supervisor delegates math → `math` worker |
 | `tool_dispatch_concurrent` | `test_tool_dispatch_concurrent.py` (2 cases) | parallel tool dispatch outside agent loop + per-call error sentinel |
 | `deep_agent.create_deep_agent` | `test_deep_agent_live.py` (2 cases) | factory with + without auto-injected Planning/VFS tools |
+| `tools.PythonReplTool` via ReactAgent | `test_python_repl_tool_live.py` (1 case) | sandboxed subprocess + agent loop computes `19*23*17 = 7429` |
+| `compat.{RunnableLambda,RunnableParallel}` | `test_compat_runnables.py` (2 cases) | LangChain shims compose with `Pipe` + a real model |
+| `streaming.stream_events` translator | `test_streaming_translator.py` (1 case) | LCEL-style `{event,name,run_id,data}` lifecycle records over real stream |
 
 ---
 
@@ -156,6 +162,13 @@ on by default.
   IS reusable, so save it: `compiled = g.compile(); compiled.invoke(...)`
   for each input. Don't call `g.compile()` inline inside the invoke
   loop.
+- **`streaming.stream_events` only emits lifecycle events**
+  (`on_chat_model_start`, `on_chat_model_end`) for a raw chat stream.
+  The intermediate `delta` chunks are NOT bridged into the LCEL-event
+  shape today — `data` is empty `{}` on the end record. To consume
+  delta tokens, iterate the underlying `model.stream(...)` directly
+  (which yields native `{type:"delta",text:...}` dicts) instead of
+  going through `stream_events`.
 - **`OpenAIChat.invoke` does NOT take `tools=` directly.** Tools
   flow through `ReactAgent` (the agent loop owns the
   `tool_calls` protocol). Don't try
