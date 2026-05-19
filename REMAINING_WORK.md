@@ -119,7 +119,7 @@ fully closed iters 378 + 379. Item 10 partially closed iter 377
   `CostCappedChatModel`
 
 #### Graph
-- ❌ Branch fan-in **dedup-by-key reducer** (today user-supplied)
+- ✅ Branch fan-in **dedup-by-key reducer** (iter 382 — `merge_dedup_by_key(current, update, key)`)
 - ✅ **`parallel_for` shorthand** for fan-out-N-copies pattern (iter 381 — `StateGraph::add_parallel_for(name, n, worker)`)
 
 #### Memory / store
