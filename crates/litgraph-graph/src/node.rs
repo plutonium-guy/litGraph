@@ -71,3 +71,49 @@ where
         Box::pin(fut)
     })
 }
+
+/// Wrap a synchronous CPU-bound closure as a `NodeFn`. The closure runs on
+/// `tokio::task::spawn_blocking` so it doesn't stall the async runtime.
+///
+/// Use for nodes that do CPU-heavy work — local model inference inline,
+/// tokenization over a big buffer, JSON-walking over megabytes of payload,
+/// PDF rasterization, etc. If the closure is short or async-friendly,
+/// `add_node` is the right call.
+///
+/// Cancellation: `spawn_blocking` runs on a dedicated thread pool and
+/// cannot be cancelled mid-call by tokio. The scheduler's `cancel` token
+/// only stops awaiting the JoinHandle; the closure still runs to
+/// completion on its worker thread.
+pub(crate) fn wrap_blocking_node<S, F>(f: F) -> NodeFn<S>
+where
+    S: Send + 'static,
+    F: Fn(S) -> NodeOutput + Send + Sync + 'static,
+{
+    let f = Arc::new(f);
+    Arc::new(move |s: S| {
+        let f = f.clone();
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || f(s))
+                .await
+                .map_err(|je| crate::GraphError::Panic(je.to_string()))
+        })
+    })
+}
+
+/// Fallible variant of [`wrap_blocking_node`] — closure may return an error.
+pub(crate) fn wrap_fallible_blocking_node<S, F>(f: F) -> NodeFn<S>
+where
+    S: Send + 'static,
+    F: Fn(S) -> crate::Result<NodeOutput> + Send + Sync + 'static,
+{
+    let f = Arc::new(f);
+    Arc::new(move |s: S| {
+        let f = f.clone();
+        Box::pin(async move {
+            match tokio::task::spawn_blocking(move || f(s)).await {
+                Ok(r) => r,
+                Err(je) => Err(crate::GraphError::Panic(je.to_string())),
+            }
+        })
+    })
+}

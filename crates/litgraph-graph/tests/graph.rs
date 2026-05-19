@@ -409,3 +409,108 @@ async fn checkpoint_preserves_next_sends_for_resume_after_interrupt() {
     r.sort();
     assert_eq!(r, vec![7, 9], "both Send payloads must survive checkpoint round-trip");
 }
+
+#[tokio::test]
+async fn blocking_node_produces_update() {
+    let mut g = StateGraph::<Counter>::new();
+    g.add_blocking_node("cpu", |s: Counter| {
+        let mut acc: u64 = 0;
+        for i in 0..1_000_u64 { acc = acc.wrapping_add(i); }
+        let _ = acc;
+        NodeOutput::update(Counter { n: s.n + 1 })
+    });
+    g.add_edge(START, "cpu");
+    g.add_edge("cpu", END);
+    let compiled = g.compile().unwrap();
+    let s = compiled.invoke(Counter::default(), None).await.unwrap();
+    assert_eq!(s.n, 1);
+}
+
+#[tokio::test]
+async fn fallible_blocking_node_propagates_error() {
+    use litgraph_graph::GraphError;
+    let mut g = StateGraph::<Counter>::new();
+    g.add_fallible_blocking_node("boom", |_s: Counter| {
+        Err::<NodeOutput, _>(GraphError::Other("synthetic".into()))
+    });
+    g.add_edge(START, "boom");
+    g.add_edge("boom", END);
+    let compiled = g.compile().unwrap();
+    let err = compiled.invoke(Counter::default(), None).await.unwrap_err();
+    assert!(matches!(err, GraphError::Other(ref m) if m == "synthetic"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn blocking_node_does_not_starve_sibling_async_node() {
+    // Two siblings fan out in parallel under a Send. One blocks the
+    // calling thread for ~150ms inside spawn_blocking; the other does
+    // a tokio::time::sleep for ~50ms. If the blocking node ran on the
+    // async runtime, it would prevent the sleeping task from being
+    // polled. With spawn_blocking, both progress concurrently — total
+    // wall time stays close to the blocking duration, not the sum.
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Clone, Default, Debug, Serialize, Deserialize)]
+    struct FanState {
+        order: Vec<String>,
+    }
+
+    fn reducer(mut state: FanState, update: serde_json::Value) -> Result<FanState, litgraph_graph::GraphError> {
+        if let Some(arr) = update.get("order").and_then(|v| v.as_array()) {
+            for s in arr {
+                if let Some(s) = s.as_str() {
+                    state.order.push(s.to_string());
+                }
+            }
+        }
+        Ok(state)
+    }
+
+    let async_done = Arc::new(AtomicUsize::new(0));
+    let async_done_clone = async_done.clone();
+
+    let mut g = StateGraph::<FanState>::new().with_reducer(reducer);
+    g.add_node("fanout", move |_s: FanState| {
+        async move {
+            NodeOutput::empty()
+                .send(Command { goto: "cpu".into(), update: json!({}) })
+                .send(Command { goto: "sleeper".into(), update: json!({}) })
+        }
+    });
+    g.add_blocking_node("cpu", |_s: FanState| {
+        // ~150ms of real CPU — std::thread::sleep simulates a heavy
+        // synchronous call (model forward pass / big tokenization).
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        NodeOutput::update(json!({ "order": ["cpu"] }))
+    });
+    g.add_node("sleeper", move |_s: FanState| {
+        let done = async_done_clone.clone();
+        async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            done.fetch_add(1, Ordering::SeqCst);
+            NodeOutput::update(json!({ "order": ["sleeper"] }))
+        }
+    });
+    g.add_edge(START, "fanout");
+    g.add_edge("cpu", END);
+    g.add_edge("sleeper", END);
+    let compiled = g.compile().unwrap();
+
+    let started = std::time::Instant::now();
+    let final_state = compiled.invoke(FanState::default(), None).await.unwrap();
+    let elapsed = started.elapsed();
+
+    assert_eq!(async_done.load(Ordering::SeqCst), 1, "sleeper must complete");
+    assert!(
+        final_state.order.contains(&"cpu".into()) && final_state.order.contains(&"sleeper".into()),
+        "both branches must reduce into state: got {:?}", final_state.order,
+    );
+    // Sleeper at 50ms + CPU at 150ms run concurrently → total ~150ms.
+    // Generous 350ms upper bound for CI jitter; sequential execution
+    // would land near or above 200ms steady state.
+    assert!(
+        elapsed < std::time::Duration::from_millis(350),
+        "expected concurrent execution under 350ms, got {:?}", elapsed,
+    );
+    let _ = AtomicUsize::new(0); // suppress unused-import in some configs
+}

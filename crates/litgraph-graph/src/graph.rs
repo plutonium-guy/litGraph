@@ -4,7 +4,10 @@ use std::sync::Arc;
 use serde::{Serialize, de::DeserializeOwned};
 
 use crate::checkpoint::{Checkpointer, MemoryCheckpointer};
-use crate::node::{NodeFn, NodeOutput, wrap_fallible_node, wrap_node};
+use crate::node::{
+    NodeFn, NodeOutput, wrap_blocking_node, wrap_fallible_blocking_node,
+    wrap_fallible_node, wrap_node,
+};
 use crate::scheduler::Scheduler;
 use crate::state::merge_append;
 use crate::{GraphError, Result};
@@ -79,6 +82,40 @@ where
         Fut: std::future::Future<Output = Result<NodeOutput>> + Send + 'static,
     {
         self.nodes.insert(name.into(), NodeEntry { func: wrap_fallible_node(func) });
+        self
+    }
+
+    /// Add a CPU-bound node whose body runs on `tokio::task::spawn_blocking`,
+    /// off the main async runtime. Use for inline local-model inference,
+    /// big-buffer tokenization, PDF rasterization, or any synchronous work
+    /// that would otherwise block sibling I/O nodes in the same superstep.
+    ///
+    /// The closure signature is sync (`Fn(S) -> NodeOutput`); for fallible
+    /// CPU work use [`Self::add_fallible_blocking_node`].
+    ///
+    /// Cancellation: tokio cannot cancel a `spawn_blocking` thread mid-call.
+    /// The graph's cancel token stops awaiting the result but the closure
+    /// finishes on its worker thread.
+    pub fn add_blocking_node<F>(&mut self, name: impl Into<String>, func: F) -> &mut Self
+    where
+        F: Fn(S) -> NodeOutput + Send + Sync + 'static,
+    {
+        self.nodes.insert(name.into(), NodeEntry { func: wrap_blocking_node(func) });
+        self
+    }
+
+    /// Fallible CPU-bound node — same dispatch as [`Self::add_blocking_node`]
+    /// but the closure may return `Result<NodeOutput>`.
+    pub fn add_fallible_blocking_node<F>(
+        &mut self,
+        name: impl Into<String>,
+        func: F,
+    ) -> &mut Self
+    where
+        F: Fn(S) -> Result<NodeOutput> + Send + Sync + 'static,
+    {
+        self.nodes
+            .insert(name.into(), NodeEntry { func: wrap_fallible_blocking_node(func) });
         self
     }
 

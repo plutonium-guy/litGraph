@@ -144,13 +144,16 @@ Total = sum. Anything ≥18 is fair game for the next ten iters.
   /threads/:id/resume`, `DELETE /threads/:id/resume`,
   `GET /resumes/pending`. Mounts alongside the chat / studio routers.
 
-### 10. Pregel-style super-step parallel execution audit
-- **Status:** ✅ scheduler exists, but worth a perf pass — currently
-  Send fan-out runs futures concurrently but always on the same
-  Tokio runtime; nodes that are CPU-bound (e.g. running a local
-  embedder inline) block the runtime. Audit + add a
-  `spawn_blocking` escape hatch for CPU-heavy nodes.
-- **Effort:** 1 iter.
+### 10. Pregel-style super-step parallel execution audit ✅ shipped iter 377
+- **Status:** ✅. `StateGraph::add_blocking_node` +
+  `add_fallible_blocking_node` (iter 377) wrap a sync CPU-bound
+  closure as a `NodeFn` that dispatches via
+  `tokio::task::spawn_blocking`. Heavy nodes (local-model forward
+  pass, big-buffer tokenization, PDF rasterization) no longer
+  stall the async runtime; sibling I/O nodes in the same superstep
+  progress concurrently. Cancellation caveat documented: tokio
+  cannot abort a `spawn_blocking` thread mid-call; the cancel
+  token stops only the await on the JoinHandle.
 
 ---
 
