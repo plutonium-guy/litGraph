@@ -140,9 +140,8 @@ fully closed iters 378 + 379. Item 10 partially closed iter 377
   the type-check bug)
 
 #### Python ergonomics
-- ❌ **Implicit Pydantic coercion** on `StateGraph(state_schema=)`
-- ❌ **`StreamPart` typed enum** mirroring `ChatStreamEvent` (today
-  duck-typed dict)
+- ✅ **Implicit Pydantic coercion** on `StateGraph(state_schema=)` (iter 378)
+- ✅ **`StreamPart` typed enum** mirroring `ChatStreamEvent` (iter 379)
 
 #### Observability
 - ❌ **Trace exemplars** linking OTel span → prompt+completion excerpt
