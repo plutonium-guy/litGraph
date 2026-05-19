@@ -120,7 +120,7 @@ fully closed iters 378 + 379. Item 10 partially closed iter 377
 
 #### Graph
 - ❌ Branch fan-in **dedup-by-key reducer** (today user-supplied)
-- ❌ **`parallel_for` shorthand** for fan-out-N-copies pattern
+- ✅ **`parallel_for` shorthand** for fan-out-N-copies pattern (iter 381 — `StateGraph::add_parallel_for(name, n, worker)`)
 
 #### Memory / store
 - ❌ **NamespacedMemory** that works on native backends (see Live-test

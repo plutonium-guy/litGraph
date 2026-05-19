@@ -440,6 +440,89 @@ async fn fallible_blocking_node_propagates_error() {
     assert!(matches!(err, GraphError::Other(ref m) if m == "synthetic"));
 }
 
+#[tokio::test]
+async fn add_parallel_for_fans_out_count_branches_with_unique_idx() {
+    // Verifies the auto-generated fan-out emits exactly N Sends,
+    // each carrying a distinct `_fanout_idx`, and each worker
+    // invocation reduces its branch result back into shared state.
+    #[derive(Clone, Default, Debug, Serialize, Deserialize)]
+    struct FanState {
+        indices: Vec<i64>,
+    }
+
+    fn reducer(
+        mut state: FanState,
+        update: serde_json::Value,
+    ) -> Result<FanState, litgraph_graph::GraphError> {
+        // Reducer surfaces `_fanout_idx` by pushing it onto the
+        // accumulator when it appears as a scalar; and on the
+        // worker output (which carries a `{"indices": [n]}`
+        // payload) it concatenates the array. This is the typical
+        // shape callers use — read the index in the worker,
+        // emit a per-branch result that the reducer appends.
+        if let Some(idx) = update.get("_fanout_idx").and_then(|v| v.as_i64()) {
+            state.indices.push(idx);
+        }
+        if let Some(arr) = update.get("indices").and_then(|v| v.as_array()) {
+            for v in arr {
+                if let Some(n) = v.as_i64() {
+                    state.indices.push(n);
+                }
+            }
+        }
+        Ok(state)
+    }
+
+    let mut g = StateGraph::<FanState>::new().with_reducer(reducer);
+    g.add_parallel_for("work", 3, |s: FanState| async move {
+        // Each branch sees the same FanState plus a merged-in
+        // `_fanout_idx` (handled by the reducer above). The worker
+        // emits a per-branch indices array — the reducer
+        // concatenates across branches.
+        let last = *s.indices.last().unwrap_or(&-1);
+        NodeOutput::update(serde_json::json!({
+            "indices": [last * 10],
+        }))
+    });
+    g.add_edge(START, "work_fanout");
+    g.add_edge("work_worker", END);
+    let compiled = g.compile().unwrap();
+    let final_state = compiled.invoke(FanState::default(), None).await.unwrap();
+
+    // Three Sends → each worker invocation sees its own
+    // `_fanout_idx` (0, 1, 2) merged into its PER-TASK state via
+    // the reducer (not into shared state — that's the LangGraph
+    // Send semantic: siblings don't see each other's overrides).
+    // The worker reads its idx from `indices[-1]` (which was just
+    // pushed by the reducer on the per-task clone), then emits
+    // `[idx * 10]`. Those outputs DO reduce into shared state in
+    // completion order. So the shared-state `indices` end up as
+    // the permutation of {0, 10, 20}.
+    let mut sorted = final_state.indices.clone();
+    sorted.sort();
+    assert_eq!(
+        sorted,
+        vec![0, 10, 20],
+        "expected three worker outputs idx*10 for idx in 0..3",
+    );
+}
+
+#[tokio::test]
+async fn add_parallel_for_zero_count_short_circuits_to_end() {
+    // Degenerate case: count = 0. The fanout node emits no Sends,
+    // so the worker never runs and the graph reaches END with
+    // initial state untouched.
+    let mut g = StateGraph::<Counter>::new();
+    g.add_parallel_for("noop", 0, |s: Counter| async move {
+        NodeOutput::update(Counter { n: s.n + 1 })
+    });
+    g.add_edge(START, "noop_fanout");
+    g.add_edge("noop_worker", END);
+    let compiled = g.compile().unwrap();
+    let final_state = compiled.invoke(Counter { n: 7 }, None).await.unwrap();
+    assert_eq!(final_state.n, 7, "no branches → worker never runs");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn blocking_node_does_not_starve_sibling_async_node() {
     // Two siblings fan out in parallel under a Send. One blocks the

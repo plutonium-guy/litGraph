@@ -119,6 +119,83 @@ where
         self
     }
 
+    /// Fan out `count` parallel branches of the same worker node. Each
+    /// branch receives the same shared state plus a unique per-branch
+    /// payload `{"_fanout_idx": <0..count>}` merged in via the
+    /// reducer, so the worker can see which branch it's running.
+    ///
+    /// Concretely this generates two nodes:
+    ///
+    /// * `{name}_fanout` — emits `count` LangGraph-style `Send`
+    ///   commands targeting `{name}_worker`, each with a distinct
+    ///   `_fanout_idx`. Itself returns no state update.
+    /// * `{name}_worker` — runs the user-supplied closure once per
+    ///   branch in parallel (classic super-step fan-out via
+    ///   `JoinSet`). Output update from each branch reduces back
+    ///   into shared state.
+    ///
+    /// The caller wires the fan-out start with `add_edge(START,
+    /// "<name>_fanout")` and the join with `add_edge("<name>_worker",
+    /// END)` (or any downstream node).
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use litgraph_graph::{NodeOutput, StateGraph, START, END};
+    ///
+    /// #[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
+    /// struct State { results: Vec<u32> }
+    ///
+    /// let mut g = StateGraph::<State>::new();
+    /// g.add_parallel_for("embed", 4, |s: State| async move {
+    ///     // Each branch sees `_fanout_idx` in its state if the
+    ///     // reducer surfaces it. Common pattern: read it from
+    ///     // a custom field on State, or rely on a custom reducer.
+    ///     let _ = s;
+    ///     NodeOutput::update(State { results: vec![1] })
+    /// });
+    /// g.add_edge(START, "embed_fanout");
+    /// g.add_edge("embed_worker", END);
+    /// ```
+    ///
+    /// # When NOT to use
+    ///
+    /// - Heterogeneous fan-out (different worker per branch) — use
+    ///   explicit `Send` commands from a custom node instead.
+    /// - The branch count depends on runtime state — same path:
+    ///   emit `Send` commands from a custom node. `add_parallel_for`
+    ///   is for compile-time-fixed counts.
+    pub fn add_parallel_for<F, Fut>(
+        &mut self,
+        name: impl Into<String>,
+        count: usize,
+        worker: F,
+    ) -> &mut Self
+    where
+        F: Fn(S) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = NodeOutput> + Send + 'static,
+    {
+        let base = name.into();
+        let fanout_name = format!("{base}_fanout");
+        let worker_name = format!("{base}_worker");
+        let worker_target = worker_name.clone();
+        self.add_node(fanout_name, move |_s: S| {
+            let worker_target = worker_target.clone();
+            async move {
+                let mut out = NodeOutput::empty();
+                for i in 0..count {
+                    out = out.send(crate::interrupt::Command {
+                        goto: worker_target.clone(),
+                        update: serde_json::json!({ "_fanout_idx": i }),
+                    });
+                }
+                out
+            }
+        });
+        self.add_node(worker_name, worker);
+        self
+    }
+
     pub fn add_edge(&mut self, from: impl Into<String>, to: impl Into<String>) -> &mut Self {
         self.edges.entry(from.into()).or_default().push(EdgeKind::Static(to.into()));
         self

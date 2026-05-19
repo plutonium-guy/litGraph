@@ -28,7 +28,7 @@ Rust core, Python bindings via PyO3 0.28 + maturin.
 - ✅ Loaders (24): text, markdown, json, jsonl, csv, html, pdf, docx, directory, web, notion, slack, confluence, github-issues, github-files, gmail, gdrive, linear, jira, s3, jupyter (iter 146), gitlab-issues (iter 149), gitlab-files (iter 154), **sitemap** (iter 160, crawl docs sites)
 - ✅ Splitters: recursive char (with language separators), markdown header, html header, json, semantic (embedding-based), CodeSplitter (definition-boundary, iter 142), **TokenTextSplitter** (iter 158, exact-token-count via tiktoken/HF)
 - ✅ Parallel ingestion (Rayon)
-- ✅ StateGraph + reducers macro + Send fan-out + Kahn scheduler + **`add_blocking_node`** (iter 377, CPU-bound escape hatch via `tokio::task::spawn_blocking` — local-model inline / heavy tokenize / PDF rasterize without stalling runtime)
+- ✅ StateGraph + reducers macro + Send fan-out + Kahn scheduler + **`add_blocking_node`** (iter 377, CPU-bound escape hatch via `tokio::task::spawn_blocking` — local-model inline / heavy tokenize / PDF rasterize without stalling runtime) + **`add_parallel_for(name, n, worker)`** (iter 381, fan-out-N-copies shorthand — auto-generates `{name}_fanout` + `{name}_worker` pair with `_fanout_idx` per branch; classic embed-N-variants / summarize-N-docs pattern in one line)
 - ✅ Checkpointers: memory, sqlite, postgres, redis
 - ✅ Streaming events: values / updates / messages / custom
 - ✅ Memory: BufferMemory, TokenBufferMemory, SummaryBufferMemory (iter 137), **VectorStoreMemory** (iter 156, topic-relevance retrieval), summarize_conversation, SqliteChatHistory, **PostgresChatHistory** (iter 162, distributed durable)
