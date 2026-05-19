@@ -1,10 +1,33 @@
-from typing import Any, Callable, Iterator
+from typing import Any, Callable, Iterator, Type, TypeVar, overload
 
 START: str
 END: str
 
+T = TypeVar("T")
+
 class StateGraph:
-    def __init__(self, max_parallel: int = 16, recursion_limit: int = 25) -> None: ...
+    """Schema-aware StateGraph (iter 378).
+
+    Passing ``state_schema=`` makes ``invoke`` / ``resume`` accept a
+    typed instance and return a typed instance via ``coerce_one``.
+    Default (``state_schema=None``) keeps the dict-in / dict-out
+    behaviour the native binding shipped pre-iter-378.
+    """
+
+    @overload
+    def __init__(
+        self,
+        state_schema: None = None,
+        max_parallel: int = 16,
+        recursion_limit: int = 25,
+    ) -> None: ...
+    @overload
+    def __init__(
+        self,
+        state_schema: Type[T],
+        max_parallel: int = 16,
+        recursion_limit: int = 25,
+    ) -> None: ...
     def add_node(self, name: str, func: Callable[[dict[str, Any]], Any]) -> None: ...
     def add_edge(self, from_: str, to: str) -> None: ...
     def add_conditional_edges(
@@ -12,6 +35,7 @@ class StateGraph:
         from_: str,
         router: Callable[[dict[str, Any]], str | list[str]],
     ) -> None: ...
+    def add_subgraph(self, name: str, sub: "CompiledGraph") -> None: ...
     def interrupt_before(self, node: str) -> None: ...
     def interrupt_after(self, node: str) -> None: ...
     def set_entry(self, node: str) -> None: ...
@@ -22,19 +46,25 @@ class StateGraph:
 class CompiledGraph:
     def invoke(
         self,
-        state: dict[str, Any],
+        state: Any,
         thread_id: str | None = None,
-    ) -> dict[str, Any]: ...
+    ) -> Any: ...
     def resume(
         self,
         thread_id: str,
-        update: dict[str, Any] | None = None,
-    ) -> dict[str, Any]: ...
+        update: Any = None,
+    ) -> Any: ...
     def stream(
         self,
-        state: dict[str, Any],
+        state: Any,
         thread_id: str | None = None,
     ) -> "GraphStream": ...
+    def state_history(self, thread_id: str) -> list[dict[str, Any]]: ...
+    def rewind_to(self, thread_id: str, step: int) -> None: ...
+    def fork_at(
+        self, thread_id: str, step: int, new_thread_id: str
+    ) -> None: ...
+    def clear_thread(self, thread_id: str) -> None: ...
     def to_mermaid(self) -> str: ...
     def to_ascii(self) -> str: ...
 

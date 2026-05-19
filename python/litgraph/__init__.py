@@ -34,6 +34,13 @@ except ImportError as _native_err:  # pragma: no cover — only in dev w/o build
 # Pure-Python sugar shipped alongside the native module.
 from .functional import entrypoint, task, Workflow  # noqa: E402
 from .coerce import coerce_one, coerce_stream  # noqa: E402
+# Schema-aware StateGraph/CompiledGraph overlay (iter 378). Shadows the
+# native classes of the same name so `litgraph.StateGraph(state_schema=...)`
+# auto-coerces invoke/resume input + output. `state_schema=None` is the
+# pre-iter-378 dict-in / dict-out behaviour. The original native classes
+# remain reachable via `litgraph.litgraph.StateGraph` for callers that
+# need the raw boundary.
+from ._state_graph import StateGraph, CompiledGraph  # noqa: E402,F811
 from . import recipes  # noqa: E402,F401
 from . import testing  # noqa: E402,F401
 from . import tool_hooks  # noqa: E402,F401
@@ -59,6 +66,8 @@ __all__.extend([
     "Workflow",
     "coerce_one",
     "coerce_stream",
+    "StateGraph",
+    "CompiledGraph",
     "recipes",
     "testing",
     "tool_hooks",
