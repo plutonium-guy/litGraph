@@ -40,3 +40,58 @@ __all__: list[str]
 __version__: str
 
 def sum_as_string(a: int, b: int) -> str: ...
+
+
+# ─── Typed mirror of ChatStreamEvent dict events (iter 379) ────────
+#
+# Re-exported at the top of the package from `_stream_part.py`; lives
+# here in `__init__.pyi` because the runtime file is private (underscore
+# prefix) and check_stubs walks only public submodules.
+
+from dataclasses import dataclass as _dataclass
+from typing import (
+    AsyncIterable as _AsyncIterable,
+    AsyncIterator as _AsyncIterator,
+    Iterable as _Iterable,
+    Iterator as _Iterator,
+    Optional as _Optional,
+    Union as _Union,
+)
+
+
+@_dataclass(frozen=True)
+class Delta:
+    text: str
+    type: str = ...
+
+
+@_dataclass(frozen=True)
+class ToolCallDelta:
+    index: int
+    id: _Optional[str] = ...
+    name: _Optional[str] = ...
+    arguments_delta: _Optional[str] = ...
+    type: str = ...
+
+
+@_dataclass(frozen=True)
+class Done:
+    text: str
+    finish_reason: str
+    model: str
+    usage: dict = ...
+    type: str = ...
+
+
+StreamPart = _Union[Delta, ToolCallDelta, Done]
+
+
+def parse_stream_part(event: dict) -> StreamPart: ...
+
+
+def parse_stream_parts(stream: _Iterable[dict]) -> _Iterator[StreamPart]: ...
+
+
+async def aparse_stream_parts(
+    stream: _AsyncIterable[dict],
+) -> _AsyncIterator[StreamPart]: ...

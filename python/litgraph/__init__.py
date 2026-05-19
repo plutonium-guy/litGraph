@@ -41,6 +41,18 @@ from .coerce import coerce_one, coerce_stream  # noqa: E402
 # remain reachable via `litgraph.litgraph.StateGraph` for callers that
 # need the raw boundary.
 from ._state_graph import StateGraph, CompiledGraph  # noqa: E402,F811
+# Typed mirror of native ChatStreamEvent dict events (iter 379). Closes
+# the StreamPart half of Tier-1 #7. Variants are dataclasses so `match`
+# narrowing works without a runtime validator dep.
+from ._stream_part import (  # noqa: E402
+    Delta,
+    Done,
+    StreamPart,
+    ToolCallDelta,
+    aparse_stream_parts,
+    parse_stream_part,
+    parse_stream_parts,
+)
 from . import recipes  # noqa: E402,F401
 from . import testing  # noqa: E402,F401
 from . import tool_hooks  # noqa: E402,F401
@@ -68,6 +80,13 @@ __all__.extend([
     "coerce_stream",
     "StateGraph",
     "CompiledGraph",
+    "Delta",
+    "Done",
+    "StreamPart",
+    "ToolCallDelta",
+    "aparse_stream_parts",
+    "parse_stream_part",
+    "parse_stream_parts",
     "recipes",
     "testing",
     "tool_hooks",

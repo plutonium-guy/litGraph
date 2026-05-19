@@ -81,10 +81,14 @@ def collect_runtime_attrs(module: object) -> Set[str]:
 
     Top-level functions: `funcname`.
     Top-level classes: `ClassName` and each method as `ClassName.method`.
+    `@dataclass` fields appear via `__dataclass_fields__` — `dir(cls)`
+    alone misses them when no instance has been constructed yet, which
+    would otherwise look like stub drift.
     Submodules are reported as a single name (`submodname`) — their
     contents live in their own .pyi file and are checked separately
     via the stub-file basenames.
     """
+    import dataclasses
     import types
 
     out: Set[str] = set()
@@ -100,7 +104,10 @@ def collect_runtime_attrs(module: object) -> Set[str]:
             out.add(name)
         elif isinstance(obj, type):
             out.add(name)
-            for member in dir(obj):
+            members: Set[str] = set(dir(obj))
+            if dataclasses.is_dataclass(obj):
+                members |= set(obj.__dataclass_fields__.keys())
+            for member in members:
                 if member.startswith("_"):
                     continue
                 out.add(f"{name}.{member}")
@@ -150,6 +157,17 @@ def _walk_top(node: ast.AST, out: Set[str]) -> None:
         for child in node.body:
             if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 out.add(f"{node.name}.{child.name}")
+            elif isinstance(child, ast.AnnAssign) and isinstance(
+                child.target, ast.Name
+            ):
+                # `field: T` or `field: T = ...` — @dataclass / pyclass
+                # field declarations. Adding these lets the runtime walk
+                # (which sees them via `dir(cls)`) match the stub.
+                out.add(f"{node.name}.{child.target.id}")
+            elif isinstance(child, ast.Assign):
+                for tgt in child.targets:
+                    if isinstance(tgt, ast.Name):
+                        out.add(f"{node.name}.{tgt.id}")
     elif isinstance(node, ast.Assign):
         # `x: T = ...` or `x = ...` — module-level constant or alias.
         for tgt in node.targets:
