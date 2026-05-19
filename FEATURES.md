@@ -11,7 +11,7 @@ Rust core, Python bindings via PyO3 0.28 + maturin.
 
 ### Done — v1.0 must-haves
 - ✅ ChatModel + Embeddings traits
-- ✅ Providers: OpenAI, OpenAIResponses, Anthropic, Gemini (AI Studio + Vertex), Bedrock (native + Converse), Cohere, OpenAI-compat (Ollama, Groq, Together, Mistral, DeepSeek, xAI, Fireworks)
+- ✅ Providers: OpenAI, OpenAIResponses, Anthropic, Gemini (AI Studio + Vertex), Bedrock (native + Converse), Cohere, OpenAI-compat (Ollama, Groq, Together, Mistral, DeepSeek, xAI, Fireworks), **`MistralRsChat`** (iter 380, first-party in-process local-chat scaffold via pluggable `ModelBackend` trait; real `mistralrs::Engine` lands iter 381 behind `engine` feature)
 - ✅ Native function/tool calling per provider
 - ✅ SSE streaming → Python async iterator
 - ✅ Tokenizers (tiktoken-rs + HF tokenizers)

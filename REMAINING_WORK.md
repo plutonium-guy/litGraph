@@ -101,7 +101,7 @@ Cross-checked against current state.
 | 5 | **Functional API: `@entrypoint` + `@task`** | ✅ shipped (live-tested in `test_functional_api.py`, `test_workflow_*.py`) |
 | 6 | **`pyo3-stub-gen` auto `.pyi`** | ❌ still hand-rolled `litgraph-stubs/` + drift checker |
 | 7 | **Pydantic-coerced state + `StreamPart`** | ✅ shipped iter 378 + 379. iter 378: `StateGraph(state_schema=Pydantic\|dataclass\|TypedDict)` auto-dumps input + auto-coerces invoke/resume output. iter 379: `StreamPart` typed-enum mirror (`Delta` / `ToolCallDelta` / `Done`) via `parse_stream_part(s)` + async variant — frozen dataclasses, `match`-narrowing, zero new deps. |
-| 8 | **Local chat model — `candle` / `mistral.rs`** | ❌ still depends on hosted providers; `providers_extras` has stubs (`llamacpp_chat`, `mistralrs_chat`, `nim_chat`) but no first-party local backend |
+| 8 | **Local chat model — `candle` / `mistral.rs`** | ⏳ scaffolded iter 380 — `litgraph-providers-mistralrs` crate ships `MistralRsChat` + `ModelBackend` trait + `MockModelBackend` for CI. Real `mistralrs::Engine` plugs in iter 381 behind `engine` feature flag. Closes air-gapped agent gap incrementally. |
 | 9 | **Webhook-resume bridge for interrupts** | ✅ shipped iter 201/202 |
 | 10 | **Pregel-style super-step parallel exec audit** | ✅ partial — iter 377 ships `StateGraph::add_blocking_node` + `add_fallible_blocking_node` (spawn_blocking escape hatch for CPU-bound nodes — local-model forward pass, heavy tokenize, PDF rasterize). Explicit super-step contract (Pregel-style barrier API) still pending. |
 

@@ -11,6 +11,7 @@ members = [
     "crates/litgraph-providers-cohere",
     "crates/litgraph-providers-voyage",
     "crates/litgraph-providers-jina",
+    "crates/litgraph-providers-mistralrs",
     "crates/litgraph-stores-memory",
     "crates/litgraph-stores-hnsw",
     "crates/litgraph-stores-qdrant",
@@ -150,6 +151,7 @@ litgraph-providers-bedrock = { path = "crates/litgraph-providers-bedrock", versi
 litgraph-providers-cohere = { path = "crates/litgraph-providers-cohere", version = "0.1.0" }
 litgraph-providers-voyage = { path = "crates/litgraph-providers-voyage", version = "0.1.0" }
 litgraph-providers-jina = { path = "crates/litgraph-providers-jina", version = "0.1.0" }
+litgraph-providers-mistralrs = { path = "crates/litgraph-providers-mistralrs", version = "0.1.0" }
 litgraph-stores-memory = { path = "crates/litgraph-stores-memory", version = "0.1.0" }
 litgraph-stores-hnsw = { path = "crates/litgraph-stores-hnsw", version = "0.1.0" }
 litgraph-stores-qdrant = { path = "crates/litgraph-stores-qdrant", version = "0.1.0" }

@@ -1,0 +1,32 @@
+[package]
+name = "litgraph-providers-mistralrs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Local in-process chat via mistralrs-core for litGraph. First-party offline / air-gapped agent backend (Tier-1 #8)."
+
+[dependencies]
+litgraph-core.workspace = true
+async-trait.workspace = true
+tokio = { workspace = true }
+tokio-stream.workspace = true
+futures.workspace = true
+futures-util.workspace = true
+async-stream.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "test-util"] }
+
+[features]
+default = []
+# Pulls real `mistralrs-core` (~30 transitive crates incl. candle +
+# safetensors + tokenizers). Off by default so the workspace builds
+# cleanly without optional heavy deps; flip on for prod use:
+#   cargo build -p litgraph-providers-mistralrs --features engine
+engine = []

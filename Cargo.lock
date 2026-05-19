@@ -2507,6 +2507,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "litgraph-providers-mistralrs"
+version = "0.1.2"
+dependencies = [
+ "async-stream",
+ "async-trait",
+ "futures",
+ "futures-util",
+ "litgraph-core",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-stream",
+ "tracing",
+]
+
+[[package]]
 name = "litgraph-providers-openai"
 version = "0.1.2"
 dependencies = [
