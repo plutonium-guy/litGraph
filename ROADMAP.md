@@ -124,18 +124,21 @@ Total = sum. Anything ≥18 is fair game for the next ten iters.
   `dict[str, Any]`.
 - **Effort:** 1–2 iters.
 
-### 8. Local chat model — candle / mistral.rs
-- **Status:** ❌. Embeddings have a local path (fastembed), chat
-  doesn't. This is the biggest "air-gapped agent" gap.
-- **What:** New crate `litgraph-providers-local` wrapping
-  `mistralrs` (or `candle` directly) behind the `ChatModel` trait.
-- **Why:** Full offline agent. Strong differentiator from LangChain
-  whose local stories all go through `ollama` or `llama.cpp`
-  external processes.
-- **Rust win:** in-process inference, no IPC; can share GPU
-  context with embeddings.
-- **Effort:** 3–4 iters. Heavy because of model loading + KV-cache
-  + tokenization edge cases.
+### 8. Local chat model — candle / mistral.rs 🚫 deferred
+- **Status:** 🚫 deferred. Iter 380 shipped the
+  `litgraph-providers-mistralrs` adapter + `ModelBackend` trait +
+  `MockModelBackend` scaffold so future contributors can plug in
+  `mistralrs::Engine` (or candle / llama.cpp) without churning the
+  trait surface. Real engine wiring is multi-day work (model
+  loader, tokenizer, sampling loop, KV cache, streaming callback)
+  and the cost / benefit didn't pencil for this season —
+  hosted-provider users get nothing; the air-gap audience runs
+  `mistralrs-server` (Docker / native) and points `OpenAIChat`
+  at `localhost` via the existing OpenAI-compat path.
+- **Reopen criteria:** user demand for true in-process inference
+  (no subprocess, GPU-context sharing with `fastembed`), or a
+  contributor with prior `mistralrs-core` / `candle` experience
+  willing to own the engine wiring.
 
 ### 9. Webhook-resume bridge for interrupts ✅ shipped iter 201 + 202
 - **Status:** ✅. `litgraph_core::ResumeRegistry` (201) ships the

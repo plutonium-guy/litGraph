@@ -101,13 +101,15 @@ Cross-checked against current state.
 | 5 | **Functional API: `@entrypoint` + `@task`** | ✅ shipped (live-tested in `test_functional_api.py`, `test_workflow_*.py`) |
 | 6 | **`pyo3-stub-gen` auto `.pyi`** | ❌ still hand-rolled `litgraph-stubs/` + drift checker |
 | 7 | **Pydantic-coerced state + `StreamPart`** | ✅ shipped iter 378 + 379. iter 378: `StateGraph(state_schema=Pydantic\|dataclass\|TypedDict)` auto-dumps input + auto-coerces invoke/resume output. iter 379: `StreamPart` typed-enum mirror (`Delta` / `ToolCallDelta` / `Done`) via `parse_stream_part(s)` + async variant — frozen dataclasses, `match`-narrowing, zero new deps. |
-| 8 | **Local chat model — `candle` / `mistral.rs`** | ⏳ scaffolded iter 380 — `litgraph-providers-mistralrs` crate ships `MistralRsChat` + `ModelBackend` trait + `MockModelBackend` for CI. Real `mistralrs::Engine` plugs in iter 381 behind `engine` feature flag. Closes air-gapped agent gap incrementally. |
+| 8 | **Local chat model — `candle` / `mistral.rs`** | 🚫 deferred — iter 380 ships `MistralRsChat` adapter + `ModelBackend` trait + `MockModelBackend` scaffold (dormant; `engine` feature off by default → zero workspace build cost). Real `mistralrs::Engine` wiring (~3-4 iters: model loader, tokenizer, sampling loop, KV cache, streaming callback) deferred indefinitely. Users wanting local chat today: run `mistralrs-server` (Docker / native) + point `OpenAIChat(base_url=…)` at it — same path as Ollama. |
 | 9 | **Webhook-resume bridge for interrupts** | ✅ shipped iter 201/202 |
 | 10 | **Pregel-style super-step parallel exec audit** | ✅ partial — iter 377 ships `StateGraph::add_blocking_node` + `add_fallible_blocking_node` (spawn_blocking escape hatch for CPU-bound nodes — local-model forward pass, heavy tokenize, PDF rasterize). Explicit super-step contract (Pregel-style barrier API) still pending. |
 
-**Net Tier-1 remaining:** 6 (auto-stubs), 8 (local model). Item 7
-fully closed iters 378 + 379. Item 10 partially closed iter 377
-(super-step contract still open).
+**Net Tier-1 remaining:** none actionable. Item 6 (auto-stubs)
+skipped — annotation churn vs marginal gain over `check_stubs.py`.
+Item 7 fully closed iters 378 + 379. Item 8 (local model)
+deferred — see row above. Item 10 partially closed iter 377
+(super-step contract still open but escape hatch shipped).
 
 ### Tier-2 / Missing-feature gaps (per MISSING_FEATURES.md)
 
