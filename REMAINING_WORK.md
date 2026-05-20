@@ -186,7 +186,11 @@ deferred — see row above. Item 10 partially closed iter 377
 
 ### Docs
 
-- ❌ "Migrate from LangChain" guide (top-20 idiom side-by-sides)
+- ✅ "Migrate from LangChain" guide (iter 387 — `MIGRATION_LANGCHAIN.md`,
+  15 idiom side-by-sides covering chat, streaming, structured output,
+  embeddings/vector stores, RAG, tool-calling agents, agent events,
+  memory, StateGraph, parallel fan-out, conditional edges,
+  interrupts, checkpointers, time travel, HTTP serve)
 - ❌ Per-crate README pointing at canonical example
 
 ### Performance / build
