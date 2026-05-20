@@ -29,6 +29,8 @@ commands:
                      (chat-agent | rag | eval-suite).
   add-tool <name>    Drop a tool stub into the current project.
   add-node <name>    Drop a graph-node stub into the current project.
+  trace <file>       Render an OTel JSON dump as a terminal timeline.
+                     Pass `-` to read from stdin.
   help               Show this message.
 
 Examples:
@@ -333,6 +335,14 @@ def _render_node_test(slug: str, name: str) -> str:
     )
 
 
+def _cmd_trace(argv: list[str]) -> int:
+    """`litgraph trace <file>` — render an OTel JSON dump as a
+    terminal timeline. Pure-Python; reads SDK stdout exporter format
+    OR OTLP JSON envelope. Stdin via `-`."""
+    from ._trace import main as trace_main
+    return trace_main(argv)
+
+
 _DISPATCH = {
     "doctor": _cmd_doctor,
     "version": _cmd_version,
@@ -341,6 +351,7 @@ _DISPATCH = {
     "init": _cmd_init,
     "add-tool": _cmd_add_tool,
     "add-node": _cmd_add_node,
+    "trace": _cmd_trace,
     "help": _cmd_help,
     "-h": _cmd_help,
     "--help": _cmd_help,

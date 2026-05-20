@@ -177,7 +177,12 @@ deferred — see row above. Item 10 partially closed iter 377
 ### CLI / DX
 
 - ✅ `litgraph init <template>` repo scaffold (already shipped — 3 templates: chat-agent, rag, eval-suite — `python/litgraph/_init.py`)
-- ❌ `litgraph trace` viewer (OTel JSON → graph timeline in terminal)
+- ✅ `litgraph trace` viewer (OTel JSON → graph timeline in terminal)
+  (iter 386) — pure-Python, stdlib-only. Accepts SDK stdout shape
+  AND OTLP JSON envelope (`resourceSpans`/`scopeSpans`/`spans`),
+  JSON or JSONL. ANSI-coloured + indented by parent; surfaces
+  `prompt_excerpt`, `completion_excerpt`, `model`, `error`. Falls
+  back to plain text when stdout isn't a TTY.
 
 ### Docs
 
