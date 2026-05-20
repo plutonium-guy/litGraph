@@ -153,7 +153,14 @@ deferred — see row above. Item 10 partially closed iter 377
 - ✅ **`StreamPart` typed enum** mirroring `ChatStreamEvent` (iter 379)
 
 #### Observability
-- ❌ **Trace exemplars** linking OTel span → prompt+completion excerpt
+- ✅ **Trace exemplars** linking OTel span → prompt+completion excerpt
+  (iter 385) — `InstrumentedChatModel` opens a `chat.invoke` /
+  `chat.stream` span and records `prompt_excerpt` +
+  `completion_excerpt` attrs (truncated to 512 B / UTF-8 boundary,
+  control chars collapsed, configurable via
+  `LITGRAPH_EXEMPLAR_BYTES`). Standalone helpers in
+  `litgraph-tracing-otel::exemplars` remain for callers wanting to
+  attach exemplars to other spans.
 - ❌ **"Turn replay" CLI** from OTel trace ID
 
 ### Loaders / splitters / stores nice-to-haves
@@ -169,7 +176,7 @@ deferred — see row above. Item 10 partially closed iter 377
 
 ### CLI / DX
 
-- ❌ `litgraph init <template>` repo scaffold
+- ✅ `litgraph init <template>` repo scaffold (already shipped — 3 templates: chat-agent, rag, eval-suite — `python/litgraph/_init.py`)
 - ❌ `litgraph trace` viewer (OTel JSON → graph timeline in terminal)
 
 ### Docs
