@@ -24,6 +24,7 @@ from . import (
     providers_extras as providers_extras,
     recipes as recipes,
     retrieval as retrieval,
+    serve as serve,
     splitters as splitters,
     splitters_extras as splitters_extras,
     store as store,

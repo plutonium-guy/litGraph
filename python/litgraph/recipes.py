@@ -88,27 +88,71 @@ def eval(
     )
 
 
-def serve(graph: Any, port: int = 8080, host: str = "0.0.0.0") -> str:
-    """Render the shell command that would serve `graph` via
-    `litgraph-serve`. Stub: doesn't actually spawn the binary yet —
-    the binary lives in a separate Cargo target and we don't ship it
-    in the wheel.
+def serve(graph: Any, port: int = 8080, host: str = "127.0.0.1") -> Any:
+    """Serve `graph` over HTTP via `litgraph-serve` (iter 384).
 
-    Returns the command-line string so the caller can run it via
-    `subprocess` or print it. Full one-call impl is planned (see
-    AGENT_DX.md §13); the stub is here so coding-agent autocomplete
-    finds the symbol.
+    Two modes, based on the input shape:
+
+    1. **`ChatModel`-shaped input** (anything with `.name`, `.invoke`,
+       and `.stream`) — spawns the axum server in-process on the
+       shared tokio runtime and returns a `litgraph.serve.ServeHandle`.
+       The handle exposes `.address()`, `.url()`, `.model()`, and
+       `.shutdown()` (idempotent, blocks until graceful drain).
+       Endpoints: `POST /invoke`, `POST /stream`, `POST /batch`,
+       `GET /health`, `GET /info`.
+
+    2. **`StateGraph` / `CompiledGraph`** — raises with a clear message.
+       Serializing a graph across the HTTP boundary is a separate scope
+       item (the `studio` feature flag on `litgraph-serve` exposes
+       graph-aware endpoints over a `Checkpointer`; that integration
+       requires more than this recipe ships).
+
+    `port=0` asks the OS for a free port — read it back from
+    `handle.address()`.
+
+    Returns the `ServeHandle` so the caller can either block on
+    `handle.shutdown()` from a signal handler or pass it around.
     """
-    # Accept either a `StateGraph` (has `.compile`) or a `CompiledGraph`
-    # (has `.invoke`). Both are wireable into `litgraph-serve` once the
-    # binary side learns to ingest them.
-    if not hasattr(graph, "compile") and not hasattr(graph, "invoke"):
-        raise TypeError(
-            "recipes.serve expects a CompiledGraph or a StateGraph; "
-            "got "
-            f"{type(graph).__name__}. Pass `g.compile()` or `g`."
+    try:
+        from litgraph import serve as _serve  # type: ignore[attr-defined]
+    except ImportError as e:  # pragma: no cover — dev w/o native
+        raise RuntimeError(
+            "litgraph native module not built — run `maturin develop` "
+            "to enable recipes.serve. The Python-only sugar can't spawn "
+            "an axum server on its own."
+        ) from e
+
+    # ChatModel duck-shape: `.invoke` + `.stream`, no `.compile`. The
+    # native `OpenAIChat` / `AnthropicChat` / `GeminiChat` etc. expose
+    # these via PyO3 #[pymethods]; `.name` is a Rust-side getter and
+    # not always surfaced through dir(), so we don't require it here.
+    is_chat = (
+        hasattr(graph, "invoke")
+        and hasattr(graph, "stream")
+        and not hasattr(graph, "compile")
+    )
+    is_graph = hasattr(graph, "compile") or (
+        hasattr(graph, "invoke") and not is_chat
+    )
+
+    if is_chat:
+        return _serve.spawn_chat(graph, host=host, port=port)
+
+    if is_graph:
+        raise NotImplementedError(
+            "recipes.serve(graph) is not implemented yet. "
+            "Graph-shaped serving requires per-thread state + "
+            "checkpoint coordination beyond what the chat endpoints "
+            "expose. Mount `litgraph_serve::studio_router` directly "
+            "for now (Rust-side), or call `recipes.serve(model)` to "
+            "serve just the underlying ChatModel."
         )
-    return f"litgraph-serve --graph {graph!r} --host {host} --port {port}"
+
+    raise TypeError(
+        "recipes.serve expects a ChatModel (has .name + .invoke + "
+        ".stream), or a CompiledGraph / StateGraph; got "
+        f"{type(graph).__name__}."
+    )
 
 
 # ---- One-call RAG ----

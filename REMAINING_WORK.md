@@ -116,9 +116,11 @@ deferred — see row above. Item 10 partially closed iter 377
 #### Agent / tool ergonomics
 - ❌ **Streaming tool execution** — `OffloadingTool` + result-poll
   pattern for long-running shell jobs
-- ⏳ **Tool-call budget caps** — `ToolBudget` exists in Python
-  `tool_hooks`, no Rust-side cost ceiling mirroring
-  `CostCappedChatModel`
+- ✅ **Tool-call budget caps** — `ToolBudgetMiddleware` in
+  `litgraph-agents::middleware` (remote iter 348-350) caps calls
+  per agent turn via `before_tool` denial. Composes with
+  `ToolMiddlewareChain` alongside PII scrub, logging, metrics,
+  caching.
 
 #### Graph
 - ✅ Branch fan-in **dedup-by-key reducer** (iter 382 — `merge_dedup_by_key(current, update, key)`)
@@ -137,9 +139,14 @@ deferred — see row above. Item 10 partially closed iter 377
 #### Serve
 - ⏳ **Studio UI parity for local graphs** — `studio` feature flag in
   `litgraph-serve` covers cloud API surface only
-- ❌ **`recipes.serve` actually spawns the binary** — today returns
-  the shell-command string only (intentional stub; `iter 366` fixed
-  the type-check bug)
+- ✅ **`recipes.serve` actually spawns the binary** (iter 384) — new
+  PyO3 module `litgraph.serve.spawn_chat(model, host, port)` binds
+  the axum listener synchronously (port-in-use → `OSError`) then
+  spawns the server on the shared tokio runtime. Returns a
+  `ServeHandle` (`.address()`, `.url()`, `.model()`, `.shutdown()`
+  — idempotent + graceful). `recipes.serve(model)` calls into it;
+  `recipes.serve(graph)` still raises with a clear deferral message
+  (graph-shaped serving is a separate scope item).
 
 #### Python ergonomics
 - ✅ **Implicit Pydantic coercion** on `StateGraph(state_schema=)` (iter 378)

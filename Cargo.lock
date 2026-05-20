@@ -2563,6 +2563,7 @@ version = "0.1.2"
 dependencies = [
  "anyhow",
  "async-trait",
+ "axum",
  "futures",
  "litgraph-agents",
  "litgraph-cache",
@@ -2585,6 +2586,7 @@ dependencies = [
  "litgraph-rerankers-voyage",
  "litgraph-resilience",
  "litgraph-retrieval",
+ "litgraph-serve",
  "litgraph-splitters",
  "litgraph-stores-chroma",
  "litgraph-stores-hnsw",
@@ -2604,6 +2606,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tokio-stream",
+ "tokio-util",
  "tracing",
 ]
 
