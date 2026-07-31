@@ -100,6 +100,82 @@ pub fn merge_dedup_by_key<S: Serialize + DeserializeOwned>(
     Ok(serde_json::from_value(base)?)
 }
 
+/// Build a reducer for fan-in branches that emit overlapping records: like
+/// [`merge_append`] (arrays concat, scalars/non-arrays replace), except array
+/// entries sharing the same value under `key_field` are collapsed to one.
+///
+/// Fan-in from parallel branches completes in whatever order the scheduler's
+/// tasks happen to finish (see `Scheduler::fold_node_success`), so a winner
+/// defined as "first-seen" or "last-write" in *arrival* order would make the
+/// merged state depend on thread scheduling — a bug, not a feature. Instead,
+/// when two entries collide on `key_field`, the winner is whichever entry's
+/// canonical JSON encoding compares lexicographically greater. That's a
+/// fixed, content-derived total order with no notion of "which branch ran
+/// first", so the merge is commutative and associative regardless of
+/// completion order: reducing the same set of updates in any order, or in
+/// any grouping, produces the same final array (same entries, same order —
+/// the surviving entries are additionally sorted by their key's canonical
+/// encoding, which removes the second source of nondeterminism: fan-in
+/// completion order otherwise also decides concatenation order).
+///
+/// Entries that aren't JSON objects, or are objects missing `key_field`,
+/// have no identity to dedup by. They are never dropped: they're kept in
+/// full, sorted among themselves by canonical encoding, and placed after
+/// the deduplicated keyed entries.
+pub fn dedup_by_key<S: Serialize + DeserializeOwned>(
+    key_field: impl Into<String>,
+) -> impl Fn(S, Value) -> Result<S> + Send + Sync + 'static {
+    let key_field = key_field.into();
+    move |current: S, update: Value| -> Result<S> {
+        let mut base = serde_json::to_value(&current)?;
+        if let (Value::Object(base_map), Value::Object(upd_map)) = (&mut base, update) {
+            for (k, v) in upd_map {
+                match v {
+                    Value::Array(incoming) => {
+                        let existing = match base_map.get_mut(&k) {
+                            Some(Value::Array(a)) => std::mem::take(a),
+                            _ => Vec::new(),
+                        };
+                        base_map.insert(k, Value::Array(dedup_array(existing, incoming, &key_field)));
+                    }
+                    other => { base_map.insert(k, other); }
+                }
+            }
+        }
+        Ok(serde_json::from_value(base)?)
+    }
+}
+
+fn dedup_array(existing: Vec<Value>, incoming: Vec<Value>, key_field: &str) -> Vec<Value> {
+    let mut winners: std::collections::BTreeMap<String, Value> = std::collections::BTreeMap::new();
+    let mut keyless: Vec<Value> = Vec::new();
+
+    for entry in existing.into_iter().chain(incoming) {
+        if let Some(key_value) = entry.get(key_field) {
+            let key = canonical(key_value);
+            let should_replace = match winners.get(&key) {
+                Some(current_winner) => canonical(&entry) > canonical(current_winner),
+                None => true,
+            };
+            if should_replace {
+                winners.insert(key, entry);
+            }
+        } else {
+            keyless.push(entry);
+        }
+    }
+
+    keyless.sort_by_key(canonical);
+
+    let mut out: Vec<Value> = winners.into_values().collect();
+    out.extend(keyless);
+    out
+}
+
+fn canonical(v: &Value) -> String {
+    serde_json::to_string(v).unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -179,5 +255,91 @@ mod tests {
         // Re-applying the same update must not duplicate.
         assert_eq!(after.docs.len(), 1);
     }
-}
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+    struct Recs {
+        records: Vec<Value>,
+        n: i32,
+    }
 
+    fn rec(id: i64, v: &str) -> Value {
+        json!({"id": id, "v": v})
+    }
+
+    fn empty() -> Recs {
+        Recs { records: vec![], n: 0 }
+    }
+
+    #[test]
+    fn overlapping_key_collapses_to_one_entry() {
+        let reducer = dedup_by_key::<Recs>("id");
+        let s = reducer(empty(), json!({"records": [rec(1, "a")]})).unwrap();
+        let s = reducer(s, json!({"records": [rec(1, "b")]})).unwrap();
+        assert_eq!(s.records.len(), 1);
+    }
+
+    #[test]
+    fn tie_break_is_greatest_canonical_encoding() {
+        // canonical("{\"id\":1,\"v\":\"a\"}") < canonical("{\"id\":1,\"v\":\"b\"}")
+        // lexicographically, so the "b" entry must win regardless of which
+        // branch's update was folded in first.
+        let reducer = dedup_by_key::<Recs>("id");
+        let a_then_b = reducer(empty(), json!({"records": [rec(1, "a")]})).unwrap();
+        let a_then_b = reducer(a_then_b, json!({"records": [rec(1, "b")]})).unwrap();
+        assert_eq!(a_then_b.records, vec![rec(1, "b")]);
+
+        let b_then_a = reducer(empty(), json!({"records": [rec(1, "b")]})).unwrap();
+        let b_then_a = reducer(b_then_a, json!({"records": [rec(1, "a")]})).unwrap();
+        assert_eq!(b_then_a.records, vec![rec(1, "b")]);
+    }
+
+    #[test]
+    fn order_independence_across_fold_order() {
+        let reducer = dedup_by_key::<Recs>("id");
+        let updates = vec![
+            json!({"records": [rec(1, "a"), rec(2, "x")]}),
+            json!({"records": [rec(1, "b")]}),
+            json!({"records": [rec(3, "z"), rec(2, "y")]}),
+        ];
+
+        let forward = updates.iter().cloned().fold(empty(), |s, u| reducer(s, u).unwrap());
+
+        let mut reversed = updates.clone();
+        reversed.reverse();
+        let backward = reversed.into_iter().fold(empty(), |s, u| reducer(s, u).unwrap());
+
+        assert_eq!(forward, backward);
+        assert_eq!(forward.records.len(), 3);
+    }
+
+    #[test]
+    fn entries_missing_key_are_kept_not_dropped() {
+        let reducer = dedup_by_key::<Recs>("id");
+        let keyless = json!({"no_id": true});
+        let s = reducer(
+            empty(),
+            json!({"records": [rec(1, "a"), keyless.clone(), keyless.clone()]}),
+        )
+        .unwrap();
+        // The keyed entry dedups against itself as usual; both keyless
+        // copies survive since they have no identity to collapse on.
+        assert_eq!(s.records.len(), 3);
+        assert_eq!(s.records.iter().filter(|v| **v == keyless).count(), 2);
+    }
+
+    #[test]
+    fn scalars_and_non_arrays_match_merge_append() {
+        let reducer = dedup_by_key::<Recs>("id");
+        let via_dedup = reducer(empty(), json!({"n": 7})).unwrap();
+        let via_append = merge_append(empty(), json!({"n": 7})).unwrap();
+        assert_eq!(via_dedup, via_append);
+        assert_eq!(via_dedup.n, 7);
+    }
+
+    #[test]
+    fn empty_update_is_a_no_op() {
+        let reducer = dedup_by_key::<Recs>("id");
+        let s = reducer(empty(), json!({"records": [rec(1, "a")]})).unwrap();
+        let s2 = reducer(s.clone(), json!({})).unwrap();
+        assert_eq!(s, s2);
+    }
+}

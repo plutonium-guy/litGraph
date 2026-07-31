@@ -29,7 +29,7 @@ pub mod event;
 pub mod interrupt;
 pub mod visualize;
 
-pub use state::{Reducer, merge_append, merge_dedup_by_key, merge_replace};
+pub use state::{Reducer, dedup_by_key, merge_append, merge_dedup_by_key, merge_replace};
 pub use node::{NodeOutput, NodeFn};
 pub use graph::{StateGraph, CompiledGraph, START, END};
 pub use checkpoint::{
