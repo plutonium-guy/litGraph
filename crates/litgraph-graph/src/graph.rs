@@ -4,6 +4,7 @@ use std::sync::Arc;
 use serde::{Serialize, de::DeserializeOwned};
 
 use crate::checkpoint::{Checkpointer, MemoryCheckpointer};
+use crate::interrupt::Command;
 use crate::node::{
     NodeFn, NodeOutput, wrap_blocking_node, wrap_fallible_blocking_node,
     wrap_fallible_node, wrap_node,
@@ -242,6 +243,57 @@ where
         self
     }
 
+    /// Fan-out-N-copies shorthand over the `NodeOutput::send` / `Forked`
+    /// frontier primitive. Registers two nodes: `name` — the dispatcher,
+    /// which runs once, calls `select` to draw a collection out of state,
+    /// and emits one `Send` per item, each carrying `{item_key: item}` as
+    /// its `override_update` — and `worker`, which runs `body` once per
+    /// item.
+    ///
+    /// Each `worker` invocation only ever sees its own item merged into a
+    /// state clone (the reducer runs per-fork, same as hand-built sends);
+    /// siblings never observe each other's item. Results flow back through
+    /// the normal reduce path exactly like any other node's `update`.
+    ///
+    /// Wire the entry edge into `name` (the dispatcher); wire the
+    /// continuation edge out of `worker` (it runs after every fan-out copy
+    /// completes, deduplicated by the scheduler's frontier normalization) —
+    /// edges added from `name` itself fire once, right after dispatch, not
+    /// after the fan-out drains.
+    pub fn parallel_for<Sel, F, Fut>(
+        &mut self,
+        name: impl Into<String>,
+        worker: impl Into<String>,
+        item_key: impl Into<String>,
+        select: Sel,
+        body: F,
+    ) -> &mut Self
+    where
+        Sel: Fn(&S) -> Vec<serde_json::Value> + Send + Sync + 'static,
+        F: Fn(S) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = NodeOutput> + Send + 'static,
+    {
+        let worker_name = worker.into();
+        let item_key = item_key.into();
+        let target = worker_name.clone();
+        self.add_node(name, move |state: S| {
+            let items = select(&state);
+            let target = target.clone();
+            let item_key = item_key.clone();
+            async move {
+                let mut out = NodeOutput::empty();
+                for item in items {
+                    let mut payload = serde_json::Map::new();
+                    payload.insert(item_key.clone(), item);
+                    out = out.send(Command::to(target.clone()).with(serde_json::Value::Object(payload)));
+                }
+                out
+            }
+        });
+        self.add_node(worker_name, body);
+        self
+    }
+
     pub fn interrupt_before(&mut self, node: impl Into<String>) -> &mut Self {
         self.interrupt_before.insert(node.into());
         self
@@ -344,5 +396,145 @@ where
         let state = (self.inner.reducer)(state, resume_value)?;
         let mut sched = Scheduler::new(self.inner.clone(), self.checkpointer.clone(), Some(thread_id));
         sched.resume_from_with_sends(state, cp.next_nodes, cp.next_sends).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Clone, Default, Debug, Serialize, serde::Deserialize)]
+    struct Pool {
+        #[serde(default)]
+        pool: Vec<i64>,
+        #[serde(default)]
+        item: Option<i64>,
+        #[serde(default)]
+        results: Vec<i64>,
+    }
+
+    fn select_pool(s: &Pool) -> Vec<serde_json::Value> {
+        s.pool.iter().map(|n| serde_json::Value::from(*n)).collect()
+    }
+
+    #[tokio::test]
+    async fn parallel_for_fans_out_n_copies_and_reduces_results() {
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let mut g = StateGraph::<Pool>::new();
+        let invs = invocations.clone();
+        g.parallel_for("scatter", "work", "item", select_pool, move |s: Pool| {
+            let invs = invs.clone();
+            async move {
+                invs.fetch_add(1, Ordering::SeqCst);
+                let item = s.item.expect("worker must see its own item");
+                NodeOutput::update(serde_json::json!({ "results": [item * 2] }))
+            }
+        });
+        g.add_edge(START, "scatter");
+        g.add_edge("work", END);
+
+        let final_state = g
+            .compile()
+            .unwrap()
+            .invoke(Pool { pool: vec![1, 2, 3, 4], ..Default::default() }, None)
+            .await
+            .unwrap();
+
+        assert_eq!(invocations.load(Ordering::SeqCst), 4);
+        let mut results = final_state.results;
+        results.sort();
+        assert_eq!(results, vec![2, 4, 6, 8]);
+    }
+
+    #[tokio::test]
+    async fn parallel_for_isolates_sibling_invocations() {
+        // Two forks carry distinct items into the same worker field. If the
+        // scheduler merged overrides into shared state instead of per-task
+        // clones, both invocations would observe whichever item landed last.
+        let seen: Arc<Mutex<Vec<i64>>> = Arc::new(Mutex::new(Vec::new()));
+        let mut g = StateGraph::<Pool>::new();
+        let seen2 = seen.clone();
+        g.parallel_for(
+            "scatter",
+            "work",
+            "item",
+            |_: &Pool| vec![serde_json::Value::from(10i64), serde_json::Value::from(20i64)],
+            move |s: Pool| {
+                let seen = seen2.clone();
+                async move {
+                    let item = s.item.expect("worker must see its own item");
+                    seen.lock().unwrap().push(item);
+                    NodeOutput::empty()
+                }
+            },
+        );
+        g.add_edge(START, "scatter");
+        g.add_edge("work", END);
+
+        g.compile().unwrap().invoke(Pool::default(), None).await.unwrap();
+
+        let mut items = seen.lock().unwrap().clone();
+        items.sort();
+        assert_eq!(items, vec![10, 20]);
+    }
+
+    #[tokio::test]
+    async fn parallel_for_empty_collection_does_not_hang() {
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let mut g = StateGraph::<Pool>::new();
+        let invs = invocations.clone();
+        g.parallel_for("scatter", "work", "item", select_pool, move |s: Pool| {
+            let invs = invs.clone();
+            async move {
+                invs.fetch_add(1, Ordering::SeqCst);
+                NodeOutput::update(serde_json::json!({ "results": [s.item.unwrap_or_default()] }))
+            }
+        });
+        g.add_edge(START, "scatter");
+        g.add_edge("work", END);
+
+        let final_state = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            g.compile().unwrap().invoke(Pool::default(), None),
+        )
+        .await
+        .expect("parallel_for over an empty collection must not hang")
+        .unwrap();
+
+        assert_eq!(invocations.load(Ordering::SeqCst), 0);
+        assert!(final_state.results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn parallel_for_exceeds_max_parallel_still_completes() {
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let mut g = StateGraph::<Pool>::new();
+        let invs = invocations.clone();
+        g.parallel_for("scatter", "work", "item", select_pool, move |s: Pool| {
+            let invs = invs.clone();
+            async move {
+                invs.fetch_add(1, Ordering::SeqCst);
+                let item = s.item.expect("worker must see its own item");
+                NodeOutput::update(serde_json::json!({ "results": [item] }))
+            }
+        });
+        g.add_edge(START, "scatter");
+        g.add_edge("work", END);
+        let g = g.with_max_parallel(4);
+
+        let pool: Vec<i64> = (0..20).collect();
+        let final_state = g
+            .compile()
+            .unwrap()
+            .invoke(Pool { pool: pool.clone(), ..Default::default() }, None)
+            .await
+            .unwrap();
+
+        assert_eq!(invocations.load(Ordering::SeqCst), 20);
+        let mut results = final_state.results;
+        results.sort();
+        assert_eq!(results, pool);
     }
 }
