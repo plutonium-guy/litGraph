@@ -12,6 +12,7 @@ class ReactAgent:
         tools: list[FunctionTool],
         system_prompt: str | None = None,
         max_iterations: int = 10,
+        tool_middleware: list[Any] | None = None,
     ) -> None: ...
     def invoke(self, user: str) -> dict[str, Any]: ...
 

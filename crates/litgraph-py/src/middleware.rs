@@ -20,6 +20,7 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyLoggingMiddleware>()?;
     m.add_class::<PyMessageWindowMiddleware>()?;
     m.add_class::<PySystemPromptMiddleware>()?;
+    m.add_class::<PyToolBudgetMiddleware>()?;
     Ok(())
 }
 
@@ -177,5 +178,42 @@ impl PySystemPromptMiddleware {
     fn __repr__(&self) -> String {
         let preview: String = self.prompt.chars().take(40).collect();
         format!("SystemPromptMiddleware({:?})", preview)
+    }
+}
+
+/// Per-turn cap on tool invocations. Unlike the `AgentMiddleware`s above
+/// (which hook the chat model), this wraps a
+/// `litgraph_agents::middleware::ToolMiddleware` and plugs into
+/// `ReactAgent(..., tool_middleware=[...])` instead of `MiddlewareChain`.
+#[pyclass(name = "ToolBudgetMiddleware", module = "litgraph.middleware")]
+pub(crate) struct PyToolBudgetMiddleware {
+    pub(crate) inner: Arc<litgraph_agents::middleware::ToolBudgetMiddleware>,
+}
+
+#[pymethods]
+impl PyToolBudgetMiddleware {
+    #[new]
+    fn new(max_calls_per_turn: usize) -> Self {
+        Self {
+            inner: Arc::new(litgraph_agents::middleware::ToolBudgetMiddleware::new(
+                max_calls_per_turn,
+            )),
+        }
+    }
+
+    /// Zero the per-turn counter. The chain doesn't reset this
+    /// automatically between `invoke()`/`stream()` calls (same as the
+    /// Rust side) — call this yourself between turns if you want a
+    /// fresh budget each time.
+    fn reset(&self) {
+        self.inner.reset();
+    }
+
+    fn calls(&self) -> usize {
+        self.inner.calls()
+    }
+
+    fn __repr__(&self) -> String {
+        format!("ToolBudgetMiddleware(calls={})", self.inner.calls())
     }
 }

@@ -22,7 +22,7 @@ use crate::providers::{
     PyFallbackChat, PyGeminiChat, PyOpenAIChat, PyOpenAIResponses, PyPiiScrubbingChat,
     PyPromptCachingChat, PySelfConsistencyChat, PyStructuredChatModel, PyTokenBudgetChat,
 };
-use crate::middleware::PyMiddlewareChat;
+use crate::middleware::{PyMiddlewareChat, PyToolBudgetMiddleware};
 use crate::runtime::{block_on_compat, rt};
 use crate::tools::{
     PyBraveSearchTool, PyCachedTool, PyCalculatorTool, PyDalleImageTool, PyDuckDuckGoSearchTool,
@@ -712,6 +712,25 @@ pub(crate) fn extract_chat_model(bound: &Bound<'_, PyAny>) -> PyResult<Arc<dyn C
     }
 }
 
+pub(crate) fn extract_tool_middleware_chain(
+    items: Option<Bound<'_, PyList>>,
+) -> PyResult<litgraph_agents::middleware::ToolMiddlewareChain> {
+    let mut chain = litgraph_agents::middleware::ToolMiddlewareChain::new();
+    let Some(items) = items else {
+        return Ok(chain);
+    };
+    for item in items.iter() {
+        if let Ok(b) = item.extract::<PyRef<PyToolBudgetMiddleware>>() {
+            chain = chain.push(b.inner.clone());
+        } else {
+            return Err(PyValueError::new_err(
+                "tool_middleware items must be ToolBudgetMiddleware",
+            ));
+        }
+    }
+    Ok(chain)
+}
+
 /// Prebuilt ReAct-style tool-calling agent. Give it a chat model and a list of
 /// tools; `invoke(user_message)` runs the tool-call loop until the model stops.
 #[pyclass(name = "ReactAgent", module = "litgraph.agents")]
@@ -722,12 +741,13 @@ pub struct PyReactAgent {
 #[pymethods]
 impl PyReactAgent {
     #[new]
-    #[pyo3(signature = (model, tools, system_prompt=None, max_iterations=10))]
+    #[pyo3(signature = (model, tools, system_prompt=None, max_iterations=10, tool_middleware=None))]
     fn new(
         model: Py<PyAny>,
         tools: Bound<'_, PyList>,
         system_prompt: Option<String>,
         max_iterations: u32,
+        tool_middleware: Option<Bound<'_, PyList>>,
     ) -> PyResult<Self> {
         let chat_model: Arc<dyn ChatModel> =
             Python::with_gil(|py| extract_chat_model(model.bind(py)))?;
@@ -802,7 +822,7 @@ impl PyReactAgent {
             max_iterations,
             chat_options: ChatOptions::default(),
             max_parallel_tools: 16,
-            tool_middleware: litgraph_agents::middleware::ToolMiddlewareChain::new(),
+            tool_middleware: extract_tool_middleware_chain(tool_middleware)?,
         };
 
         let agent = ReactAgent::new(chat_model, tool_vec, cfg)
