@@ -125,214 +125,22 @@ where
         let sem = Arc::new(Semaphore::new(self.graph.max_parallel));
 
         loop {
-            if self.step >= self.graph.recursion_limit {
-                return Err(GraphError::Other(format!(
-                    "recursion limit ({}) reached", self.graph.recursion_limit
-                )));
-            }
-            frontier.retain(|e| e.node() != END);
-            // Dedup ONLY Normal entries (same-node, no override) while preserving
-            // order — forked invocations with the same target node but different
-            // overrides are intentionally distinct and must all run.
-            let mut seen_normal: HashSet<String> = HashSet::new();
-            let mut deduped: Vec<FrontierEntry> = Vec::with_capacity(frontier.len());
-            for e in frontier.drain(..) {
-                match &e {
-                    FrontierEntry::Normal(n) => {
-                        if seen_normal.insert(n.clone()) {
-                            deduped.push(e);
-                        }
-                    }
-                    FrontierEntry::Forked { .. } => deduped.push(e),
-                }
-            }
-            frontier = deduped;
+            self.check_recursion_limit()?;
+
+            frontier = normalize_frontier(frontier);
             if frontier.is_empty() { break; }
 
-            // Check interrupt_before — if any queued node is in the set, stop and checkpoint.
-            // On resume, skip this check for the first superstep (otherwise we'd re-fire
-            // the same interrupt that suspended us).
-            let skip = std::mem::replace(&mut self.skip_interrupt_before_once, false);
-            let hit = if skip { None } else {
-                frontier
-                    .iter()
-                    .find(|e| self.graph.interrupt_before.contains(e.node()))
-                    .map(|e| e.node().to_string())
-            };
-            if let Some(hit) = hit {
-                let (checkpoint_nodes, checkpoint_sends) = split_frontier(&frontier);
-                let cp = Checkpoint {
-                    thread_id: self.thread_id.clone(),
-                    step: self.step,
-                    state: rmp_serde::to_vec(&state)?,
-                    next_nodes: checkpoint_nodes,
-                    next_sends: checkpoint_sends,
-                    pending_interrupt: Some(crate::interrupt::Interrupt {
-                        node: hit.clone(),
-                        payload: serde_json::Value::Null,
-                    }),
-                    ts_ms: now_ms(),
-                };
-                self.cp.put(cp).await?;
-                self.emit(GraphEvent::Interrupt {
-                    node: hit.clone(),
-                    step: self.step,
-                    payload: serde_json::Value::Null,
-                }).await;
-                return Err(GraphError::Interrupted(hit));
-            }
+            self.check_interrupt_before(&state, &frontier).await?;
 
             self.step += 1;
             let step = self.step;
 
-            // Spawn all ready nodes in parallel — classic Kahn superstep.
-            // Forked entries get a per-task state: reducer(state.clone(), override).
-            // This is the key semantic for LangGraph-style `Send` fan-out:
-            // sibling forks do NOT see each other's overrides at invocation time.
-            let mut set: JoinSet<(String, Result<NodeOutput>)> = JoinSet::new();
-            for fe in &frontier {
-                let node_name = fe.node().to_string();
-                if node_name == END { continue; }
-                let Some(entry) = self.graph.nodes.get(&node_name) else {
-                    return Err(GraphError::UnknownNode(node_name));
-                };
-                let func = entry.func.clone();
-                let per_task_state = match fe {
-                    FrontierEntry::Normal(_) => state.clone(),
-                    FrontierEntry::Forked { override_update, .. } => {
-                        if matches!(override_update, serde_json::Value::Null) {
-                            state.clone()
-                        } else {
-                            (self.graph.reducer)(state.clone(), override_update.clone())?
-                        }
-                    }
-                };
-                let sem = sem.clone();
-                let cancel = self.cancel.child_token();
-                let name = node_name.clone();
-                let tx = self.events.clone();
-                set.spawn(async move {
-                    let span = info_span!("node", name = %name, step);
-                    let _g = span.enter();
-                    let permit = match sem.acquire_owned().await {
-                        Ok(p) => p,
-                        Err(_) => return (name, Err(GraphError::Cancelled)),
-                    };
-                    if let Some(tx) = &tx {
-                        let _ = tx.send(GraphEvent::NodeStart { node: name.clone(), step }).await;
-                    }
-                    let res = tokio::select! {
-                        biased;
-                        _ = cancel.cancelled() => Err(GraphError::Cancelled),
-                        out = func(per_task_state) => out,
-                    };
-                    drop(permit);
-                    (name, res)
-                });
-            }
-
-            let mut next_frontier: Vec<FrontierEntry> = Vec::new();
-            let mut any_err: Option<GraphError> = None;
-
-            while let Some(joined) = set.join_next().await {
-                let (name, res) = match joined {
-                    Ok(pair) => pair,
-                    Err(je) => {
-                        warn!("node join error: {je}");
-                        any_err.get_or_insert(GraphError::Panic(je.to_string()));
-                        continue;
-                    }
-                };
-                match res {
-                    Ok(out) => {
-                        self.emit(GraphEvent::NodeEnd {
-                            node: name.clone(),
-                            step,
-                            update: out.update.clone(),
-                        }).await;
-
-                        // Reduce the node's output update into the shared
-                        // state. For forked tasks this is the "reduce" half
-                        // of map-reduce; all siblings' updates land here in
-                        // completion order.
-                        if !matches!(out.update, serde_json::Value::Null) {
-                            state = (self.graph.reducer)(state, out.update)?;
-                        }
-
-                        if let Some(goto) = out.goto {
-                            next_frontier.extend(goto.into_iter().map(FrontierEntry::Normal));
-                        } else {
-                            next_frontier.extend(
-                                successors(&self.graph, &name, &state)
-                                    .into_iter()
-                                    .map(FrontierEntry::Normal),
-                            );
-                        }
-
-                        // LangGraph-style `Send`: each cmd becomes a
-                        // FORKED frontier entry with its own payload.
-                        // Critically, we do NOT merge the payload into
-                        // shared state here — that would make siblings see
-                        // each other's inputs. Instead, the next superstep
-                        // reduces each payload into a per-task state clone.
-                        for cmd in out.sends {
-                            next_frontier.push(FrontierEntry::Forked {
-                                node: cmd.goto,
-                                override_update: cmd.update,
-                            });
-                        }
-
-                        if self.graph.interrupt_after.contains(&name) {
-                            let (checkpoint_nodes, checkpoint_sends) = split_frontier(&next_frontier);
-                            let cp = Checkpoint {
-                                thread_id: self.thread_id.clone(),
-                                step,
-                                state: rmp_serde::to_vec(&state)?,
-                                next_nodes: checkpoint_nodes,
-                                next_sends: checkpoint_sends,
-                                pending_interrupt: Some(crate::interrupt::Interrupt {
-                                    node: name.clone(),
-                                    payload: serde_json::Value::Null,
-                                }),
-                                ts_ms: now_ms(),
-                            };
-                            self.cp.put(cp).await?;
-                            self.emit(GraphEvent::Interrupt {
-                                node: name.clone(),
-                                step,
-                                payload: serde_json::Value::Null,
-                            }).await;
-                            // Cancel any still-running tasks in this superstep.
-                            self.cancel.cancel();
-                            return Err(GraphError::Interrupted(name));
-                        }
-                    }
-                    Err(e) => {
-                        self.emit(GraphEvent::NodeError {
-                            node: name,
-                            step,
-                            error: e.to_string(),
-                        }).await;
-                        any_err.get_or_insert(e);
-                        self.cancel.cancel();
-                    }
-                }
-            }
-
-            if let Some(e) = any_err { return Err(e); }
+            let set = self.spawn_superstep(&frontier, &state, step, &sem)?;
+            let (new_state, next_frontier) = self.drain_superstep(set, step, state).await?;
+            state = new_state;
 
             // Persist post-superstep checkpoint.
-            let (checkpoint_nodes, checkpoint_sends) = split_frontier(&next_frontier);
-            let cp = Checkpoint {
-                thread_id: self.thread_id.clone(),
-                step,
-                state: rmp_serde::to_vec(&state)?,
-                next_nodes: checkpoint_nodes,
-                next_sends: checkpoint_sends,
-                pending_interrupt: None,
-                ts_ms: now_ms(),
-            };
-            self.cp.put(cp).await?;
+            self.checkpoint_after_superstep(step, &state, &next_frontier).await?;
 
             debug!(step, next = ?next_frontier, "superstep done");
             frontier = next_frontier;
@@ -340,6 +148,260 @@ where
 
         Ok(state)
     }
+
+    fn check_recursion_limit(&self) -> Result<()> {
+        if self.step >= self.graph.recursion_limit {
+            return Err(GraphError::Other(format!(
+                "recursion limit ({}) reached", self.graph.recursion_limit
+            )));
+        }
+        Ok(())
+    }
+
+    /// Check interrupt_before — if any queued node is in the set, stop and checkpoint.
+    /// On resume, skip this check for the first superstep (otherwise we'd re-fire
+    /// the same interrupt that suspended us).
+    async fn check_interrupt_before(&mut self, state: &S, frontier: &[FrontierEntry]) -> Result<()> {
+        let skip = std::mem::replace(&mut self.skip_interrupt_before_once, false);
+        let hit = if skip { None } else {
+            frontier
+                .iter()
+                .find(|e| self.graph.interrupt_before.contains(e.node()))
+                .map(|e| e.node().to_string())
+        };
+        if let Some(hit) = hit {
+            let (checkpoint_nodes, checkpoint_sends) = split_frontier(frontier);
+            let cp = Checkpoint {
+                thread_id: self.thread_id.clone(),
+                step: self.step,
+                state: rmp_serde::to_vec(state)?,
+                next_nodes: checkpoint_nodes,
+                next_sends: checkpoint_sends,
+                pending_interrupt: Some(crate::interrupt::Interrupt {
+                    node: hit.clone(),
+                    payload: serde_json::Value::Null,
+                }),
+                ts_ms: now_ms(),
+            };
+            self.cp.put(cp).await?;
+            self.emit(GraphEvent::Interrupt {
+                node: hit.clone(),
+                step: self.step,
+                payload: serde_json::Value::Null,
+            }).await;
+            return Err(GraphError::Interrupted(hit));
+        }
+        Ok(())
+    }
+
+    /// Spawn all ready nodes in parallel — classic Kahn superstep.
+    /// Forked entries get a per-task state: reducer(state.clone(), override).
+    /// This is the key semantic for LangGraph-style `Send` fan-out:
+    /// sibling forks do NOT see each other's overrides at invocation time.
+    fn spawn_superstep(
+        &self,
+        frontier: &[FrontierEntry],
+        state: &S,
+        step: u64,
+        sem: &Arc<Semaphore>,
+    ) -> Result<JoinSet<(String, Result<NodeOutput>)>> {
+        let mut set: JoinSet<(String, Result<NodeOutput>)> = JoinSet::new();
+        for fe in frontier {
+            let node_name = fe.node().to_string();
+            if node_name == END { continue; }
+            let Some(entry) = self.graph.nodes.get(&node_name) else {
+                return Err(GraphError::UnknownNode(node_name));
+            };
+            let func = entry.func.clone();
+            let per_task_state = match fe {
+                FrontierEntry::Normal(_) => state.clone(),
+                FrontierEntry::Forked { override_update, .. } => {
+                    if matches!(override_update, serde_json::Value::Null) {
+                        state.clone()
+                    } else {
+                        (self.graph.reducer)(state.clone(), override_update.clone())?
+                    }
+                }
+            };
+            let sem = sem.clone();
+            let cancel = self.cancel.child_token();
+            let name = node_name.clone();
+            let tx = self.events.clone();
+            set.spawn(async move {
+                let span = info_span!("node", name = %name, step);
+                let _g = span.enter();
+                let permit = match sem.acquire_owned().await {
+                    Ok(p) => p,
+                    Err(_) => return (name, Err(GraphError::Cancelled)),
+                };
+                if let Some(tx) = &tx {
+                    let _ = tx.send(GraphEvent::NodeStart { node: name.clone(), step }).await;
+                }
+                let res = tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => Err(GraphError::Cancelled),
+                    out = func(per_task_state) => out,
+                };
+                drop(permit);
+                (name, res)
+            });
+        }
+        Ok(set)
+    }
+
+    /// Drain a superstep's `JoinSet`, folding each node's result back into
+    /// state until all tasks have joined.
+    async fn drain_superstep(
+        &mut self,
+        mut set: JoinSet<(String, Result<NodeOutput>)>,
+        step: u64,
+        mut state: S,
+    ) -> Result<(S, Vec<FrontierEntry>)> {
+        let mut next_frontier: Vec<FrontierEntry> = Vec::new();
+        let mut any_err: Option<GraphError> = None;
+
+        while let Some(joined) = set.join_next().await {
+            let (name, res) = match joined {
+                Ok(pair) => pair,
+                Err(je) => {
+                    warn!("node join error: {je}");
+                    any_err.get_or_insert(GraphError::Panic(je.to_string()));
+                    continue;
+                }
+            };
+            match res {
+                Ok(out) => {
+                    state = self.fold_node_success(name, out, step, state, &mut next_frontier).await?;
+                }
+                Err(e) => {
+                    self.emit(GraphEvent::NodeError {
+                        node: name,
+                        step,
+                        error: e.to_string(),
+                    }).await;
+                    any_err.get_or_insert(e);
+                    self.cancel.cancel();
+                }
+            }
+        }
+
+        if let Some(e) = any_err { return Err(e); }
+
+        Ok((state, next_frontier))
+    }
+
+    async fn fold_node_success(
+        &mut self,
+        name: String,
+        out: NodeOutput,
+        step: u64,
+        mut state: S,
+        next_frontier: &mut Vec<FrontierEntry>,
+    ) -> Result<S> {
+        self.emit(GraphEvent::NodeEnd {
+            node: name.clone(),
+            step,
+            update: out.update.clone(),
+        }).await;
+
+        // Reduce the node's output update into the shared
+        // state. For forked tasks this is the "reduce" half
+        // of map-reduce; all siblings' updates land here in
+        // completion order.
+        if !matches!(out.update, serde_json::Value::Null) {
+            state = (self.graph.reducer)(state, out.update)?;
+        }
+
+        if let Some(goto) = out.goto {
+            next_frontier.extend(goto.into_iter().map(FrontierEntry::Normal));
+        } else {
+            next_frontier.extend(
+                successors(&self.graph, &name, &state)
+                    .into_iter()
+                    .map(FrontierEntry::Normal),
+            );
+        }
+
+        // LangGraph-style `Send`: each cmd becomes a
+        // FORKED frontier entry with its own payload.
+        // Critically, we do NOT merge the payload into
+        // shared state here — that would make siblings see
+        // each other's inputs. Instead, the next superstep
+        // reduces each payload into a per-task state clone.
+        for cmd in out.sends {
+            next_frontier.push(FrontierEntry::Forked {
+                node: cmd.goto,
+                override_update: cmd.update,
+            });
+        }
+
+        if self.graph.interrupt_after.contains(&name) {
+            let (checkpoint_nodes, checkpoint_sends) = split_frontier(next_frontier);
+            let cp = Checkpoint {
+                thread_id: self.thread_id.clone(),
+                step,
+                state: rmp_serde::to_vec(&state)?,
+                next_nodes: checkpoint_nodes,
+                next_sends: checkpoint_sends,
+                pending_interrupt: Some(crate::interrupt::Interrupt {
+                    node: name.clone(),
+                    payload: serde_json::Value::Null,
+                }),
+                ts_ms: now_ms(),
+            };
+            self.cp.put(cp).await?;
+            self.emit(GraphEvent::Interrupt {
+                node: name.clone(),
+                step,
+                payload: serde_json::Value::Null,
+            }).await;
+            // Cancel any still-running tasks in this superstep.
+            self.cancel.cancel();
+            return Err(GraphError::Interrupted(name));
+        }
+
+        Ok(state)
+    }
+
+    async fn checkpoint_after_superstep(
+        &self,
+        step: u64,
+        state: &S,
+        next_frontier: &[FrontierEntry],
+    ) -> Result<()> {
+        let (checkpoint_nodes, checkpoint_sends) = split_frontier(next_frontier);
+        let cp = Checkpoint {
+            thread_id: self.thread_id.clone(),
+            step,
+            state: rmp_serde::to_vec(state)?,
+            next_nodes: checkpoint_nodes,
+            next_sends: checkpoint_sends,
+            pending_interrupt: None,
+            ts_ms: now_ms(),
+        };
+        self.cp.put(cp).await?;
+        Ok(())
+    }
+}
+
+/// Dedup ONLY Normal entries (same-node, no override) while preserving
+/// order — forked invocations with the same target node but different
+/// overrides are intentionally distinct and must all run.
+fn normalize_frontier(mut frontier: Vec<FrontierEntry>) -> Vec<FrontierEntry> {
+    frontier.retain(|e| e.node() != END);
+    let mut seen_normal: HashSet<String> = HashSet::new();
+    let mut deduped: Vec<FrontierEntry> = Vec::with_capacity(frontier.len());
+    for e in frontier.drain(..) {
+        match &e {
+            FrontierEntry::Normal(n) => {
+                if seen_normal.insert(n.clone()) {
+                    deduped.push(e);
+                }
+            }
+            FrontierEntry::Forked { .. } => deduped.push(e),
+        }
+    }
+    deduped
 }
 
 /// Split a frontier into the (Vec<String>, Vec<Command>) representation that
