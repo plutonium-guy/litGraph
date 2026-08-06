@@ -149,6 +149,25 @@ where
     // ---- Stage 1: loaders → load_tx ----
     let load_concurrency = cfg.load_concurrency;
     let stage1_loaders = loaders;
+    spawn_load_stage(stage1_loaders, load_concurrency, load_tx);
+
+    // ---- Stage 2: load_rx → splitter → split_tx ----
+    let splitter_arc = splitter.clone();
+    spawn_split_stage(splitter_arc, load_rx, split_tx);
+
+    // ---- Stage 3: split_rx → embedder (chunked) → batch_tx ----
+    let embed_chunk_size = cfg.embed_chunk_size;
+    let embed_concurrency = cfg.embed_concurrency;
+    spawn_embed_stage(split_rx, embedder, embed_chunk_size, embed_concurrency, batch_tx);
+
+    ReceiverStream::new(batch_rx)
+}
+
+fn spawn_load_stage(
+    stage1_loaders: Vec<Arc<dyn Loader>>,
+    load_concurrency: usize,
+    load_tx: mpsc::Sender<LoaderResult<Vec<Document>>>,
+) {
     tokio::spawn(async move {
         let results = load_concurrent(stage1_loaders, load_concurrency).await;
         for r in results {
@@ -157,9 +176,15 @@ where
             }
         }
     });
+}
 
-    // ---- Stage 2: load_rx → splitter → split_tx ----
-    let splitter_arc = splitter.clone();
+fn spawn_split_stage<S>(
+    splitter_arc: Arc<S>,
+    load_rx: mpsc::Receiver<LoaderResult<Vec<Document>>>,
+    split_tx: mpsc::Sender<LoaderResult<Document>>,
+) where
+    S: Fn(Document) -> Vec<Document> + Send + Sync + 'static,
+{
     tokio::spawn(async move {
         let mut load_rx = load_rx;
         while let Some(batch_result) = load_rx.recv().await {
@@ -183,52 +208,57 @@ where
             }
         }
     });
+}
 
-    // ---- Stage 3: split_rx → embedder (chunked) → batch_tx ----
-    let embed_chunk_size = cfg.embed_chunk_size;
-    let embed_concurrency = cfg.embed_concurrency;
+// Drain `buf`, embed, send a batch result.
+async fn flush_embed_buffer(
+    buf: &mut Vec<Document>,
+    embedder: &Arc<dyn Embeddings>,
+    embed_chunk_size: usize,
+    embed_concurrency: usize,
+    tx: &mpsc::Sender<Result<IngestBatch, LoaderError>>,
+) -> bool {
+    if buf.is_empty() {
+        return true;
+    }
+    let texts: Vec<String> = buf.iter().map(|d| d.content.clone()).collect();
+    let res = embed_documents_concurrent(
+        embedder.clone(),
+        &texts,
+        embed_chunk_size,
+        embed_concurrency,
+    )
+    .await;
+    let payload = match res {
+        Ok(embeddings) => {
+            let docs: Vec<Document> = std::mem::take(buf);
+            Ok(IngestBatch { docs, embeddings })
+        }
+        Err(e) => {
+            buf.clear();
+            Err(LoaderError::Other(format!("embed: {e}")))
+        }
+    };
+    tx.send(payload).await.is_ok()
+}
+
+fn spawn_embed_stage(
+    split_rx: mpsc::Receiver<LoaderResult<Document>>,
+    embedder: Arc<dyn Embeddings>,
+    embed_chunk_size: usize,
+    embed_concurrency: usize,
+    batch_tx: mpsc::Sender<Result<IngestBatch, LoaderError>>,
+) {
     tokio::spawn(async move {
         let mut split_rx = split_rx;
         let mut buf: Vec<Document> = Vec::with_capacity(embed_chunk_size);
-
-        // Helper: drain `buf`, embed, send a batch result.
-        async fn flush_buf(
-            buf: &mut Vec<Document>,
-            embedder: &Arc<dyn Embeddings>,
-            embed_chunk_size: usize,
-            embed_concurrency: usize,
-            tx: &mpsc::Sender<Result<IngestBatch, LoaderError>>,
-        ) -> bool {
-            if buf.is_empty() {
-                return true;
-            }
-            let texts: Vec<String> = buf.iter().map(|d| d.content.clone()).collect();
-            let res = embed_documents_concurrent(
-                embedder.clone(),
-                &texts,
-                embed_chunk_size,
-                embed_concurrency,
-            )
-            .await;
-            let payload = match res {
-                Ok(embeddings) => {
-                    let docs: Vec<Document> = std::mem::take(buf);
-                    Ok(IngestBatch { docs, embeddings })
-                }
-                Err(e) => {
-                    buf.clear();
-                    Err(LoaderError::Other(format!("embed: {e}")))
-                }
-            };
-            tx.send(payload).await.is_ok()
-        }
 
         while let Some(item) = split_rx.recv().await {
             match item {
                 Ok(doc) => {
                     buf.push(doc);
                     if buf.len() >= embed_chunk_size
-                        && !flush_buf(
+                        && !flush_embed_buffer(
                             &mut buf,
                             &embedder,
                             embed_chunk_size,
@@ -249,7 +279,7 @@ where
             }
         }
         // Flush any tail.
-        let _ = flush_buf(
+        let _ = flush_embed_buffer(
             &mut buf,
             &embedder,
             embed_chunk_size,
@@ -258,8 +288,6 @@ where
         )
         .await;
     });
-
-    ReceiverStream::new(batch_rx)
 }
 
 /// Like [`ingest_to_stream`] but additionally updates the supplied
@@ -303,6 +331,35 @@ where
     let load_concurrency = cfg.load_concurrency;
     let stage1_loaders = loaders;
     let stage1_progress = progress.clone();
+    spawn_load_stage_with_progress(stage1_loaders, load_concurrency, load_tx, stage1_progress);
+
+    // ---- Stage 2: load_rx → splitter → split_tx (with progress) ----
+    let splitter_arc = splitter.clone();
+    let stage2_progress = progress.clone();
+    spawn_split_stage_with_progress(splitter_arc, load_rx, split_tx, stage2_progress);
+
+    // ---- Stage 3: split_rx → embedder → batch_tx (with progress) ----
+    let embed_chunk_size = cfg.embed_chunk_size;
+    let embed_concurrency = cfg.embed_concurrency;
+    let stage3_progress = progress;
+    spawn_embed_stage_with_progress(
+        split_rx,
+        embedder,
+        embed_chunk_size,
+        embed_concurrency,
+        batch_tx,
+        stage3_progress,
+    );
+
+    ReceiverStream::new(batch_rx)
+}
+
+fn spawn_load_stage_with_progress(
+    stage1_loaders: Vec<Arc<dyn Loader>>,
+    load_concurrency: usize,
+    load_tx: mpsc::Sender<LoaderResult<Vec<Document>>>,
+    stage1_progress: Progress<IngestProgress>,
+) {
     tokio::spawn(async move {
         let results = load_concurrent(stage1_loaders, load_concurrency).await;
         for r in results {
@@ -319,10 +376,16 @@ where
             }
         }
     });
+}
 
-    // ---- Stage 2: load_rx → splitter → split_tx (with progress) ----
-    let splitter_arc = splitter.clone();
-    let stage2_progress = progress.clone();
+fn spawn_split_stage_with_progress<S>(
+    splitter_arc: Arc<S>,
+    load_rx: mpsc::Receiver<LoaderResult<Vec<Document>>>,
+    split_tx: mpsc::Sender<LoaderResult<Document>>,
+    stage2_progress: Progress<IngestProgress>,
+) where
+    S: Fn(Document) -> Vec<Document> + Send + Sync + 'static,
+{
     tokio::spawn(async move {
         let mut load_rx = load_rx;
         while let Some(batch_result) = load_rx.recv().await {
@@ -350,63 +413,68 @@ where
             }
         }
     });
+}
 
-    // ---- Stage 3: split_rx → embedder → batch_tx (with progress) ----
-    let embed_chunk_size = cfg.embed_chunk_size;
-    let embed_concurrency = cfg.embed_concurrency;
-    let stage3_progress = progress;
+async fn flush_embed_buffer_with_progress(
+    buf: &mut Vec<Document>,
+    embedder: &Arc<dyn Embeddings>,
+    embed_chunk_size: usize,
+    embed_concurrency: usize,
+    tx: &mpsc::Sender<Result<IngestBatch, LoaderError>>,
+    progress: &Progress<IngestProgress>,
+) -> bool {
+    if buf.is_empty() {
+        return true;
+    }
+    let n = buf.len() as u64;
+    let texts: Vec<String> = buf.iter().map(|d| d.content.clone()).collect();
+    let res = embed_documents_concurrent(
+        embedder.clone(),
+        &texts,
+        embed_chunk_size,
+        embed_concurrency,
+    )
+    .await;
+    let payload = match res {
+        Ok(embeddings) => {
+            let docs: Vec<Document> = std::mem::take(buf);
+            let _ = progress.update(|p| IngestProgress {
+                chunks_embedded: p.chunks_embedded + n,
+                batches_emitted: p.batches_emitted + 1,
+                ..p.clone()
+            });
+            Ok(IngestBatch { docs, embeddings })
+        }
+        Err(e) => {
+            buf.clear();
+            let _ = progress.update(|p| IngestProgress {
+                embed_errors: p.embed_errors + 1,
+                ..p.clone()
+            });
+            Err(LoaderError::Other(format!("embed: {e}")))
+        }
+    };
+    tx.send(payload).await.is_ok()
+}
+
+fn spawn_embed_stage_with_progress(
+    split_rx: mpsc::Receiver<LoaderResult<Document>>,
+    embedder: Arc<dyn Embeddings>,
+    embed_chunk_size: usize,
+    embed_concurrency: usize,
+    batch_tx: mpsc::Sender<Result<IngestBatch, LoaderError>>,
+    stage3_progress: Progress<IngestProgress>,
+) {
     tokio::spawn(async move {
         let mut split_rx = split_rx;
         let mut buf: Vec<Document> = Vec::with_capacity(embed_chunk_size);
-
-        async fn flush_buf(
-            buf: &mut Vec<Document>,
-            embedder: &Arc<dyn Embeddings>,
-            embed_chunk_size: usize,
-            embed_concurrency: usize,
-            tx: &mpsc::Sender<Result<IngestBatch, LoaderError>>,
-            progress: &Progress<IngestProgress>,
-        ) -> bool {
-            if buf.is_empty() {
-                return true;
-            }
-            let n = buf.len() as u64;
-            let texts: Vec<String> = buf.iter().map(|d| d.content.clone()).collect();
-            let res = embed_documents_concurrent(
-                embedder.clone(),
-                &texts,
-                embed_chunk_size,
-                embed_concurrency,
-            )
-            .await;
-            let payload = match res {
-                Ok(embeddings) => {
-                    let docs: Vec<Document> = std::mem::take(buf);
-                    let _ = progress.update(|p| IngestProgress {
-                        chunks_embedded: p.chunks_embedded + n,
-                        batches_emitted: p.batches_emitted + 1,
-                        ..p.clone()
-                    });
-                    Ok(IngestBatch { docs, embeddings })
-                }
-                Err(e) => {
-                    buf.clear();
-                    let _ = progress.update(|p| IngestProgress {
-                        embed_errors: p.embed_errors + 1,
-                        ..p.clone()
-                    });
-                    Err(LoaderError::Other(format!("embed: {e}")))
-                }
-            };
-            tx.send(payload).await.is_ok()
-        }
 
         while let Some(item) = split_rx.recv().await {
             match item {
                 Ok(doc) => {
                     buf.push(doc);
                     if buf.len() >= embed_chunk_size
-                        && !flush_buf(
+                        && !flush_embed_buffer_with_progress(
                             &mut buf,
                             &embedder,
                             embed_chunk_size,
@@ -426,7 +494,7 @@ where
                 }
             }
         }
-        let _ = flush_buf(
+        let _ = flush_embed_buffer_with_progress(
             &mut buf,
             &embedder,
             embed_chunk_size,
@@ -436,8 +504,6 @@ where
         )
         .await;
     });
-
-    ReceiverStream::new(batch_rx)
 }
 
 #[cfg(test)]

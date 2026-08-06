@@ -225,32 +225,15 @@ impl BedrockChat {
         }
         resp.json().await.map_err(|e| Error::provider(format!("decode: {e}")))
     }
-}
 
-#[async_trait]
-impl ChatModel for BedrockChat {
-    fn name(&self) -> &str { &self.cfg.model_id }
-
-    async fn invoke(&self, messages: Vec<Message>, opts: &ChatOptions) -> Result<ChatResponse> {
-        let body = self.body(&messages, opts);
-        let v = self.invoke_inner(&body).await?;
-        parse_response(&self.cfg.model_id, v)
-    }
-
-    /// Bedrock streaming via `InvokeModelWithResponseStream`. Parses the AWS
-    /// event-stream binary frame format, base64-decodes each chunk's payload,
-    /// then interprets the inner JSON as Anthropic Messages-API SSE events
-    /// (the Anthropic-on-Bedrock pattern; non-Anthropic models would need
-    /// their own inner-payload parser).
-    async fn stream(&self, messages: Vec<Message>, opts: &ChatOptions) -> Result<ChatStream> {
-        let body = self.body(&messages, opts);
+    async fn send_stream_request(&self, body: &Value) -> Result<reqwest::Response> {
         if let Some(cb) = &self.cfg.on_request {
-            cb(&self.cfg.model_id, &body);
+            cb(&self.cfg.model_id, body);
         }
         let (host, base) = resolve_endpoint(&self.cfg);
         let path = format!("/model/{}/invoke-with-response-stream", urlencoded(&self.cfg.model_id));
         let url = format!("{base}{path}");
-        let body_bytes = serde_json::to_vec(&body).map_err(Error::from)?;
+        let body_bytes = serde_json::to_vec(body).map_err(Error::from)?;
 
         let signed = sigv4::sign(
             &self.cfg.credentials,
@@ -285,17 +268,35 @@ impl ChatModel for BedrockChat {
             let txt = resp.text().await.unwrap_or_default();
             return Err(Error::provider(format!("bedrock stream {status}: {txt}")));
         }
+        Ok(resp)
+    }
+}
+
+#[async_trait]
+impl ChatModel for BedrockChat {
+    fn name(&self) -> &str { &self.cfg.model_id }
+
+    async fn invoke(&self, messages: Vec<Message>, opts: &ChatOptions) -> Result<ChatResponse> {
+        let body = self.body(&messages, opts);
+        let v = self.invoke_inner(&body).await?;
+        parse_response(&self.cfg.model_id, v)
+    }
+
+    /// Bedrock streaming via `InvokeModelWithResponseStream`. Parses the AWS
+    /// event-stream binary frame format, base64-decodes each chunk's payload,
+    /// then interprets the inner JSON as Anthropic Messages-API SSE events
+    /// (the Anthropic-on-Bedrock pattern; non-Anthropic models would need
+    /// their own inner-payload parser).
+    async fn stream(&self, messages: Vec<Message>, opts: &ChatOptions) -> Result<ChatStream> {
+        let body = self.body(&messages, opts);
+        let resp = self.send_stream_request(&body).await?;
 
         let model_name = self.cfg.model_id.clone();
         let mut bytes_stream = resp.bytes_stream();
 
         let stream = async_stream::try_stream! {
             let mut buf: Vec<u8> = Vec::with_capacity(8 * 1024);
-            let mut agg_text = String::new();
-            let mut tool_calls: Vec<ToolCall> = Vec::new();
-            let mut tool_arg_bufs: Vec<String> = Vec::new();
-            let mut usage = TokenUsage::default();
-            let mut finish = FinishReason::Stop;
+            let mut state = BedrockInvokeStreamState::new();
 
             while let Some(chunk) = bytes_stream.next().await {
                 let chunk = chunk.map_err(|e| Error::provider(format!("stream chunk: {e}")))?;
@@ -310,110 +311,149 @@ impl ChatModel for BedrockChat {
                             let _drained: Vec<u8> = buf.drain(..consumed).collect();
                             let event_type = frame.headers.get(":event-type").cloned().unwrap_or_default();
                             if event_type != "chunk" { continue; }
-                            // Outer payload: { "bytes": "<base64>" }
-                            let outer: Value = serde_json::from_slice(&frame.payload)
-                                .map_err(|e| Error::provider(format!("chunk outer json: {e}")))?;
-                            let b64 = outer.get("bytes").and_then(|v| v.as_str())
-                                .ok_or_else(|| Error::provider("chunk missing bytes"))?;
-                            let decoded = base64::engine::general_purpose::STANDARD
-                                .decode(b64)
-                                .map_err(|e| Error::provider(format!("chunk base64: {e}")))?;
-                            // Inner: Anthropic-on-Bedrock SSE event shape
-                            let v: Value = serde_json::from_slice(&decoded)
-                                .map_err(|e| Error::provider(format!("inner json: {e}")))?;
-                            let etype = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
-                            match etype {
-                                "content_block_start" => {
-                                    if let Some(block) = v.get("content_block") {
-                                        if block.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
-                                            tool_calls.push(ToolCall {
-                                                id: block.get("id").and_then(|v| v.as_str()).unwrap_or("").into(),
-                                                name: block.get("name").and_then(|v| v.as_str()).unwrap_or("").into(),
-                                                arguments: Value::Null,
-                                            });
-                                            tool_arg_bufs.push(String::new());
-                                        }
-                                    }
-                                }
-                                "content_block_delta" => {
-                                    if let Some(delta) = v.get("delta") {
-                                        match delta.get("type").and_then(|t| t.as_str()) {
-                                            Some("text_delta") => {
-                                                if let Some(t) = delta.get("text").and_then(|v| v.as_str()) {
-                                                    if !t.is_empty() {
-                                                        agg_text.push_str(t);
-                                                        yield ChatStreamEvent::Delta { text: t.into() };
-                                                    }
-                                                }
-                                            }
-                                            Some("input_json_delta") => {
-                                                if let Some(idx) = v.get("index").and_then(|v| v.as_u64()) {
-                                                    let idx = idx as usize;
-                                                    if let Some(b) = tool_arg_bufs.get_mut(idx) {
-                                                        if let Some(pj) = delta.get("partial_json").and_then(|v| v.as_str()) {
-                                                            b.push_str(pj);
-                                                            yield ChatStreamEvent::ToolCallDelta {
-                                                                index: idx as u32, id: None, name: None,
-                                                                arguments_delta: Some(pj.into()),
-                                                            };
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                            _ => {}
-                                        }
-                                    }
-                                }
-                                "message_delta" => {
-                                    if let Some(d) = v.get("delta") {
-                                        if let Some(sr) = d.get("stop_reason").and_then(|v| v.as_str()) {
-                                            finish = match sr {
-                                                "end_turn" => FinishReason::Stop,
-                                                "max_tokens" => FinishReason::Length,
-                                                "tool_use" => FinishReason::ToolCalls,
-                                                _ => FinishReason::Other,
-                                            };
-                                        }
-                                    }
-                                    if let Some(u) = v.get("usage") {
-                                        usage.completion = u.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-                                    }
-                                }
-                                "message_start" => {
-                                    if let Some(m) = v.get("message") {
-                                        if let Some(u) = m.get("usage") {
-                                            usage.prompt = u.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-                                        }
-                                    }
-                                }
-                                _ => {}
+                            let v = decode_bedrock_chunk_payload(&frame.payload)?;
+                            if let Some(ev) = state.apply_event(&v) {
+                                yield ev;
                             }
                         }
                     }
                 }
             }
 
-            // Finalize aggregated tool calls.
-            for (i, b) in tool_arg_bufs.iter().enumerate() {
-                if !b.is_empty() {
-                    tool_calls[i].arguments = serde_json::from_str(b).unwrap_or(Value::String(b.clone()));
-                }
-            }
-            usage.total = usage.prompt + usage.completion;
-            let msg = Message {
-                role: Role::Assistant,
-                content: if agg_text.is_empty() { vec![] } else { vec![ContentPart::Text { text: agg_text.clone() }] },
-                tool_calls,
-                tool_call_id: None,
-                name: None,
-                cache: false,
-            };
-            yield ChatStreamEvent::Done {
-                response: ChatResponse { message: msg, finish_reason: finish, usage, model: model_name },
-            };
+            yield state.into_done_event(model_name);
         };
 
         Ok(Box::pin(stream.map_err(|e: Error| e)))
+    }
+}
+
+fn decode_bedrock_chunk_payload(payload: &[u8]) -> Result<Value> {
+    // Outer payload: { "bytes": "<base64>" }
+    let outer: Value = serde_json::from_slice(payload)
+        .map_err(|e| Error::provider(format!("chunk outer json: {e}")))?;
+    let b64 = outer.get("bytes").and_then(|v| v.as_str())
+        .ok_or_else(|| Error::provider("chunk missing bytes"))?;
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(b64)
+        .map_err(|e| Error::provider(format!("chunk base64: {e}")))?;
+    // Inner: Anthropic-on-Bedrock SSE event shape
+    serde_json::from_slice(&decoded)
+        .map_err(|e| Error::provider(format!("inner json: {e}")))
+}
+
+struct BedrockInvokeStreamState {
+    agg_text: String,
+    tool_calls: Vec<ToolCall>,
+    tool_arg_bufs: Vec<String>,
+    usage: TokenUsage,
+    finish: FinishReason,
+}
+
+impl BedrockInvokeStreamState {
+    fn new() -> Self {
+        Self {
+            agg_text: String::new(),
+            tool_calls: Vec::new(),
+            tool_arg_bufs: Vec::new(),
+            usage: TokenUsage::default(),
+            finish: FinishReason::Stop,
+        }
+    }
+
+    fn apply_event(&mut self, v: &Value) -> Option<ChatStreamEvent> {
+        let etype = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        match etype {
+            "content_block_start" => {
+                if let Some(block) = v.get("content_block") {
+                    if block.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
+                        self.tool_calls.push(ToolCall {
+                            id: block.get("id").and_then(|v| v.as_str()).unwrap_or("").into(),
+                            name: block.get("name").and_then(|v| v.as_str()).unwrap_or("").into(),
+                            arguments: Value::Null,
+                        });
+                        self.tool_arg_bufs.push(String::new());
+                    }
+                }
+                None
+            }
+            "content_block_delta" => {
+                if let Some(delta) = v.get("delta") {
+                    match delta.get("type").and_then(|t| t.as_str()) {
+                        Some("text_delta") => {
+                            if let Some(t) = delta.get("text").and_then(|v| v.as_str()) {
+                                if !t.is_empty() {
+                                    self.agg_text.push_str(t);
+                                    return Some(ChatStreamEvent::Delta { text: t.into() });
+                                }
+                            }
+                        }
+                        Some("input_json_delta") => {
+                            if let Some(idx) = v.get("index").and_then(|v| v.as_u64()) {
+                                let idx = idx as usize;
+                                if let Some(b) = self.tool_arg_bufs.get_mut(idx) {
+                                    if let Some(pj) = delta.get("partial_json").and_then(|v| v.as_str()) {
+                                        b.push_str(pj);
+                                        return Some(ChatStreamEvent::ToolCallDelta {
+                                            index: idx as u32, id: None, name: None,
+                                            arguments_delta: Some(pj.into()),
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                None
+            }
+            "message_delta" => {
+                if let Some(d) = v.get("delta") {
+                    if let Some(sr) = d.get("stop_reason").and_then(|v| v.as_str()) {
+                        self.finish = match sr {
+                            "end_turn" => FinishReason::Stop,
+                            "max_tokens" => FinishReason::Length,
+                            "tool_use" => FinishReason::ToolCalls,
+                            _ => FinishReason::Other,
+                        };
+                    }
+                }
+                if let Some(u) = v.get("usage") {
+                    self.usage.completion = u.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                }
+                None
+            }
+            "message_start" => {
+                if let Some(m) = v.get("message") {
+                    if let Some(u) = m.get("usage") {
+                        self.usage.prompt = u.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
+    fn into_done_event(self, model_name: String) -> ChatStreamEvent {
+        let Self { agg_text, mut tool_calls, tool_arg_bufs, mut usage, finish } = self;
+        // Finalize aggregated tool calls.
+        for (i, b) in tool_arg_bufs.iter().enumerate() {
+            if !b.is_empty() {
+                tool_calls[i].arguments = serde_json::from_str(b).unwrap_or(Value::String(b.clone()));
+            }
+        }
+        usage.total = usage.prompt + usage.completion;
+        let msg = Message {
+            role: Role::Assistant,
+            content: if agg_text.is_empty() { vec![] } else { vec![ContentPart::Text { text: agg_text.clone() }] },
+            tool_calls,
+            tool_call_id: None,
+            name: None,
+            cache: false,
+        };
+        ChatStreamEvent::Done {
+            response: ChatResponse { message: msg, finish_reason: finish, usage, model: model_name },
+        }
     }
 }
 
@@ -930,29 +970,15 @@ impl BedrockConverseChat {
             .await
             .map_err(|e| Error::provider(format!("decode: {e}")))
     }
-}
 
-#[async_trait]
-impl ChatModel for BedrockConverseChat {
-    fn name(&self) -> &str {
-        &self.cfg.model_id
-    }
-
-    async fn invoke(&self, messages: Vec<Message>, opts: &ChatOptions) -> Result<ChatResponse> {
-        let body = self.body(&messages, opts);
-        let v = self.invoke_inner(&body).await?;
-        parse_converse_response(&self.cfg.model_id, v)
-    }
-
-    async fn stream(&self, messages: Vec<Message>, opts: &ChatOptions) -> Result<ChatStream> {
-        let body = self.body(&messages, opts);
+    async fn send_stream_request(&self, body: &Value) -> Result<reqwest::Response> {
         if let Some(cb) = &self.cfg.on_request {
-            cb(&self.cfg.model_id, &body);
+            cb(&self.cfg.model_id, body);
         }
         let (host, base) = resolve_endpoint(&self.cfg);
         let path = format!("/model/{}/converse-stream", urlencoded(&self.cfg.model_id));
         let url = format!("{base}{path}");
-        let body_bytes = serde_json::to_vec(&body).map_err(Error::from)?;
+        let body_bytes = serde_json::to_vec(body).map_err(Error::from)?;
 
         let signed = sigv4::sign(
             &self.cfg.credentials,
@@ -992,30 +1018,32 @@ impl ChatModel for BedrockConverseChat {
                 "bedrock converse stream {status}: {txt}"
             )));
         }
+        Ok(resp)
+    }
+}
+
+#[async_trait]
+impl ChatModel for BedrockConverseChat {
+    fn name(&self) -> &str {
+        &self.cfg.model_id
+    }
+
+    async fn invoke(&self, messages: Vec<Message>, opts: &ChatOptions) -> Result<ChatResponse> {
+        let body = self.body(&messages, opts);
+        let v = self.invoke_inner(&body).await?;
+        parse_converse_response(&self.cfg.model_id, v)
+    }
+
+    async fn stream(&self, messages: Vec<Message>, opts: &ChatOptions) -> Result<ChatStream> {
+        let body = self.body(&messages, opts);
+        let resp = self.send_stream_request(&body).await?;
 
         let model_name = self.cfg.model_id.clone();
         let mut bytes_stream = resp.bytes_stream();
 
-        // Converse stream events — differ from Anthropic-on-Bedrock!
-        // Frame payload is the JSON event directly (no nested base64 `bytes`
-        // wrapper like invoke-with-response-stream uses). Event-type header:
-        //   messageStart          → {role}
-        //   contentBlockStart     → {start: {toolUse: {toolUseId, name}}, contentBlockIndex}
-        //   contentBlockDelta     → {delta: {text | toolUse.input}, contentBlockIndex}
-        //   contentBlockStop      → {contentBlockIndex}
-        //   messageStop           → {stopReason}
-        //   metadata              → {usage: {inputTokens, outputTokens, totalTokens}}
         let stream = async_stream::try_stream! {
             let mut buf: Vec<u8> = Vec::with_capacity(8 * 1024);
-            let mut agg_text = String::new();
-            // Each contentBlockIndex maps to at most one tool_use accumulator.
-            // We store by index so out-of-order blocks don't clobber each other.
-            let mut tool_calls_by_index: std::collections::BTreeMap<u64, ToolCall> =
-                std::collections::BTreeMap::new();
-            let mut tool_arg_bufs: std::collections::BTreeMap<u64, String> =
-                std::collections::BTreeMap::new();
-            let mut usage = TokenUsage::default();
-            let mut finish = FinishReason::Stop;
+            let mut state = BedrockConverseStreamState::new();
 
             while let Some(chunk) = bytes_stream.next().await {
                 let chunk = chunk.map_err(|e| Error::provider(format!("stream chunk: {e}")))?;
@@ -1032,176 +1060,221 @@ impl ChatModel for BedrockConverseChat {
                                 .get(":event-type")
                                 .cloned()
                                 .unwrap_or_default();
-                            // :message-type header is "event" for payload frames,
-                            // "exception" for error frames. Surface exceptions
-                            // loudly — they typically carry ValidationException
-                            // / ThrottlingException / ModelNotReadyException.
                             let msg_type = frame
                                 .headers
                                 .get(":message-type")
                                 .cloned()
                                 .unwrap_or_default();
-                            if msg_type == "exception" {
-                                let payload = String::from_utf8_lossy(&frame.payload).to_string();
-                                Err(Error::provider(format!(
-                                    "bedrock converse stream {event_type}: {payload}"
-                                )))?;
-                            }
-                            // Parse the JSON payload directly — no nested base64.
-                            let v: Value = serde_json::from_slice(&frame.payload)
-                                .map_err(|e| Error::provider(format!(
-                                    "converse event json ({event_type}): {e}"
-                                )))?;
-                            match event_type.as_str() {
-                                "messageStart" => {
-                                    // {"role": "assistant"} — nothing to do
-                                    // (we always set Assistant on the final msg).
-                                }
-                                "contentBlockStart" => {
-                                    // Start of a new block. If it's a toolUse
-                                    // block, stash id + name at this index.
-                                    let idx = v
-                                        .get("contentBlockIndex")
-                                        .and_then(|n| n.as_u64())
-                                        .unwrap_or(0);
-                                    if let Some(tu) = v.pointer("/start/toolUse") {
-                                        let id = tu
-                                            .get("toolUseId")
-                                            .and_then(|s| s.as_str())
-                                            .unwrap_or("")
-                                            .to_string();
-                                        let name = tu
-                                            .get("name")
-                                            .and_then(|s| s.as_str())
-                                            .unwrap_or("")
-                                            .to_string();
-                                        tool_calls_by_index.insert(idx, ToolCall {
-                                            id: id.clone(),
-                                            name: name.clone(),
-                                            arguments: Value::Null,
-                                        });
-                                        tool_arg_bufs.insert(idx, String::new());
-                                        yield ChatStreamEvent::ToolCallDelta {
-                                            index: idx as u32,
-                                            id: Some(id),
-                                            name: Some(name),
-                                            arguments_delta: None,
-                                        };
-                                    }
-                                }
-                                "contentBlockDelta" => {
-                                    let idx = v
-                                        .get("contentBlockIndex")
-                                        .and_then(|n| n.as_u64())
-                                        .unwrap_or(0);
-                                    if let Some(delta) = v.get("delta") {
-                                        // Text delta.
-                                        if let Some(t) = delta.get("text").and_then(|v| v.as_str()) {
-                                            if !t.is_empty() {
-                                                agg_text.push_str(t);
-                                                yield ChatStreamEvent::Delta { text: t.into() };
-                                            }
-                                        }
-                                        // Tool-use input delta (partial JSON).
-                                        if let Some(tu) = delta.get("toolUse") {
-                                            if let Some(pj) = tu
-                                                .get("input")
-                                                .and_then(|v| v.as_str())
-                                            {
-                                                if let Some(b) = tool_arg_bufs.get_mut(&idx) {
-                                                    b.push_str(pj);
-                                                    yield ChatStreamEvent::ToolCallDelta {
-                                                        index: idx as u32,
-                                                        id: None,
-                                                        name: None,
-                                                        arguments_delta: Some(pj.into()),
-                                                    };
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                "contentBlockStop" => {
-                                    // Finalize an accumulator block. For tool_use,
-                                    // parse the buffered partial-json → Value.
-                                    let idx = v
-                                        .get("contentBlockIndex")
-                                        .and_then(|n| n.as_u64())
-                                        .unwrap_or(0);
-                                    if let Some(buf) = tool_arg_bufs.get(&idx) {
-                                        if let Some(tc) = tool_calls_by_index.get_mut(&idx) {
-                                            tc.arguments = serde_json::from_str(buf)
-                                                .unwrap_or(Value::String(buf.clone()));
-                                        }
-                                    }
-                                }
-                                "messageStop" => {
-                                    if let Some(sr) = v
-                                        .get("stopReason")
-                                        .and_then(|v| v.as_str())
-                                    {
-                                        finish = match sr {
-                                            "end_turn" => FinishReason::Stop,
-                                            "tool_use" => FinishReason::ToolCalls,
-                                            "max_tokens" => FinishReason::Length,
-                                            "content_filtered" => FinishReason::ContentFilter,
-                                            "stop_sequence" => FinishReason::Stop,
-                                            _ => FinishReason::Other,
-                                        };
-                                    }
-                                }
-                                "metadata" => {
-                                    if let Some(u) = v.get("usage") {
-                                        usage.prompt = u
-                                            .get("inputTokens")
-                                            .and_then(|n| n.as_u64())
-                                            .unwrap_or(0) as u32;
-                                        usage.completion = u
-                                            .get("outputTokens")
-                                            .and_then(|n| n.as_u64())
-                                            .unwrap_or(0) as u32;
-                                        usage.total = u
-                                            .get("totalTokens")
-                                            .and_then(|n| n.as_u64())
-                                            .unwrap_or(0) as u32;
-                                    }
-                                }
-                                _ => {
-                                    // Unknown event type — forward-compat silent
-                                    // skip, consistent with how the iter-0
-                                    // Anthropic path handles future event kinds.
-                                }
+                            let v = decode_converse_frame(&event_type, &msg_type, &frame.payload)?;
+                            for ev in state.apply_event(&event_type, &v) {
+                                yield ev;
                             }
                         }
                     }
                 }
             }
 
-            // Assemble final message — tool_calls in stable index order.
-            let tool_calls: Vec<ToolCall> = tool_calls_by_index.into_values().collect();
-            let content = if agg_text.is_empty() {
-                vec![]
-            } else {
-                vec![ContentPart::Text { text: agg_text.clone() }]
-            };
-            yield ChatStreamEvent::Done {
-                response: ChatResponse {
-                    message: Message {
-                        role: Role::Assistant,
-                        content,
-                        tool_calls,
-                        tool_call_id: None,
-                        name: None,
-                        cache: false,
-                    },
-                    finish_reason: finish,
-                    usage,
-                    model: model_name,
-                },
-            };
+            yield state.into_done_event(model_name);
         };
 
         Ok(Box::pin(stream.map_err(|e: Error| e)))
+    }
+}
+
+// :message-type header is "event" for payload frames, "exception" for error
+// frames. Surface exceptions loudly — they typically carry
+// ValidationException / ThrottlingException / ModelNotReadyException.
+fn decode_converse_frame(event_type: &str, msg_type: &str, payload: &[u8]) -> Result<Value> {
+    if msg_type == "exception" {
+        let payload = String::from_utf8_lossy(payload).to_string();
+        return Err(Error::provider(format!(
+            "bedrock converse stream {event_type}: {payload}"
+        )));
+    }
+    // Parse the JSON payload directly — no nested base64.
+    serde_json::from_slice(payload).map_err(|e| Error::provider(format!(
+        "converse event json ({event_type}): {e}"
+    )))
+}
+
+// Converse stream events — differ from Anthropic-on-Bedrock! Frame payload
+// is the JSON event directly (no nested base64 `bytes` wrapper like
+// invoke-with-response-stream uses). Event-type header:
+//   messageStart          → {role}
+//   contentBlockStart     → {start: {toolUse: {toolUseId, name}}, contentBlockIndex}
+//   contentBlockDelta     → {delta: {text | toolUse.input}, contentBlockIndex}
+//   contentBlockStop      → {contentBlockIndex}
+//   messageStop           → {stopReason}
+//   metadata              → {usage: {inputTokens, outputTokens, totalTokens}}
+struct BedrockConverseStreamState {
+    agg_text: String,
+    // Each contentBlockIndex maps to at most one tool_use accumulator. We
+    // store by index so out-of-order blocks don't clobber each other.
+    tool_calls_by_index: std::collections::BTreeMap<u64, ToolCall>,
+    tool_arg_bufs: std::collections::BTreeMap<u64, String>,
+    usage: TokenUsage,
+    finish: FinishReason,
+}
+
+impl BedrockConverseStreamState {
+    fn new() -> Self {
+        Self {
+            agg_text: String::new(),
+            tool_calls_by_index: std::collections::BTreeMap::new(),
+            tool_arg_bufs: std::collections::BTreeMap::new(),
+            usage: TokenUsage::default(),
+            finish: FinishReason::Stop,
+        }
+    }
+
+    fn apply_event(&mut self, event_type: &str, v: &Value) -> Vec<ChatStreamEvent> {
+        let mut events = Vec::new();
+        match event_type {
+            "messageStart" => {
+                // {"role": "assistant"} — nothing to do
+                // (we always set Assistant on the final msg).
+            }
+            "contentBlockStart" => {
+                // Start of a new block. If it's a toolUse
+                // block, stash id + name at this index.
+                let idx = v
+                    .get("contentBlockIndex")
+                    .and_then(|n| n.as_u64())
+                    .unwrap_or(0);
+                if let Some(tu) = v.pointer("/start/toolUse") {
+                    let id = tu
+                        .get("toolUseId")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let name = tu
+                        .get("name")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    self.tool_calls_by_index.insert(idx, ToolCall {
+                        id: id.clone(),
+                        name: name.clone(),
+                        arguments: Value::Null,
+                    });
+                    self.tool_arg_bufs.insert(idx, String::new());
+                    events.push(ChatStreamEvent::ToolCallDelta {
+                        index: idx as u32,
+                        id: Some(id),
+                        name: Some(name),
+                        arguments_delta: None,
+                    });
+                }
+            }
+            "contentBlockDelta" => {
+                let idx = v
+                    .get("contentBlockIndex")
+                    .and_then(|n| n.as_u64())
+                    .unwrap_or(0);
+                if let Some(delta) = v.get("delta") {
+                    // Text delta.
+                    if let Some(t) = delta.get("text").and_then(|v| v.as_str()) {
+                        if !t.is_empty() {
+                            self.agg_text.push_str(t);
+                            events.push(ChatStreamEvent::Delta { text: t.into() });
+                        }
+                    }
+                    // Tool-use input delta (partial JSON).
+                    if let Some(tu) = delta.get("toolUse") {
+                        if let Some(pj) = tu
+                            .get("input")
+                            .and_then(|v| v.as_str())
+                        {
+                            if let Some(b) = self.tool_arg_bufs.get_mut(&idx) {
+                                b.push_str(pj);
+                                events.push(ChatStreamEvent::ToolCallDelta {
+                                    index: idx as u32,
+                                    id: None,
+                                    name: None,
+                                    arguments_delta: Some(pj.into()),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            "contentBlockStop" => {
+                // Finalize an accumulator block. For tool_use,
+                // parse the buffered partial-json → Value.
+                let idx = v
+                    .get("contentBlockIndex")
+                    .and_then(|n| n.as_u64())
+                    .unwrap_or(0);
+                if let Some(buf) = self.tool_arg_bufs.get(&idx) {
+                    if let Some(tc) = self.tool_calls_by_index.get_mut(&idx) {
+                        tc.arguments = serde_json::from_str(buf)
+                            .unwrap_or(Value::String(buf.clone()));
+                    }
+                }
+            }
+            "messageStop" => {
+                if let Some(sr) = v
+                    .get("stopReason")
+                    .and_then(|v| v.as_str())
+                {
+                    self.finish = match sr {
+                        "end_turn" => FinishReason::Stop,
+                        "tool_use" => FinishReason::ToolCalls,
+                        "max_tokens" => FinishReason::Length,
+                        "content_filtered" => FinishReason::ContentFilter,
+                        "stop_sequence" => FinishReason::Stop,
+                        _ => FinishReason::Other,
+                    };
+                }
+            }
+            "metadata" => {
+                if let Some(u) = v.get("usage") {
+                    self.usage.prompt = u
+                        .get("inputTokens")
+                        .and_then(|n| n.as_u64())
+                        .unwrap_or(0) as u32;
+                    self.usage.completion = u
+                        .get("outputTokens")
+                        .and_then(|n| n.as_u64())
+                        .unwrap_or(0) as u32;
+                    self.usage.total = u
+                        .get("totalTokens")
+                        .and_then(|n| n.as_u64())
+                        .unwrap_or(0) as u32;
+                }
+            }
+            _ => {
+                // Unknown event type — forward-compat silent
+                // skip, consistent with how the iter-0
+                // Anthropic path handles future event kinds.
+            }
+        }
+        events
+    }
+
+    fn into_done_event(self, model_name: String) -> ChatStreamEvent {
+        // Assemble final message — tool_calls in stable index order.
+        let tool_calls: Vec<ToolCall> = self.tool_calls_by_index.into_values().collect();
+        let content = if self.agg_text.is_empty() {
+            vec![]
+        } else {
+            vec![ContentPart::Text { text: self.agg_text.clone() }]
+        };
+        ChatStreamEvent::Done {
+            response: ChatResponse {
+                message: Message {
+                    role: Role::Assistant,
+                    content,
+                    tool_calls,
+                    tool_call_id: None,
+                    name: None,
+                    cache: false,
+                },
+                finish_reason: self.finish,
+                usage: self.usage,
+                model: model_name,
+            },
+        }
     }
 }
 

@@ -63,6 +63,26 @@ fn extract_leaf(xml: &str, tag: &str) -> Option<String> {
         .map(|m| m.as_str().to_string())
 }
 
+/// One `<Contents>` block's `key` / `size` / `last_modified` / `etag`.
+struct ContentsMeta {
+    key: String,
+    size: u64,
+    last_modified: String,
+    etag: String,
+}
+
+fn parse_contents_block(block: &str) -> ContentsMeta {
+    let key = extract_leaf(block, "Key").unwrap_or_default();
+    let size: u64 = extract_leaf(block, "Size")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let last_modified = extract_leaf(block, "LastModified").unwrap_or_default();
+    let etag = extract_leaf(block, "ETag")
+        .map(|e| e.trim_matches('"').to_string())
+        .unwrap_or_default();
+    ContentsMeta { key, size, last_modified, etag }
+}
+
 pub struct S3Loader {
     pub credentials: AwsCredentials,
     pub region: String,
@@ -185,6 +205,137 @@ impl S3Loader {
         }
         true
     }
+
+    /// `GET /?list-type=2&...` one page of the bucket listing and return
+    /// the raw XML body.
+    fn fetch_list_page(
+        &self,
+        ctx: &S3RequestContext,
+        continuation: &Option<String>,
+    ) -> LoaderResult<String> {
+        let client = ctx.client;
+        let host = ctx.host;
+        let bucket_path = ctx.bucket_path;
+        let base = ctx.base;
+
+        let mut query_parts = vec![
+            "list-type=2".to_string(),
+            format!("max-keys={}", 1000usize.min(self.max_files.max(1))),
+        ];
+        if let Some(p) = &self.prefix {
+            query_parts.push(format!("prefix={}", url_encode_s3(p)));
+        }
+        if let Some(ct) = continuation {
+            query_parts.push(format!("continuation-token={}", url_encode_s3(ct)));
+        }
+        // S3 requires query params sorted by name for canonical request.
+        query_parts.sort();
+        let query = query_parts.join("&");
+
+        let list_headers = sign_headers(
+            &self.credentials,
+            "GET",
+            host,
+            bucket_path,
+            &query,
+            &[],
+            &self.region,
+        );
+        let list_url = format!("{base}{bucket_path}?{query}");
+        let mut req = client.get(&list_url);
+        for (k, v) in &list_headers {
+            req = req.header(k, v);
+        }
+        let resp = req
+            .send()
+            .map_err(|e| LoaderError::Other(format!("s3 list send: {e}")))?;
+        let status = resp.status();
+        let text = resp
+            .text()
+            .map_err(|e| LoaderError::Other(format!("s3 list read: {e}")))?;
+        if !status.is_success() {
+            return Err(LoaderError::Other(format!(
+                "s3 list {}: {}",
+                status.as_u16(),
+                text
+            )));
+        }
+        Ok(text)
+    }
+
+    /// `GET /{key}` one object and build its `Document`. Returns `Ok(None)`
+    /// for objects we deliberately skip (failed fetch, non-UTF-8 body) so
+    /// the caller can move on to the next key without failing the whole load.
+    fn fetch_object(
+        &self,
+        ctx: &S3RequestContext,
+        meta: &ContentsMeta,
+    ) -> LoaderResult<Option<Document>> {
+        let client = ctx.client;
+        let host = ctx.host;
+        let bucket_path = ctx.bucket_path;
+        let base = ctx.base;
+        let key = meta.key.as_str();
+        let size = meta.size;
+        let last_modified = meta.last_modified.as_str();
+        let etag = meta.etag.as_str();
+
+        let obj_path = format!("{bucket_path}/{}", url_encode_s3_path(key));
+        let obj_headers = sign_headers(
+            &self.credentials,
+            "GET",
+            host,
+            &obj_path,
+            "",
+            &[],
+            &self.region,
+        );
+        let obj_url = format!("{base}{obj_path}");
+        let mut obj_req = client.get(&obj_url);
+        for (k, v) in &obj_headers {
+            obj_req = obj_req.header(k, v);
+        }
+        let obj_resp = obj_req
+            .send()
+            .map_err(|e| LoaderError::Other(format!("s3 get send: {e}")))?;
+        let obj_status = obj_resp.status();
+        let bytes = obj_resp
+            .bytes()
+            .map_err(|e| LoaderError::Other(format!("s3 get read: {e}")))?;
+        if !obj_status.is_success() {
+            // Don't fail the entire load; skip + continue. S3
+            // intermittent 503s are common; log via tracing.
+            tracing::warn!(key = %key, status = %obj_status, "s3 get failed; skipping");
+            return Ok(None);
+        }
+        let content = match std::str::from_utf8(&bytes) {
+            Ok(s) => s.to_string(),
+            Err(_) => {
+                tracing::debug!(key = %key, "s3: non-UTF-8 object, skipping");
+                return Ok(None);
+            }
+        };
+
+        let source = format!("s3://{}/{}", self.bucket, key);
+        let doc = Document::new(content)
+            .with_id(source.clone())
+            .with_metadata("key", json!(key))
+            .with_metadata("size", json!(size))
+            .with_metadata("last_modified", json!(last_modified))
+            .with_metadata("etag", json!(etag))
+            .with_metadata("bucket", json!(self.bucket))
+            .with_metadata("source", json!(source));
+        Ok(Some(doc))
+    }
+}
+
+/// Bundles the values every `fetch_*` call needs so they don't have to be
+/// threaded through as individual arguments.
+struct S3RequestContext<'a> {
+    client: &'a reqwest::blocking::Client,
+    host: &'a str,
+    bucket_path: &'a str,
+    base: &'a str,
 }
 
 impl Loader for S3Loader {
@@ -197,54 +348,19 @@ impl Loader for S3Loader {
         let base = self.base();
         let host = Self::host_from_base(&base);
         let bucket_path = self.path_for_bucket_request(&self.bucket);
+        let ctx = S3RequestContext {
+            client: &client,
+            host: &host,
+            bucket_path: &bucket_path,
+            base: &base,
+        };
 
         let mut docs = Vec::new();
         let mut continuation: Option<String> = None;
 
         'outer: loop {
             // --- LIST OBJECTS V2 ---
-            let mut query_parts = vec![
-                "list-type=2".to_string(),
-                format!("max-keys={}", 1000usize.min(self.max_files.max(1))),
-            ];
-            if let Some(p) = &self.prefix {
-                query_parts.push(format!("prefix={}", url_encode_s3(p)));
-            }
-            if let Some(ct) = &continuation {
-                query_parts.push(format!("continuation-token={}", url_encode_s3(ct)));
-            }
-            // S3 requires query params sorted by name for canonical request.
-            query_parts.sort();
-            let query = query_parts.join("&");
-
-            let list_headers = sign_headers(
-                &self.credentials,
-                "GET",
-                &host,
-                &bucket_path,
-                &query,
-                &[],
-                &self.region,
-            );
-            let list_url = format!("{base}{bucket_path}?{query}");
-            let mut req = client.get(&list_url);
-            for (k, v) in &list_headers {
-                req = req.header(k, v);
-            }
-            let resp = req
-                .send()
-                .map_err(|e| LoaderError::Other(format!("s3 list send: {e}")))?;
-            let status = resp.status();
-            let text = resp
-                .text()
-                .map_err(|e| LoaderError::Other(format!("s3 list read: {e}")))?;
-            if !status.is_success() {
-                return Err(LoaderError::Other(format!(
-                    "s3 list {}: {}",
-                    status.as_u16(),
-                    text
-                )));
-            }
+            let text = self.fetch_list_page(&ctx, &continuation)?;
 
             // --- PARSE XML ---
             for cap in CONTENTS_BLOCK.captures_iter(&text) {
@@ -252,69 +368,19 @@ impl Loader for S3Loader {
                     break 'outer;
                 }
                 let block = cap.get(1).map(|m| m.as_str()).unwrap_or("");
-                let key = extract_leaf(block, "Key").unwrap_or_default();
-                if key.is_empty() {
+                let meta = parse_contents_block(block);
+                if meta.key.is_empty() {
                     continue;
                 }
-                let size: u64 = extract_leaf(block, "Size")
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(0);
-                let last_modified = extract_leaf(block, "LastModified").unwrap_or_default();
-                let etag = extract_leaf(block, "ETag")
-                    .map(|e| e.trim_matches('"').to_string())
-                    .unwrap_or_default();
 
-                if !self.key_passes(&key, size) {
+                if !self.key_passes(&meta.key, meta.size) {
                     continue;
                 }
 
                 // --- GET OBJECT ---
-                let obj_path = format!("{bucket_path}/{}", url_encode_s3_path(&key));
-                let obj_headers = sign_headers(
-                    &self.credentials,
-                    "GET",
-                    &host,
-                    &obj_path,
-                    "",
-                    &[],
-                    &self.region,
-                );
-                let obj_url = format!("{base}{obj_path}");
-                let mut obj_req = client.get(&obj_url);
-                for (k, v) in &obj_headers {
-                    obj_req = obj_req.header(k, v);
+                if let Some(doc) = self.fetch_object(&ctx, &meta)? {
+                    docs.push(doc);
                 }
-                let obj_resp = obj_req
-                    .send()
-                    .map_err(|e| LoaderError::Other(format!("s3 get send: {e}")))?;
-                let obj_status = obj_resp.status();
-                let bytes = obj_resp
-                    .bytes()
-                    .map_err(|e| LoaderError::Other(format!("s3 get read: {e}")))?;
-                if !obj_status.is_success() {
-                    // Don't fail the entire load; skip + continue. S3
-                    // intermittent 503s are common; log via tracing.
-                    tracing::warn!(key = %key, status = %obj_status, "s3 get failed; skipping");
-                    continue;
-                }
-                let content = match std::str::from_utf8(&bytes) {
-                    Ok(s) => s.to_string(),
-                    Err(_) => {
-                        tracing::debug!(key = %key, "s3: non-UTF-8 object, skipping");
-                        continue;
-                    }
-                };
-
-                let source = format!("s3://{}/{}", self.bucket, key);
-                let doc = Document::new(content)
-                    .with_id(source.clone())
-                    .with_metadata("key", json!(key))
-                    .with_metadata("size", json!(size))
-                    .with_metadata("last_modified", json!(last_modified))
-                    .with_metadata("etag", json!(etag))
-                    .with_metadata("bucket", json!(self.bucket))
-                    .with_metadata("source", json!(source));
-                docs.push(doc);
             }
 
             // --- PAGINATE ---

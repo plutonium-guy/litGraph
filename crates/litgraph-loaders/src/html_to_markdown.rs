@@ -148,24 +148,40 @@ fn pre_marker(idx: usize) -> String {
 /// `strip_boilerplate=true` removes `<nav>`, `<header>`, `<footer>`,
 /// `<aside>` blocks (with their content). Mirrors the `HtmlLoader` flag.
 pub fn html_to_markdown(input: &str, strip_boilerplate: bool) -> String {
-    let mut s = input.to_string();
+    let s = input.to_string();
+    let s = remove_non_content_html(s, strip_boilerplate);
+    let (s, pre_blocks) = extract_pre_blocks(s);
+    let s = convert_headings(s);
+    let s = convert_lists(s);
+    let s = convert_inline_formatting(s);
+    let s = convert_links_and_images(s);
+    let s = convert_blockquotes(s);
+    let s = finalize_tags_and_entities(s);
+    let s = normalize_whitespace(s);
+    let s = restore_pre_blocks(s, &pre_blocks);
+    s.trim().to_string()
+}
 
-    // 1) Drop scripts / styles / comments — content + tags both gone.
+// Drop scripts / styles / comments — content + tags both gone. Drop
+// boilerplate sections if requested.
+fn remove_non_content_html(mut s: String, strip_boilerplate: bool) -> String {
     s = SCRIPT_RE.replace_all(&s, "").into_owned();
     s = STYLE_RE.replace_all(&s, "").into_owned();
     s = COMMENT_RE.replace_all(&s, "").into_owned();
 
-    // 2) Drop boilerplate sections if requested.
     if strip_boilerplate {
         s = NAV_RE.replace_all(&s, "").into_owned();
         s = HEADER_RE.replace_all(&s, "").into_owned();
         s = FOOTER_RE.replace_all(&s, "").into_owned();
         s = ASIDE_RE.replace_all(&s, "").into_owned();
     }
+    s
+}
 
-    // 3) Stash <pre> blocks under sentinel markers. The fenced markdown
-    // gets restored AFTER all transform + whitespace passes, so internal
-    // indentation / trailing spaces inside the code block survive intact.
+// Stash <pre> blocks under sentinel markers. The fenced markdown gets
+// restored AFTER all transform + whitespace passes, so internal
+// indentation / trailing spaces inside the code block survive intact.
+fn extract_pre_blocks(mut s: String) -> (String, Vec<String>) {
     let mut pre_blocks: Vec<String> = Vec::new();
     s = PRE_RE
         .replace_all(&s, |caps: &regex::Captures| {
@@ -182,8 +198,11 @@ pub fn html_to_markdown(input: &str, strip_boilerplate: bool) -> String {
             format!("\n\n{}\n\n", pre_marker(idx))
         })
         .into_owned();
+    (s, pre_blocks)
+}
 
-    // 4) Headings — process h1..h6 in order.
+// Headings — process h1..h6 in order.
+fn convert_headings(mut s: String) -> String {
     for level in 1..=6 {
         let prefix = "#".repeat(level);
         s = heading_regex(level)
@@ -194,17 +213,23 @@ pub fn html_to_markdown(input: &str, strip_boilerplate: bool) -> String {
             })
             .into_owned();
     }
+    s
+}
 
-    // 5) Lists — render <ol>/<ul> bodies before any other tag transforms
-    // get to <li>. Numbering for <ol> resets per block.
+// Lists — render <ol>/<ul> bodies before any other tag transforms get to
+// <li>. Numbering for <ol> resets per block.
+fn convert_lists(mut s: String) -> String {
     s = OL_RE
         .replace_all(&s, |caps: &regex::Captures| render_list(caps.get(1).map(|m| m.as_str()).unwrap_or(""), true))
         .into_owned();
     s = UL_RE
         .replace_all(&s, |caps: &regex::Captures| render_list(caps.get(1).map(|m| m.as_str()).unwrap_or(""), false))
         .into_owned();
+    s
+}
 
-    // 6) Inline formatting (innermost-first via lazy regex).
+// Inline formatting (innermost-first via lazy regex).
+fn convert_inline_formatting(mut s: String) -> String {
     s = STRONG_RE
         .replace_all(&s, |caps: &regex::Captures| {
             format!("**{}**", caps.get(1).map(|m| m.as_str()).unwrap_or("").trim())
@@ -220,10 +245,13 @@ pub fn html_to_markdown(input: &str, strip_boilerplate: bool) -> String {
             format!("`{}`", caps.get(1).map(|m| m.as_str()).unwrap_or(""))
         })
         .into_owned();
+    s
+}
 
-    // 7) Links + images. Empty link text falls back to the URL itself
-    // (using `[url](url)` rather than `<url>` autolink — angle-bracket
-    // autolinks would be eaten by the catch-all tag stripper below).
+// Links + images. Empty link text falls back to the URL itself (using
+// `[url](url)` rather than `<url>` autolink — angle-bracket autolinks
+// would be eaten by the catch-all tag stripper below).
+fn convert_links_and_images(mut s: String) -> String {
     s = A_RE
         .replace_all(&s, |caps: &regex::Captures| {
             let href = caps.get(1).map(|m| m.as_str()).unwrap_or("");
@@ -249,8 +277,11 @@ pub fn html_to_markdown(input: &str, strip_boilerplate: bool) -> String {
             format!("![{alt}]({src})")
         })
         .into_owned();
+    s
+}
 
-    // 8) Blockquote — prefix every non-empty line with `> `.
+// Blockquote — prefix every non-empty line with `> `.
+fn convert_blockquotes(mut s: String) -> String {
     s = BLOCKQUOTE_RE
         .replace_all(&s, |caps: &regex::Captures| {
             let inner = caps.get(1).map(|m| m.as_str()).unwrap_or("").trim();
@@ -265,10 +296,17 @@ pub fn html_to_markdown(input: &str, strip_boilerplate: bool) -> String {
             format!("\n\n{prefixed}\n\n")
         })
         .into_owned();
+    s
+}
 
-    // 9) Hr, br, p. Hard break uses `\\\n` (CommonMark backslash form)
-    // rather than the trailing-two-spaces form, because the per-line
-    // `trim_end()` in step 14 would eat the trailing spaces.
+// Hr, br, p. Hard break uses `\\\n` (CommonMark backslash form) rather
+// than the trailing-two-spaces form, because the per-line `trim_end()` in
+// `normalize_whitespace` would eat the trailing spaces. Also drops the
+// (already-extracted-as-metadata) title, strips any remaining unknown
+// tags, then decodes entities (after tag stripping so e.g. `&lt;`
+// doesn't get re-interpreted as a tag start — sentinel markers contain
+// no entities so this is a no-op for them).
+fn finalize_tags_and_entities(mut s: String) -> String {
     s = HR_RE.replace_all(&s, "\n\n---\n\n").into_owned();
     s = BR_RE.replace_all(&s, "\\\n").into_owned();
     s = P_OPEN_RE.replace_all(&s, "\n\n").into_owned();
@@ -276,19 +314,17 @@ pub fn html_to_markdown(input: &str, strip_boilerplate: bool) -> String {
     s = DIV_RE.replace_all(&s, "\n").into_owned();
     s = SPAN_RE.replace_all(&s, "").into_owned();
 
-    // 10) Drop title (already extracted as metadata).
     s = TITLE_RE.replace_all(&s, "").into_owned();
 
-    // 11) Strip any remaining unknown tags.
     s = TAG_RE.replace_all(&s, "").into_owned();
 
-    // 12) Decode entities (after tag stripping so e.g. `&lt;` doesn't get
-    // re-interpreted as a tag start). Sentinel markers contain no
-    // entities so this is a no-op for them.
     s = decode_entities(&s);
+    s
+}
 
-    // 13) Whitespace normalization. Sentinels survive since they contain
-    // no whitespace runs.
+// Whitespace normalization. Sentinels survive since they contain no
+// whitespace runs.
+fn normalize_whitespace(mut s: String) -> String {
     s = MULTI_SPACE_RE.replace_all(&s, " ").into_owned();
     s = s
         .lines()
@@ -296,14 +332,16 @@ pub fn html_to_markdown(input: &str, strip_boilerplate: bool) -> String {
         .collect::<Vec<_>>()
         .join("\n");
     s = MULTI_BLANK_RE.replace_all(&s, "\n\n").into_owned();
+    s
+}
 
-    // 14) Restore <pre> blocks last — fenced code with original
-    // whitespace + trailing-space hard breaks intact.
+// Restore <pre> blocks last — fenced code with original whitespace +
+// trailing-space hard breaks intact.
+fn restore_pre_blocks(mut s: String, pre_blocks: &[String]) -> String {
     for (idx, fenced) in pre_blocks.iter().enumerate() {
         s = s.replace(&pre_marker(idx), fenced);
     }
-
-    s.trim().to_string()
+    s
 }
 
 /// Render a `<ol>` or `<ul>` body to markdown bullets. Strips inline tags
