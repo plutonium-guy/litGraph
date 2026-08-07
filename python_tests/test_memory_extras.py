@@ -6,6 +6,7 @@ from typing import Any, Mapping
 import pytest
 
 from litgraph.memory_extras import NamespacedMemory, NS_KEY
+from litgraph.memory import BufferMemory
 
 
 class _FakeBackend:
@@ -22,6 +23,20 @@ class _FakeBackend:
 
     def add_tool(self, text: str, metadata: Mapping[str, Any] | None = None) -> None:
         self.store.append({"role": "tool", "content": text, "metadata": dict(metadata or {})})
+
+    def messages(self) -> list[dict[str, Any]]:
+        return list(self.store)
+
+    def clear(self) -> None:
+        self.store.clear()
+
+
+class _AppendOnlyBackend:
+    def __init__(self) -> None:
+        self.store: list[dict[str, Any]] = []
+
+    def append(self, message: Mapping[str, Any]) -> None:
+        self.store.append(dict(message))
 
     def messages(self) -> list[dict[str, Any]]:
         return list(self.store)
@@ -112,3 +127,43 @@ def test_namespace_property_returns_value():
     inner = _FakeBackend()
     a = NamespacedMemory(inner, namespace="alice/session_1")
     assert a.namespace == "alice/session_1"
+
+
+def test_append_only_backend_uses_shared_namespace_sidecar():
+    inner = _AppendOnlyBackend()
+    a = NamespacedMemory(inner, namespace="alice")
+    b = NamespacedMemory(inner, namespace="bob")
+    a.add_user("a", {"request_id": "1"})
+    b.add_ai("b")
+
+    assert [m["content"] for m in a.messages()] == ["a"]
+    assert [m["content"] for m in b.messages()] == ["b"]
+    assert a.messages()[0]["metadata"]["request_id"] == "1"
+    assert inner.store == [
+        {"role": "user", "content": "a"},
+        {"role": "assistant", "content": "b"},
+    ]
+
+
+def test_append_only_clear_is_logical_and_keeps_other_namespace():
+    inner = _AppendOnlyBackend()
+    a = NamespacedMemory(inner, namespace="alice")
+    b = NamespacedMemory(inner, namespace="bob")
+    a.add_user("a")
+    b.add_user("b")
+    a.clear()
+
+    assert a.messages() == []
+    assert [m["content"] for m in b.messages()] == ["b"]
+
+
+def test_native_buffer_memory_uses_sidecar_isolation():
+    inner = BufferMemory()
+    a = NamespacedMemory(inner, namespace="native/a")
+    b = NamespacedMemory(inner, namespace="native/b")
+    a.add_user("a", {"request_id": "a1"})
+    b.add_user("b")
+
+    assert [m["content"] for m in a.messages()] == ["a"]
+    assert [m["content"] for m in b.messages()] == ["b"]
+    assert a.messages()[0]["metadata"]["request_id"] == "a1"

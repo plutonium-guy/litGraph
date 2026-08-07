@@ -9,6 +9,7 @@ from . import (
     embeddings_extras as embeddings_extras,
     evaluators as evaluators,
     graph as graph,
+    harness as harness,
     lcel as lcel,
     loaders as loaders,
     loaders_extras as loaders_extras,
@@ -30,12 +31,15 @@ from . import (
     store as store,
     stores_extras as stores_extras,
     streaming as streaming,
+    stream_parts as stream_parts,
     testing as testing,
     tokenizers as tokenizers,
     tool_hooks as tool_hooks,
     tools as tools,
     tracing as tracing,
 )
+from .harness import AgentHarness, AgentRun, create_agent
+from .stream_parts import StreamPart, stream_part
 
 __all__: list[str]
 __version__: str
@@ -84,15 +88,14 @@ class Done:
     type: str = ...
 
 
-StreamPart = _Union[Delta, ToolCallDelta, Done]
+def parse_stream_part(event: dict) -> _Union[Delta, ToolCallDelta, Done]: ...
 
 
-def parse_stream_part(event: dict) -> StreamPart: ...
-
-
-def parse_stream_parts(stream: _Iterable[dict]) -> _Iterator[StreamPart]: ...
+def parse_stream_parts(
+    stream: _Iterable[dict],
+) -> _Iterator[_Union[Delta, ToolCallDelta, Done]]: ...
 
 
 async def aparse_stream_parts(
     stream: _AsyncIterable[dict],
-) -> _AsyncIterator[StreamPart]: ...
+) -> _AsyncIterator[_Union[Delta, ToolCallDelta, Done]]: ...

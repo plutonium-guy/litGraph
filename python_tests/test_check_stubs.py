@@ -7,12 +7,17 @@ runs without a built native module.
 
 import sys
 import textwrap
+from enum import Enum
 from pathlib import Path
 from types import ModuleType
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "tools"))
 
-from check_stubs import collect_runtime_attrs, collect_stub_attrs  # noqa: E402
+from check_stubs import (  # noqa: E402
+    _stub_module_names,
+    collect_runtime_attrs,
+    collect_stub_attrs,
+)
 
 
 # ─── collect_runtime_attrs ─────────────────────────────────────────
@@ -80,6 +85,18 @@ def test_runtime_attrs_skip_dunder():
     assert not any(a.startswith("__") for a in attrs)
 
 
+def test_runtime_attrs_do_not_require_inherited_string_methods():
+    m = ModuleType("fake_native")
+
+    class Part(str, Enum):
+        DELTA = "delta"
+
+    m.Part = Part
+    attrs = collect_runtime_attrs(m)
+    assert "Part.DELTA" in attrs
+    assert "Part.capitalize" not in attrs
+
+
 # ─── collect_stub_attrs ────────────────────────────────────────────
 
 
@@ -116,6 +133,28 @@ def test_stub_attrs_class_methods(tmp_path):
     assert "Foo" in attrs
     assert "Foo.method_a" in attrs
     assert "Foo.method_b" in attrs
+
+
+def test_stub_attrs_class_constants(tmp_path):
+    stub = tmp_path / "mod.pyi"
+    stub.write_text(
+        textwrap.dedent(
+            """
+            class Part:
+                DELTA: Part
+                DONE = "done"
+            """
+        ).strip()
+    )
+    attrs = collect_stub_attrs(tmp_path)
+    assert "Part.DELTA" in attrs
+    assert "Part.DONE" in attrs
+
+
+def test_stub_module_names_skip_appledouble_sidecars(tmp_path):
+    (tmp_path / "agents.pyi").write_text("")
+    (tmp_path / "._agents.pyi").write_text("not a real stub")
+    assert _stub_module_names(tmp_path) == {"agents"}
 
 
 def test_stub_attrs_async_function(tmp_path):

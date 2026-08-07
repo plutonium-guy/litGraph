@@ -74,6 +74,7 @@ least *one* of these to contain a runnable snippet.
 | USAGE.md as the "long-form quickstart" doc | ✅ | — |
 | **`litgraph examples list`** — CLI that prints the example index | ✅ (iter 340) | S |
 | **💡 Examples are tested in CI** (every example file is a pytest case) | 💡 | M |
+| Native `ScriptedChatModel` runs full agents offline without HTTP mocks | ✅ | S |
 
 **Why Claude Code cares:** when the agent calls `help(ReactAgent)`, the
 docstring should be enough to write a working call without consulting
@@ -92,9 +93,9 @@ The agent guesses defaults wrong ~30% of the time. Defaults should be
 | `OpenAIChat()` works with `OPENAI_API_KEY` env | ✅ | — |
 | `model="gpt-5"` default if user doesn't specify | ⏳ (errors instead) | S |
 | `RetryingChatModel(m)` with sane retry policy by default | ✅ | — |
-| `StateGraph()` accepts no args for "I don't care about typed state" | ⏳ | S |
+| `StateGraph()` accepts no args for "I don't care about typed state" | ✅ | — |
 | `ReactAgent(m, tools)` works without `system_prompt` | ✅ | — |
-| **💡 `quickstart()` factory** — pick reasonable model/embeddings/store/tools from env | 💡 | M |
+| `create_agent(model, ...)` — explicit model + planning, VFS, tracing, streaming, eval harness | ✅ | M |
 | **💡 `from_env()` constructors** on every provider | 💡 | S |
 
 **Why Claude Code cares:** when the agent writes `OpenAIChat(model=...)`
@@ -151,7 +152,7 @@ when there's a `--template` flag.
 | Feature | Status | Effort |
 |---|---|---|
 | `litgraph init <template>` scaffolds a minimal repo | ✅ (iter 340) | M |
-| Templates: `chat-agent`, `rag`, `react-agent`, `multi-agent`, `eval-suite`, `serve` | ⏳ (chat-agent shipped iter 340; rest planned) | M |
+| Templates: `chat-agent`, `rag`, `eval-suite` (Pixi-first) | ✅ | M |
 | Scaffolded repo includes: `pyproject.toml`, `.env.example`, `tests/`, `README.md`, AGENTS.md | ✅ (iter 340) | S |
 | Scaffolded repo runs `pytest` green out of the box (with mock provider) | ✅ (iter 340) | M |
 | `litgraph add-tool <name>` generates a stub tool with schema + test | 💡 | M |
@@ -319,8 +320,8 @@ When the agent's code fails in production, the agent's next action is
 |---|---|---|
 | OTel trace export | ✅ | — |
 | **💡 `litgraph replay <trace-id>`** — fetch span + replay agent locally | 💡 | L |
-| **💡 `litgraph trace inspect <id>`** — pretty-print a trace timeline | 💡 | M |
-| **💡 Persistent prompt+response capture** (pluggable callback writing JSONL) | 💡 | S |
+| `litgraph trace <path>` — pretty-print harness JSONL or OTLP JSON | ✅ | — |
+| Persistent run/event capture (harness JSONL + event hook) | ✅ | — |
 | **💡 `litgraph diff-traces a b`** — what changed between two runs | 💡 | M |
 
 **Why Claude Code cares:** prod debug is the worst-context environment

@@ -336,3 +336,96 @@ def main(argv: list[str]) -> int:
             return 1
     sys.stdout.write(render_trace(text))
     return 0
+"""Read harness JSONL or OTLP JSON and render a terminal timeline."""
+
+import json
+from pathlib import Path
+from typing import Any, Iterable, Mapping
+
+
+def load_trace(path: str | Path) -> list[dict[str, Any]]:
+    source = Path(path)
+    try:
+        text = source.read_text(encoding="utf-8")
+    except OSError as error:
+        raise ValueError(f"cannot read trace {source}: {error}") from error
+    if not text.strip():
+        return []
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        payload = []
+        for line_number, line in enumerate(text.splitlines(), 1):
+            if not line.strip():
+                continue
+            try:
+                payload.append(json.loads(line))
+            except json.JSONDecodeError as error:
+                raise ValueError(
+                    f"invalid JSON on line {line_number}: {error.msg}"
+                ) from error
+    return _normalize(payload)
+
+
+def render_timeline(events: Iterable[Mapping[str, Any]]) -> str:
+    rows = sorted((dict(event) for event in events), key=_timestamp_ms)
+    if not rows:
+        return "litgraph trace: no events"
+    origin = _timestamp_ms(rows[0])
+    lines = [f"litgraph trace: {len(rows)} events"]
+    for event in rows:
+        offset = _timestamp_ms(event) - origin
+        kind = str(event.get("type") or event.get("name") or "event")
+        lines.append(f"+{offset:9.3f} ms  {kind:<20} {_summary(event)}".rstrip())
+    return "\n".join(lines)
+
+
+def _normalize(payload: Any) -> list[dict[str, Any]]:
+    if isinstance(payload, list):
+        return [dict(item) for item in payload if isinstance(item, Mapping)]
+    if not isinstance(payload, Mapping):
+        raise ValueError("trace root must be a JSON object, array, or JSONL records")
+    if "resourceSpans" not in payload:
+        return [dict(payload)]
+    events: list[dict[str, Any]] = []
+    for resource in payload.get("resourceSpans", []):
+        for scope in resource.get("scopeSpans", []):
+            for span in scope.get("spans", []):
+                if not isinstance(span, Mapping):
+                    continue
+                start = int(span.get("startTimeUnixNano", 0)) / 1_000_000
+                end = int(span.get("endTimeUnixNano", 0)) / 1_000_000
+                events.append({
+                    "type": "span",
+                    "name": span.get("name", "span"),
+                    "trace_id": span.get("traceId"),
+                    "span_id": span.get("spanId"),
+                    "timestamp_ms": start,
+                    "duration_ms": max(0.0, end - start),
+                    "status": span.get("status", {}),
+                })
+    return events
+
+
+def _timestamp_ms(event: Mapping[str, Any]) -> float:
+    if "timestamp_ms" in event:
+        return float(event["timestamp_ms"])
+    if "timestamp" in event:
+        return float(event["timestamp"]) * 1_000
+    if "startTimeUnixNano" in event:
+        return int(event["startTimeUnixNano"]) / 1_000_000
+    return 0.0
+
+
+def _summary(event: Mapping[str, Any]) -> str:
+    parts = []
+    for key in ("name", "node", "run_id", "trace_id", "error"):
+        value = event.get(key)
+        if value not in (None, ""):
+            parts.append(f"{key}={value}")
+    if "duration_ms" in event:
+        parts.append(f"duration={float(event['duration_ms']):.3f}ms")
+    nested = event.get("event")
+    if isinstance(nested, Mapping) and nested.get("type"):
+        parts.append(f"event={nested['type']}")
+    return " ".join(parts)

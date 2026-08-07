@@ -20,7 +20,8 @@ use crate::graph::json_to_py;
 use crate::providers::{
     PyAnthropicChat, PyBedrockChat, PyBedrockConverseChat, PyCohereChat, PyCostCappedChat,
     PyFallbackChat, PyGeminiChat, PyOpenAIChat, PyOpenAIResponses, PyPiiScrubbingChat,
-    PyPromptCachingChat, PySelfConsistencyChat, PyStructuredChatModel, PyTokenBudgetChat,
+    PyPromptCachingChat, PyScriptedChatModel, PySelfConsistencyChat, PyStructuredChatModel,
+    PyTokenBudgetChat,
 };
 use crate::middleware::{PyMiddlewareChat, PyToolBudgetMiddleware};
 use crate::runtime::{block_on_compat, rt};
@@ -671,7 +672,9 @@ fn extract_tools(tools: &Bound<'_, PyList>) -> PyResult<Vec<Arc<dyn litgraph_cor
 }
 
 pub(crate) fn extract_chat_model(bound: &Bound<'_, PyAny>) -> PyResult<Arc<dyn ChatModel>> {
-    if let Ok(o) = bound.extract::<PyRef<PyOpenAIChat>>() {
+    if let Ok(s) = bound.extract::<PyRef<PyScriptedChatModel>>() {
+        Ok(s.chat_model())
+    } else if let Ok(o) = bound.extract::<PyRef<PyOpenAIChat>>() {
         Ok(o.chat_model())
     } else if let Ok(r) = bound.extract::<PyRef<PyOpenAIResponses>>() {
         Ok(r.chat_model())
@@ -707,7 +710,7 @@ pub(crate) fn extract_chat_model(bound: &Bound<'_, PyAny>) -> PyResult<Arc<dyn C
         Ok(mw.chat_model())
     } else {
         Err(PyValueError::new_err(
-            "model must be OpenAIChat, OpenAIResponses, AnthropicChat, GeminiChat, BedrockChat, CohereChat, StructuredChatModel, FallbackChat, TokenBudgetChat, PiiScrubbingChat, PromptCachingChat, CostCappedChat, SelfConsistencyChat, or MiddlewareChat",
+            "model must be ScriptedChatModel, OpenAIChat, OpenAIResponses, AnthropicChat, GeminiChat, BedrockChat, CohereChat, StructuredChatModel, FallbackChat, TokenBudgetChat, PiiScrubbingChat, PromptCachingChat, CostCappedChat, SelfConsistencyChat, or MiddlewareChat",
         ))
     }
 }

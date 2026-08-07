@@ -178,12 +178,20 @@ let state = agent.invoke("17 + 25?").await?;
 
 ## <a id="stategraph"></a>6. StateGraph
 
-Typed state, deterministic Kahn scheduler, parallel branches via fan-out:
+Typed state, deterministic Kahn scheduler, parallel branches via fan-out.
+Pass a Pydantic model class to validate/coerce state at graph boundaries and
+before every Python node/router call:
 
 ```python
-from litgraph.graph import StateGraph
+from pydantic import BaseModel
+from litgraph.graph import StateGraph, END
 
-g = StateGraph(state_schema=dict)
+class PlanState(BaseModel):
+    plan: list[str] = []
+    hits: list[str] = []
+    summary: str = ""
+
+g = StateGraph(state_schema=PlanState)
 
 def planner(state):
     return {"plan": ["search", "summarise"]}
@@ -192,22 +200,22 @@ def search(state):
     return {"hits": ["a", "b"]}
 
 def summarise(state):
-    return {"summary": ", ".join(state["hits"])}
+    return {"summary": ", ".join(state.hits)}
 
 g.add_node("plan", planner)
 g.add_node("search", search)
 g.add_node("sum", summarise)
 g.add_edge("plan", "search")
 g.add_edge("search", "sum")
-g.set_entry_point("plan")
-g.set_finish_point("sum")
+g.add_edge("sum", END)
+g.set_entry("plan")
 
-result = g.compile().invoke({})
+result = g.compile().invoke({})  # PlanState
 ```
 
-Helpers: `add_conditional_edges`, `add_send` (dynamic fan-out à la
-LangGraph `Send`), `subgraph(...)` (compose into a parent graph),
-`visualize()` (Mermaid / Graphviz).
+Omit `state_schema` (or pass `dict`) for the original zero-coercion dict API.
+Helpers: `add_conditional_edges`, `Send` (dynamic fan-out),
+`add_subgraph(...)`, `to_mermaid()`, and `to_ascii()`.
 
 Parallel branches execute on a tokio JoinSet; CPU-bound nodes can use
 `rayon` directly inside the closure — no GIL contention.

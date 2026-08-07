@@ -1,6 +1,6 @@
 # Missing & Nice-to-have Features
 
-Snapshot: 2026-05-02 (iter 325). For full long-form prioritisation,
+Snapshot: 2026-08-07. For full long-form prioritisation,
 see `ROADMAP.md`. This file is the short, actionable view: each item
 is either *missing* (a real gap) or *nice-to-have* (would help, not
 load-bearing).
@@ -13,26 +13,15 @@ work with `iter N` in the commit log.
 ## Missing — true gaps vs. parity
 
 ### Agent / tool ergonomics
-- `before_tool` / `after_tool` middleware hooks. Today the closest
-  things are `on_request` (HTTP body) and the callback bus. Tool-
-  granularity hooks would let users wrap retries, redaction, and
-  audit logging without touching every tool.
-- Streaming tool execution. Real use-cases are rare (long shell
-  jobs). A `OffloadingTool` + result-poll pattern probably covers it
-  without a `Tool` trait revamp.
-- Tool-call budget caps mirroring `CostCappedChatModel` — limit *N*
-  tool invocations per turn, not just dollars.
+- Streaming tool-result deltas inside a single tool invocation. The shipped
+  `OffloadingTool` + result-poll pattern covers long-running jobs without a
+  `Tool` trait revamp.
 
 ### Graph
 - Pregel-style super-step parallel execution audit. The Kahn
   scheduler already runs independent nodes concurrently; an explicit
   super-step contract (with barrier semantics) would make
   reproducibility and step-by-step debug strictly defined.
-- Branch fan-in deduplication (currently fan-in merges aggregated
-  state by user-supplied reducer; an opt-in dedup-by-key reducer
-  would avoid hand-rolling it).
-- A `parallel_for` shorthand for the common "fan out N copies of the
-  same node" pattern.
 
 ### Local / on-device models
 - Local chat model via `candle` or `mistral.rs`. Cuts the OpenAI
@@ -53,9 +42,6 @@ work with `iter N` in the commit log.
 - Vector-indexed semantic search on the `Store` trait beyond the
   postgres + sqlite implementations (e.g., a Redis-vector backend
   for ops shops already running Redis).
-- Hierarchical / namespaced memory (per-thread, per-org, per-app)
-  with a single store. Today the user composes namespacing via
-  `SearchFilter`; a first-class `Namespace` would tighten this.
 
 ### Eval & reproducibility
 - Eval cache keyed on `(case_hash, model_hash, params_hash)` so re-runs
@@ -74,17 +60,8 @@ work with `iter N` in the commit log.
 ### Python ergonomics
 - `pyo3-stub-gen` auto-generated `.pyi` to replace hand-rolled
   `litgraph-stubs` so they can never drift from PyO3 signatures.
-- Pydantic-coerced state on the Python side: today the user opts in
-  via `coerce_one`/`coerce_stream`; making this implicit on
-  `StateGraph(state_schema=BaseModel)` would match LangGraph
-  ergonomics.
-- `StreamPart` Python type that mirrors the Rust `ChatStreamEvent`
-  enum more closely (today a duck-typed dict).
 
 ### Observability
-- Trace exemplars: link an OTel span to its prompt + completion
-  excerpt without dumping the full body. Helps debug high-cardinality
-  flows.
 - A "turn replay" CLI that takes an OTel trace ID and replays the
   exact prompt against a chosen model — closes the loop on prod
   debug.
@@ -114,10 +91,6 @@ work with `iter N` in the commit log.
   the rest of the pipeline without store noise.
 
 ### CLI / DX
-- `litgraph init <template>` to scaffold a minimal repo (one graph,
-  one provider, one tool, a test).
-- A `litgraph trace` viewer that ingests OTel JSON and renders a
-  graph timeline in the terminal.
 - Studio UI parity for *local* graphs (today the `studio` feature
   flag in `litgraph-serve` covers the cloud API surface only).
 

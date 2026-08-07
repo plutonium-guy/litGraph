@@ -1,6 +1,8 @@
 """Tests for `litgraph examples`, `litgraph show`, and `litgraph init`."""
 from __future__ import annotations
 
+import json
+
 from litgraph._cli import main as cli_main
 
 
@@ -68,6 +70,7 @@ def test_init_command_creates_files(tmp_path, capsys):
     assert "wrote" in out
     # Required files all present.
     assert (target / "pyproject.toml").is_file()
+    assert (target / "pixi.toml").is_file()
     assert (target / "README.md").is_file()
     assert (target / "AGENTS.md").is_file()
     assert (target / ".env.example").is_file()
@@ -109,6 +112,20 @@ def test_init_scaffold_test_file_imports_from_slug(tmp_path):
     cli_main(["init", "chat-agent", str(target)])
     test_src = (target / "tests" / "test_agent.py").read_text()
     assert "from alpha import" in test_src
+
+
+def test_init_scaffold_is_pixi_first(tmp_path, capsys):
+    target = tmp_path / "pixi-agent"
+    cli_main(["init", "chat-agent", str(target)])
+    output = capsys.readouterr().out
+    pixi = (target / "pixi.toml").read_text()
+    package = next(
+        p for p in target.glob("*/__init__.py") if p.parent.name != "tests"
+    ).read_text()
+    assert 'test = "pytest"' in pixi
+    assert 'start = "python -m pixi_agent"' in pixi
+    assert "pixi run test" in output
+    assert "from litgraph.harness import create_agent" in package
 
 
 # ---- new templates ----
@@ -219,3 +236,42 @@ def test_add_node_rejects_bad_name(tmp_path):
     cli_main(["init", "chat-agent", str(target)])
     rc = cli_main(["add-node", "Bad-Name", str(target)])
     assert rc == 2
+
+
+def test_trace_command_renders_harness_jsonl(tmp_path, capsys):
+    trace = tmp_path / "agent.jsonl"
+    trace.write_text(
+        "\n".join([
+            json.dumps({"type": "run_start", "run_id": "r1", "timestamp": 10.0}),
+            json.dumps({"type": "run_end", "run_id": "r1", "timestamp": 10.25}),
+        ])
+    )
+
+    assert cli_main(["trace", str(trace)]) == 0
+    out = capsys.readouterr().out
+    assert "2 events" in out
+    assert "run_start" in out
+    assert "+  250.000 ms" in out
+
+
+def test_trace_command_normalizes_otlp_json(tmp_path, capsys):
+    trace = tmp_path / "otel.json"
+    trace.write_text(json.dumps({"resourceSpans": [{"scopeSpans": [{"spans": [{
+        "name": "agent.invoke",
+        "traceId": "abc",
+        "spanId": "def",
+        "startTimeUnixNano": "1000000000",
+        "endTimeUnixNano": "1250000000",
+    }]}]}]}))
+
+    assert cli_main(["trace", str(trace), "--json"]) == 0
+    rows = json.loads(capsys.readouterr().out)
+    assert rows[0]["name"] == "agent.invoke"
+    assert rows[0]["duration_ms"] == 250.0
+
+
+def test_trace_command_reports_invalid_json(tmp_path, capsys):
+    trace = tmp_path / "broken.jsonl"
+    trace.write_text('{"type":"ok"}\nnot-json\n')
+    assert cli_main(["trace", str(trace)]) == 1
+    assert "line 2" in capsys.readouterr().err

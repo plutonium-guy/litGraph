@@ -1,0 +1,21 @@
+[workspace]
+name = "litgraph-dev"
+channels = ["conda-forge"]
+platforms = ["osx-arm64", "linux-64", "linux-aarch64"]
+
+[dependencies]
+python = ">=3.9,<3.14"
+pip = ">=25,<27"
+maturin = ">=1.13,<2"
+pytest = ">=8,<9"
+rust = ">=1.75,<2"
+
+[pypi-dependencies]
+litgraph = { path = ".", editable = true }
+
+[tasks]
+develop = "maturin develop --release"
+check-rust = "cargo check --workspace"
+test-python = { cmd = "pytest python_tests", depends-on = ["develop"] }
+test-stubs = { cmd = "python tools/check_stubs.py", depends-on = ["develop"] }
+test = { depends-on = ["check-rust", "test-python", "test-stubs"] }

@@ -4,7 +4,7 @@ Templates ship as in-memory string dicts so they work in a wheel
 install (no example files on disk required). Each template:
 
 - Drops the right files into `<dir>` (creates `<dir>` if needed).
-- Includes a `pyproject.toml`, a `.env.example`, a `README.md`, and a
+- Includes a `pyproject.toml`, `pixi.toml`, a `.env.example`, a `README.md`, and a
   runnable hello-world that uses `litgraph.testing` mocks so
   `python <entrypoint>` exits 0 with no API key.
 - Includes a pytest test file that passes out of the box.
@@ -17,8 +17,7 @@ Available templates:
 Usage:
     litgraph init chat-agent ./my-app
     cd my-app
-    pip install -e .
-    pytest
+    pixi run test
 """
 from __future__ import annotations
 
@@ -49,6 +48,27 @@ packages = ["{slug}"]
 """
 
 
+_PIXI = """\
+[workspace]
+name = "{slug}"
+channels = ["conda-forge"]
+platforms = ["osx-arm64", "linux-64", "linux-aarch64"]
+
+[dependencies]
+python = ">=3.9,<3.14"
+pip = ">=25,<27"
+pytest = ">=8,<9"
+
+[pypi-dependencies]
+{slug} = {{ path = ".", editable = true }}
+
+[tasks]
+test = "pytest"
+start = "python -m {slug}"
+check = {{ depends-on = ["test"] }}
+"""
+
+
 _ENV_EXAMPLE = """\
 # Copy to .env and fill in. The hello-world runs without these
 # (uses MockChatModel), but real providers need them.
@@ -65,9 +85,8 @@ Scaffolded by `litgraph init {template}`.
 ## Quickstart
 
 ```bash
-pip install -e .
-pytest                    # tests pass with no API key
-python -m {slug}          # runs the hello-world (mocked)
+pixi run test             # tests pass with no API key
+pixi run start            # runs the hello-world (mocked)
 ```
 
 ## Real provider
@@ -92,9 +111,8 @@ Coding agent: read this first.
 ## Build / test
 
 ```bash
-pip install -e .
-pytest                # all tests must pass
-python -m {slug}      # runs the hello-world
+pixi run test         # all tests must pass
+pixi run start        # runs the hello-world
 ```
 
 ## Where things live
@@ -140,21 +158,21 @@ def add_tool() -> Any:
 
 
 def build_agent(model: Any, **agent_kwargs: Any) -> Any:
-    \"\"\"Wire model + tools + system prompt. Pass any ChatModel.
+    \"\"\"Build a batteries-included harness. Pass any native ChatModel.
 
     Example:
 
         from litgraph.providers import OpenAIChat
         from {slug} import build_agent
 
-        agent = build_agent(OpenAIChat(model="gpt-5"))
-        print(agent.invoke("17 + 25?"))
+        harness = build_agent(OpenAIChat(model="gpt-5"))
+        print(harness.run("17 + 25?").output)
     \"\"\"
-    from litgraph.agents import ReactAgent
-    return ReactAgent(
+    from litgraph.harness import create_agent
+    return create_agent(
         model,
-        [add_tool()],
-        system_prompt=agent_kwargs.pop("system_prompt", "Be terse."),
+        tools=[add_tool()],
+        instructions=agent_kwargs.pop("instructions", "Be terse."),
         **agent_kwargs,
     )
 """
@@ -401,6 +419,7 @@ def test_run_eval_returns_aggregate():
 TEMPLATES: dict[str, dict[str, str]] = {
     "chat-agent": {
         "pyproject.toml": _PYPROJECT,
+        "pixi.toml": _PIXI,
         ".env.example": _ENV_EXAMPLE,
         "README.md": _README,
         "AGENTS.md": _AGENTS_MD,
@@ -411,6 +430,7 @@ TEMPLATES: dict[str, dict[str, str]] = {
     },
     "rag": {
         "pyproject.toml": _PYPROJECT,
+        "pixi.toml": _PIXI,
         ".env.example": _ENV_EXAMPLE,
         "README.md": _README,
         "AGENTS.md": _AGENTS_MD,
@@ -421,6 +441,7 @@ TEMPLATES: dict[str, dict[str, str]] = {
     },
     "eval-suite": {
         "pyproject.toml": _PYPROJECT,
+        "pixi.toml": _PIXI,
         ".env.example": _ENV_EXAMPLE,
         "README.md": _README,
         "AGENTS.md": _AGENTS_MD,
@@ -474,9 +495,8 @@ def _materialise(template_name: str, target_dir: str) -> int:
     print(f"litgraph init: wrote {written} file(s) into {target_dir}/")
     print()
     print(f"  cd {target_dir}")
-    print("  pip install -e '.[dev]'")
-    print("  pytest")
-    print(f"  python -m {slug}")
+    print("  pixi run test")
+    print("  pixi run start")
     return 0
 
 

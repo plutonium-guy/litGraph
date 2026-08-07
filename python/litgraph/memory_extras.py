@@ -27,6 +27,7 @@ The namespace is stamped into the wrapped messages' metadata under
 """
 from __future__ import annotations
 
+from threading import RLock
 from typing import Any, Iterable, Mapping
 
 
@@ -42,14 +43,29 @@ __all__ = [
 NS_KEY = "__litgraph_ns__"
 
 
+_SIDECARS_LOCK = RLock()
+_SIDECARS: dict[int, tuple[Any, dict[str, list[dict[str, Any]]]]] = {}
+
+
+def _sidecar_for(inner: Any) -> dict[str, list[dict[str, Any]]]:
+    key = id(inner)
+    with _SIDECARS_LOCK:
+        found = _SIDECARS.get(key)
+        if found is not None and found[0] is inner:
+            return found[1]
+        state: dict[str, list[dict[str, Any]]] = {}
+        _SIDECARS[key] = (inner, state)
+        return state
+
+
 class NamespacedMemory:
     """Drop-in wrapper that namespaces every read + write against an
     inner memory backend.
 
-    The inner backend must accept a `metadata` argument on `add_user`
-    / `add_ai` (every native litGraph memory class does as of v0.1.x;
-    the wrapper falls back to a plain string write if `metadata` is
-    rejected, with a warning).
+    Metadata-aware backends are filtered directly. Native append-only
+    backends use a shared in-process sidecar so wrappers over the same
+    backend still see isolated namespaces without changing the Rust
+    memory representation.
 
     Reads filter by `metadata[NS_KEY] == namespace`. The pin set by
     `set_system(...)` lives outside the message stream and is namespaced
@@ -66,6 +82,8 @@ class NamespacedMemory:
         self._inner = inner
         self._ns = namespace
         self._system_pin: Mapping[str, Any] | None = None
+        self._sidecar = _sidecar_for(inner)
+        self._uses_sidecar = False
 
     @property
     def namespace(self) -> str:
@@ -94,10 +112,17 @@ class NamespacedMemory:
             self._system_pin = dict(message) if message is not None else None
 
     def clear(self) -> None:
-        """Drop only this namespace's messages from the inner backend.
+        """Drop only this namespace's messages from the wrapper view.
         Pure Python read-then-rewrite for backends without per-key
         delete; backends that natively expose `delete_where(metadata)`
-        could be plugged in later."""
+        could be plugged in later. Append-only native backends keep their
+        lossy physical history while the sidecar forgets this namespace."""
+        if self._uses_sidecar or self._ns in self._sidecar:
+            with _SIDECARS_LOCK:
+                self._sidecar.pop(self._ns, None)
+            self._system_pin = None
+            return
+
         # Read all, keep ones not in this namespace, rewrite.
         all_msgs = self._inner.messages() if hasattr(self._inner, "messages") else []
         if hasattr(self._inner, "clear"):
@@ -121,6 +146,13 @@ class NamespacedMemory:
     # ---- reads ----
 
     def messages(self) -> list[Mapping[str, Any]]:
+        if self._uses_sidecar or self._ns in self._sidecar:
+            with _SIDECARS_LOCK:
+                stored = [dict(m) for m in self._sidecar.get(self._ns, [])]
+            if self._system_pin is not None:
+                return [self._system_pin, *stored]
+            return stored
+
         all_msgs: Iterable[Any] = (
             self._inner.messages() if hasattr(self._inner, "messages") else []
         )
@@ -151,15 +183,40 @@ class NamespacedMemory:
     def _dispatch(self, method: str, text: str, metadata: dict[str, Any]) -> None:
         fn = getattr(self._inner, method, None)
         if fn is None:
-            raise AttributeError(
-                f"inner memory backend does not support {method!r}"
-            )
+            append = getattr(self._inner, "append", None)
+            if append is None:
+                raise AttributeError(
+                    f"inner memory backend does not support {method!r} or 'append'"
+                )
+            role = {
+                "add_user": "user",
+                "add_ai": "assistant",
+                "add_tool": "tool",
+            }[method]
+            append({"role": role, "content": text})
+            self._record_sidecar(role, text, metadata)
+            return
         try:
             fn(text, metadata=metadata)
         except TypeError:
-            # Backend doesn't accept metadata kwarg. Fall back to
-            # plain text — namespace isolation is best-effort here.
             fn(text)
+            role = {
+                "add_user": "user",
+                "add_ai": "assistant",
+                "add_tool": "tool",
+            }[method]
+            self._record_sidecar(role, text, metadata)
+
+    def _record_sidecar(
+        self,
+        role: str,
+        text: str,
+        metadata: dict[str, Any],
+    ) -> None:
+        message = {"role": role, "content": text, "metadata": dict(metadata)}
+        with _SIDECARS_LOCK:
+            self._sidecar.setdefault(self._ns, []).append(message)
+        self._uses_sidecar = True
 
     def __repr__(self) -> str:
         return f"NamespacedMemory(ns={self._ns!r}, inner={type(self._inner).__name__})"

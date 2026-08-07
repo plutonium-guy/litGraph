@@ -76,17 +76,25 @@ impl PySend {
 pub struct PyStateGraph {
     /// Present until `compile()` consumes it.
     inner: Option<StateGraph<Value>>,
+    state_schema: Option<Arc<Py<PyAny>>>,
 }
 
 #[pymethods]
 impl PyStateGraph {
     #[new]
-    #[pyo3(signature = (max_parallel=16, recursion_limit=25))]
-    fn new(max_parallel: usize, recursion_limit: u64) -> Self {
+    #[pyo3(signature = (max_parallel=16, recursion_limit=25, state_schema=None))]
+    fn new(
+        max_parallel: usize,
+        recursion_limit: u64,
+        state_schema: Option<Py<PyAny>>,
+    ) -> Self {
         let g = StateGraph::<Value>::new()
             .with_max_parallel(max_parallel)
             .with_recursion_limit(recursion_limit);
-        Self { inner: Some(g) }
+        Self {
+            inner: Some(g),
+            state_schema: state_schema.map(Arc::new),
+        }
     }
 
     /// Register a node. `func` is any Python callable `dict -> dict` (or None
@@ -107,12 +115,18 @@ impl PyStateGraph {
             .ok_or_else(|| PyRuntimeError::new_err("graph already compiled"))?;
 
         let fn_ref = Arc::new(func);
+        let state_schema = self.state_schema.clone();
         let node_name = name.clone();
         g.add_fallible_node(name, move |state: Value| {
             let fn_ref = fn_ref.clone();
+            let state_schema = state_schema.clone();
             let node_name = node_name.clone();
             Box::pin(async move {
-                let raw = call_py_callable_returning_raw(&fn_ref, state).await;
+                let raw = call_py_callable_returning_raw(
+                    &fn_ref,
+                    state,
+                    state_schema.as_ref(),
+                ).await;
                 match raw {
                     Ok(node_output) => Ok(node_output),
                     Err(e) => Err(litgraph_graph::GraphError::Other(
@@ -152,11 +166,13 @@ impl PyStateGraph {
         let g = self.inner.as_mut()
             .ok_or_else(|| PyRuntimeError::new_err("graph already compiled"))?;
         let r = Arc::new(router);
+        let state_schema = self.state_schema.clone();
         g.add_conditional_edges(from, move |state: &Value| {
             let r = r.clone();
+            let state_schema = state_schema.clone();
             let state = state.clone();
             Python::with_gil(|py| {
-                let py_state = match json_to_py(py, &state) {
+                let py_state = match json_to_state(py, &state, state_schema.as_ref()) {
                     Ok(v) => v,
                     Err(_) => return vec![],
                 };
@@ -202,7 +218,10 @@ impl PyStateGraph {
             .ok_or_else(|| PyRuntimeError::new_err("graph already compiled"))?;
         let compiled = g.compile()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        Ok(PyCompiledGraph { inner: Arc::new(compiled) })
+        Ok(PyCompiledGraph {
+            inner: Arc::new(compiled),
+            state_schema: self.state_schema.take(),
+        })
     }
 
     /// Render the graph as a Mermaid `graph TD` flowchart string. Conditional
@@ -227,6 +246,7 @@ impl PyStateGraph {
 #[pyclass(name = "CompiledGraph", module = "litgraph.graph")]
 pub struct PyCompiledGraph {
     inner: Arc<CompiledGraph<Value>>,
+    state_schema: Option<Arc<Py<PyAny>>>,
 }
 
 #[pymethods]
@@ -236,16 +256,16 @@ impl PyCompiledGraph {
     fn invoke<'py>(
         &self,
         py: Python<'py>,
-        state: Bound<'py, PyDict>,
+        state: Bound<'py, PyAny>,
         thread_id: Option<String>,
-    ) -> PyResult<Bound<'py, PyDict>> {
-        let initial = py_dict_to_json(&state)?;
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let initial = py_to_json(py, &state)?;
         let inner = self.inner.clone();
         let final_state: Value = py.allow_threads(|| {
             block_on_compat(async move { inner.invoke(initial, thread_id).await })
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))
         })?;
-        json_to_py_dict(py, &final_state)
+        json_to_state(py, &final_state, self.state_schema.as_ref())
     }
 
     /// Resume an interrupted graph. `update` is merged into the checkpointed state
@@ -256,7 +276,7 @@ impl PyCompiledGraph {
         py: Python<'py>,
         thread_id: String,
         update: Option<Bound<'py, PyDict>>,
-    ) -> PyResult<Bound<'py, PyDict>> {
+    ) -> PyResult<Bound<'py, PyAny>> {
         let upd = match update {
             Some(d) => py_dict_to_json(&d)?,
             None => Value::Object(Default::default()),
@@ -266,7 +286,7 @@ impl PyCompiledGraph {
             block_on_compat(async move { inner.resume(thread_id, upd).await })
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))
         })?;
-        json_to_py_dict(py, &final_state)
+        json_to_state(py, &final_state, self.state_schema.as_ref())
     }
 
     /// Start streaming graph execution. Returns a `GraphStream` that is both an
@@ -275,10 +295,10 @@ impl PyCompiledGraph {
     #[pyo3(signature = (state, thread_id=None))]
     fn stream<'py>(
         &self,
-        state: Bound<'py, PyDict>,
+        state: Bound<'py, PyAny>,
         thread_id: Option<String>,
     ) -> PyResult<PyGraphStream> {
-        let initial = py_dict_to_json(&state)?;
+        let initial = py_to_json(state.py(), &state)?;
         let inner = self.inner.clone();
         // `CompiledGraph::stream` calls `tokio::spawn` internally, which requires a
         // runtime context. We enter our shared runtime's handle before the call.
@@ -495,6 +515,14 @@ pub(crate) fn py_to_json(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResult<Val
     if let Ok(dict) = obj.downcast::<PyDict>() {
         return py_dict_to_json(dict);
     }
+    if obj.hasattr("model_dump")? {
+        let dumped = obj.call_method0("model_dump")?;
+        return py_to_json(py, &dumped);
+    }
+    if obj.hasattr("dict")? {
+        let dumped = obj.call_method0("dict")?;
+        return py_to_json(py, &dumped);
+    }
     // Fallback: repr as string so we never silently drop content.
     Ok(Value::String(obj.str()?.extract::<String>()?))
 }
@@ -534,9 +562,11 @@ pub(crate) fn json_to_py<'py>(py: Python<'py>, v: &Value) -> PyResult<Bound<'py,
 pub(crate) async fn call_py_callable_returning_raw(
     func: &Arc<Py<PyAny>>,
     state: Value,
+    state_schema: Option<&Arc<Py<PyAny>>>,
 ) -> Result<NodeOutput, String> {
     Python::with_gil(|py| {
-        let py_state = json_to_py(py, &state).map_err(|e| e.to_string())?;
+        let py_state = json_to_state(py, &state, state_schema)
+            .map_err(|e| e.to_string())?;
         let ret = func.call1(py, (py_state,)).map_err(|e| e.to_string())?;
         let mut bound = ret.bind(py).clone();
         if bound.hasattr("__await__").map_err(|e| e.to_string())? {
@@ -628,8 +658,37 @@ pub(crate) async fn call_py_callable_returning_raw(
         // Non-dict, non-None — wrap under "value" key as a state update so
         // weird returns don't crash the graph.
         let v = py_to_json(py, &bound).map_err(|e| e.to_string())?;
+        if v.is_object() {
+            return Ok(NodeOutput::update(v));
+        }
         Ok(NodeOutput::update(serde_json::json!({"value": v})))
     })
+}
+
+fn json_to_state<'py>(
+    py: Python<'py>,
+    value: &Value,
+    state_schema: Option<&Arc<Py<PyAny>>>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let Some(schema) = state_schema else {
+        return Ok(json_to_py_dict(py, value)?.into_any());
+    };
+    let data = json_to_py(py, value)?;
+    let schema = schema.bind(py);
+    let schema_name = schema.getattr("__name__")?.extract::<String>().unwrap_or_default();
+    let schema_module = schema.getattr("__module__")?.extract::<String>().unwrap_or_default();
+    if schema_name == "dict" && schema_module == "builtins" {
+        return Ok(data);
+    }
+    if schema.hasattr("model_validate")? {
+        return schema.call_method1("model_validate", (data,));
+    }
+    if schema.hasattr("parse_obj")? {
+        return schema.call_method1("parse_obj", (data,));
+    }
+    Err(PyValueError::new_err(
+        "state_schema must be dict or a Pydantic model class exposing model_validate or parse_obj",
+    ))
 }
 
 pub(crate) fn json_to_py_dict<'py>(py: Python<'py>, v: &Value) -> PyResult<Bound<'py, PyDict>> {

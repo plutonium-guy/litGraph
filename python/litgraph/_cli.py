@@ -29,8 +29,8 @@ commands:
                      (chat-agent | rag | eval-suite).
   add-tool <name>    Drop a tool stub into the current project.
   add-node <name>    Drop a graph-node stub into the current project.
-  trace <file>       Render an OTel JSON dump as a terminal timeline.
-                     Pass `-` to read from stdin.
+  trace <path>       Render harness JSONL or OTLP JSON as a timeline.
+                     --json emits normalized JSON; --limit N caps rows.
   help               Show this message.
 
 Examples:
@@ -313,6 +313,43 @@ def _cmd_add_node(argv: list[str]) -> int:
     return 0
 
 
+def _cmd_trace(argv: list[str]) -> int:
+    if not argv or argv[0] in ("-h", "--help"):
+        print("usage: litgraph trace <path> [--json] [--limit N]")
+        return 0
+    import json
+    from ._trace import load_trace, render_timeline
+
+    path = argv[0]
+    as_json = "--json" in argv[1:]
+    limit: int | None = None
+    if "--limit" in argv[1:]:
+        index = argv.index("--limit")
+        if index + 1 >= len(argv):
+            print("litgraph trace: --limit requires an integer", file=sys.stderr)
+            return 2
+        try:
+            limit = int(argv[index + 1])
+        except ValueError:
+            print("litgraph trace: --limit requires an integer", file=sys.stderr)
+            return 2
+        if limit < 0:
+            print("litgraph trace: --limit must be non-negative", file=sys.stderr)
+            return 2
+    try:
+        events = load_trace(path)
+    except ValueError as error:
+        print(f"litgraph trace: {error}", file=sys.stderr)
+        return 1
+    if limit is not None:
+        events = events[:limit]
+    if as_json:
+        print(json.dumps(events, indent=2, ensure_ascii=False))
+    else:
+        print(render_timeline(events))
+    return 0
+
+
 def _render_node_stub(name: str) -> str:
     return (
         f'"""Graph node: {name}."""\n'
@@ -333,14 +370,6 @@ def _render_node_test(slug: str, name: str) -> str:
         f"    assert isinstance(out, dict)\n"
         f'    assert out.get("{name}_ran") is True\n'
     )
-
-
-def _cmd_trace(argv: list[str]) -> int:
-    """`litgraph trace <file>` — render an OTel JSON dump as a
-    terminal timeline. Pure-Python; reads SDK stdout exporter format
-    OR OTLP JSON envelope. Stdin via `-`."""
-    from ._trace import main as trace_main
-    return trace_main(argv)
 
 
 _DISPATCH = {

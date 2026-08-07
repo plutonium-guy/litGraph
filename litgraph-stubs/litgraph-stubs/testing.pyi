@@ -1,6 +1,7 @@
 """Pure-Python mocks for unit tests against litGraph public APIs."""
 from __future__ import annotations
 from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
+from .providers import ScriptedChatModel as ScriptedChatModel
 
 
 class MockChatModel:

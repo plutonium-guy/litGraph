@@ -1,29 +1,30 @@
-"""Live integration: `NamespacedMemory` — BLOCKED against native backends.
-
-`NamespacedMemory` requires the inner backend to:
-1. Expose `add_user(text, metadata=...)` / `add_ai(text, metadata=...)`,
-   AND
-2. Preserve the `metadata` dict on messages so reads can filter by
-   `metadata[NS_KEY] == namespace`.
-
-Native litGraph memory classes (`BufferMemory`, `TokenBufferMemory`,
-`SummaryBufferMemory`, …) expose only `append({"role", "content"})`
-and silently DROP the `metadata` field. Result: `NamespacedMemory`
-either raises `AttributeError: ... does not support 'add_user'` or
-the metadata-filter on read returns an empty list.
-
-Use NamespacedMemory with backends that preserve metadata
-(LangChain-compat memories, custom dict stores). Tests can be added
-once a metadata-preserving native backend lands.
-"""
+"""Native-memory integration for `NamespacedMemory`."""
 from __future__ import annotations
 
 import pytest
 
+from litgraph.memory import BufferMemory
+from litgraph.memory_extras import NamespacedMemory
 
 pytestmark = pytest.mark.integration
 
 
-@pytest.mark.skip(reason="NamespacedMemory needs a metadata-preserving inner backend; native litGraph memories drop metadata")
-def test_namespaced_memory_isolates_threads(deepseek_chat):  # pragma: no cover
-    pass
+def test_namespaced_memory_isolates_threads_on_native_backend():
+    shared = BufferMemory()
+    alice = NamespacedMemory(shared, "tenant/alice")
+    bob = NamespacedMemory(shared, "tenant/bob")
+
+    alice.add_user("hello from alice", {"request_id": "a1"})
+    bob.add_user("hello from bob")
+    alice.add_ai("alice reply")
+
+    assert [m["content"] for m in alice.messages()] == [
+        "hello from alice",
+        "alice reply",
+    ]
+    assert [m["content"] for m in bob.messages()] == ["hello from bob"]
+    assert alice.messages()[0]["metadata"]["request_id"] == "a1"
+
+    alice.clear()
+    assert alice.messages() == []
+    assert [m["content"] for m in bob.messages()] == ["hello from bob"]

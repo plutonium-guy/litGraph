@@ -7,6 +7,31 @@ class ChatStream:
     def __iter__(self) -> Iterator[dict[str, Any]]: ...
     def __next__(self) -> dict[str, Any]: ...
 
+class ScriptedChatModel:
+    calls: list[dict[str, Any]]
+    call_count: int
+    remaining: int | None
+    def __init__(
+        self,
+        replies: list[str | dict[str, Any]],
+        cycle: bool = False,
+        model: str = "scripted",
+        stream_chunk_size: int = 1,
+    ) -> None: ...
+    def invoke(
+        self,
+        messages: list[dict[str, Any]],
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+    ) -> dict[str, Any]: ...
+    def stream(
+        self,
+        messages: list[dict[str, Any]],
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+    ) -> ChatStream: ...
+    def reset(self, clear_calls: bool = True) -> None: ...
+
 class OpenAIChat:
     def __init__(
         self,

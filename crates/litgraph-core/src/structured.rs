@@ -41,6 +41,7 @@ pub struct StructuredChatModel {
     /// JSON that doesn't match the schema. False is the OpenAI-compat
     /// default for older models / OSS providers.
     strict: bool,
+    json_object_fallback: bool,
 }
 
 impl StructuredChatModel {
@@ -54,11 +55,17 @@ impl StructuredChatModel {
             schema,
             schema_name: schema_name.into(),
             strict: true,
+            json_object_fallback: true,
         }
     }
 
     pub fn with_strict(mut self, strict: bool) -> Self {
         self.strict = strict;
+        self
+    }
+
+    pub fn with_json_object_fallback(mut self, enabled: bool) -> Self {
+        self.json_object_fallback = enabled;
         self
     }
 
@@ -102,6 +109,34 @@ impl StructuredChatModel {
         }));
         opts
     }
+
+    fn fallback_opts(&self, base: &ChatOptions) -> ChatOptions {
+        let mut opts = base.clone();
+        opts.response_format = Some(json!({"type": "json_object"}));
+        opts
+    }
+
+    fn fallback_messages(&self, mut messages: Vec<Message>) -> Vec<Message> {
+        messages.insert(0, Message::system(format!(
+            "Return only valid JSON matching the `{}` JSON Schema. JSON Schema: {}",
+            self.schema_name, self.schema
+        )));
+        messages
+    }
+
+    fn should_fallback(&self, error: &Error) -> bool {
+        if !self.json_object_fallback {
+            return false;
+        }
+        let message = error.to_string().to_ascii_lowercase();
+        let names_schema_mode = message.contains("json_schema")
+            || message.contains("response_format")
+            || message.contains("response format");
+        let rejects_mode = message.contains("unsupported")
+            || message.contains("not support")
+            || message.contains("invalid");
+        names_schema_mode && rejects_mode
+    }
 }
 
 #[async_trait]
@@ -109,8 +144,16 @@ impl ChatModel for StructuredChatModel {
     fn name(&self) -> &str { self.inner.name() }
 
     async fn invoke(&self, messages: Vec<Message>, opts: &ChatOptions) -> Result<ChatResponse> {
-        let opts = self.injected_opts(opts);
-        let resp = self.inner.invoke(messages, &opts).await?;
+        let schema_opts = self.injected_opts(opts);
+        let resp = match self.inner.invoke(messages.clone(), &schema_opts).await {
+            Ok(resp) => resp,
+            Err(error) if self.should_fallback(&error) => {
+                let fallback_opts = self.fallback_opts(opts);
+                let fallback_messages = self.fallback_messages(messages);
+                self.inner.invoke(fallback_messages, &fallback_opts).await?
+            }
+            Err(error) => return Err(error),
+        };
         // Validate text parses as JSON before returning — fail fast at the
         // wrapper, not in user code that assumed the wrapper already checked.
         let text = resp.message.text_content();
@@ -129,8 +172,16 @@ impl ChatModel for StructuredChatModel {
         // For streaming, we can't validate JSON until Done — so just inject
         // the response_format and pass through. Caller is responsible for
         // collecting + parsing the final assembled text.
-        let opts = self.injected_opts(opts);
-        self.inner.stream(messages, &opts).await
+        let schema_opts = self.injected_opts(opts);
+        match self.inner.stream(messages.clone(), &schema_opts).await {
+            Ok(stream) => Ok(stream),
+            Err(error) if self.should_fallback(&error) => {
+                let fallback_opts = self.fallback_opts(opts);
+                let fallback_messages = self.fallback_messages(messages);
+                self.inner.stream(fallback_messages, &fallback_opts).await
+            }
+            Err(error) => Err(error),
+        }
     }
 }
 
@@ -145,6 +196,36 @@ mod tests {
     struct ScriptedJsonLlm {
         next_text: Mutex<String>,
         last_response_format: Mutex<Option<Value>>,
+    }
+
+    struct SchemaRejectingLlm {
+        calls: Mutex<Vec<(Vec<Message>, Option<Value>)>>,
+        error: Error,
+    }
+    impl SchemaRejectingLlm {
+        fn new(error: Error) -> Self {
+            Self { calls: Mutex::new(vec![]), error }
+        }
+    }
+    #[async_trait]
+    impl ChatModel for SchemaRejectingLlm {
+        fn name(&self) -> &str { "schema-rejecting" }
+        async fn invoke(&self, messages: Vec<Message>, opts: &ChatOptions) -> Result<ChatResponse> {
+            let mut calls = self.calls.lock().unwrap();
+            calls.push((messages, opts.response_format.clone()));
+            if calls.len() == 1 {
+                return Err(Error::other(self.error.to_string()));
+            }
+            Ok(ChatResponse {
+                message: Message::assistant(r#"{"name":"Ada","age":36}"#),
+                finish_reason: FinishReason::Stop,
+                usage: TokenUsage::default(),
+                model: "schema-rejecting".into(),
+            })
+        }
+        async fn stream(&self, _m: Vec<Message>, _o: &ChatOptions) -> Result<ChatStream> {
+            unimplemented!()
+        }
     }
     impl ScriptedJsonLlm {
         fn new(text: &str) -> Self {
@@ -240,6 +321,59 @@ mod tests {
         let _ = m.invoke(vec![Message::user("x")], &ChatOptions::default()).await.unwrap();
         let rf = inner2.last_response_format.lock().unwrap().clone().unwrap();
         assert_eq!(rf["json_schema"]["strict"], false);
+    }
+
+    #[tokio::test]
+    async fn unsupported_json_schema_falls_back_to_json_object() {
+        let inner = Arc::new(SchemaRejectingLlm::new(Error::provider(
+            "response_format json_schema is unsupported",
+        )));
+        let captured = inner.clone();
+        let model = StructuredChatModel::new(inner, person_schema(), "Person");
+
+        let response = model.invoke(
+            vec![Message::user("Return a person")],
+            &ChatOptions::default(),
+        ).await.unwrap();
+
+        assert!(response.message.text_content().contains("Ada"));
+        let calls = captured.calls.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].1.as_ref().unwrap()["type"], "json_schema");
+        assert_eq!(calls[1].1.as_ref().unwrap()["type"], "json_object");
+        assert!(calls[1].0[0].text_content().contains("JSON Schema"));
+        assert!(calls[1].0[0].text_content().contains("Person"));
+    }
+
+    #[tokio::test]
+    async fn unrelated_provider_error_is_not_retried() {
+        let inner = Arc::new(SchemaRejectingLlm::new(Error::provider("network down")));
+        let captured = inner.clone();
+        let model = StructuredChatModel::new(inner, person_schema(), "Person");
+
+        let error = model.invoke(
+            vec![Message::user("Return a person")],
+            &ChatOptions::default(),
+        ).await.unwrap_err();
+
+        assert!(error.to_string().contains("network down"));
+        assert_eq!(captured.calls.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn json_object_fallback_can_be_disabled() {
+        let inner = Arc::new(SchemaRejectingLlm::new(Error::provider(
+            "response_format json_schema is unsupported",
+        )));
+        let captured = inner.clone();
+        let model = StructuredChatModel::new(inner, person_schema(), "Person")
+            .with_json_object_fallback(false);
+
+        assert!(model.invoke(
+            vec![Message::user("Return a person")],
+            &ChatOptions::default(),
+        ).await.is_err());
+        assert_eq!(captured.calls.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]

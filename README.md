@@ -110,15 +110,14 @@ Wheels for PyPI are pending v1. For now: build from source.
 # Prereqs (one-time):
 #   Rust toolchain (stable, ≥ 1.75)  →  https://rustup.rs
 #   Python 3.9+ (CPython or PyPy)
-#   uv  or  pip + venv               (any modern Python installer)
+#   Pixi                              → https://pixi.sh
 
 git clone https://github.com/amiyamandal/litGraph.git
 cd litGraph
 
-# Build the native extension into a project venv:
-uv venv
-uv pip install maturin
-maturin develop --release
+# Create the environment, build the native extension, and run checks:
+pixi run develop
+pixi run test
 
 # Optional: PEP-561 type stubs for IDE autocomplete + Pyright/mypy.
 pip install ./litgraph-stubs
@@ -164,6 +163,59 @@ print(agent.invoke("What is 17 + 25?")["messages"][-1]["content"])
 ```
 
 That's the whole hello-world. Below: each subsystem in 10–20 lines.
+
+For a batteries-included development loop, use the high-level harness. It
+keeps the model explicit, while planning, in-memory scratch storage, streaming,
+JSONL traces, and evaluation are ready to use:
+
+```python
+from litgraph import create_agent
+from litgraph.providers import OpenAIChat
+from litgraph.tools import CalculatorTool
+
+harness = create_agent(
+    OpenAIChat(model="gpt-5"),
+    tools=[CalculatorTool()],
+    instructions="Solve the task and verify your result.",
+    agents_md_path="AGENTS.md",
+    skills_dir="skills",
+    trace_path=".litgraph/traces.jsonl",
+)
+
+print(harness.run("What is 17 + 25?").output)
+for event in harness.stream("Now multiply it by 3"):
+    print(event)
+
+report = harness.evaluate([
+    {"input": "What is 2 + 2?", "expected": "4"},
+])
+print(report["aggregate"]["means"])
+```
+
+Scaffold a Pixi-ready agent project with `litgraph init chat-agent my-agent`,
+then run it with `pixi run test` and `pixi run start`.
+
+Inspect a harness JSONL trace or exported OTLP JSON without a collector UI:
+
+```bash
+litgraph trace .litgraph/traces.jsonl
+litgraph trace otel-export.json --json
+```
+
+Use the native scripted model for deterministic agent-loop tests. It exercises
+the real Rust scheduler, tool dispatch, streaming, and harness without an API
+key or local HTTP mock server:
+
+```python
+from litgraph import create_agent
+from litgraph.testing import ScriptedChatModel
+
+model = ScriptedChatModel(["first answer", "second answer"])
+harness = create_agent(model)
+
+assert harness.run("first prompt").output == "first answer"
+assert model.calls[0]["messages"][-1]["content"] == "first prompt"
+```
 
 ---
 
@@ -274,6 +326,20 @@ print(g.compile().invoke({"items": []}))   # items = [1, 2, 3]
 ```
 
 The three `fetch_*` branches run concurrently on the tokio worker pool — GIL released for the duration. Plain Python asyncio can't get this on a per-node basis without ceremony.
+
+For validated Python state, pass a Pydantic class. Nodes and conditional
+routers receive model instances; `invoke` accepts either a dict or model and
+returns the model:
+
+```python
+from pydantic import BaseModel
+
+class State(BaseModel):
+    count: int
+
+g = StateGraph(state_schema=State)
+g.add_node("increment", lambda state: {"count": state.count + 1})
+```
 
 Helpers: `add_conditional_edges`, `add_send` (LangGraph-style dynamic fan-out), `subgraph(...)` (compose), `visualize()` (Mermaid / Graphviz).
 

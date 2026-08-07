@@ -1,7 +1,10 @@
 # What's left in litGraph — single-pane view
 
-**Snapshot:** 2026-05-07 · post-iter-376 · 132 live integration tests
-passing / 6 cleanly skipped.
+**Snapshot:** 2026-08-07 · implementation audit against the current tree.
+
+Items marked shipped below were verified in code during this pass. The
+remaining provider-key and service-gated rows are validation work, not local
+framework implementation gaps.
 
 This file is the consolidated "what's left" picture as of today. It
 points at the deeper docs rather than duplicating them — read the
@@ -28,16 +31,16 @@ linked sources for prioritisation rationale.
 
 ---
 
-## 1. Live-test blockers (6 skipped tests)
+## 1. Live-test blockers
 
 All against DeepSeek; documented in `INTEGRATION_TESTS.md` → Blocked.
 
 | Skip | Root cause | Unblocks when… |
 |---|---|---|
-| `LlmJudge` (2 cases) | DeepSeek rejects `response_format=json_schema` (returned by `StructuredChatModel.with_strict(true)`). | DeepSeek adds schema mode OR `StructuredChatModel` falls back to `json_object` + post-validate. |
-| `synthesize_eval_cases` (2 cases) | Same root cause as `LlmJudge`. | Same fix unblocks both. |
+| `LlmJudge` (2 cases) | ✅ Code-unblocked: `StructuredChatModel` retries explicit unsupported-schema errors with `json_object`, injects the JSON Schema into the system prompt, and still post-validates JSON. | Run live when `DEEPSEEK_API_KEY` is available. |
+| `synthesize_eval_cases` (2 cases) | ✅ Code-unblocked by the same structured-output fallback. | Run live when `DEEPSEEK_API_KEY` is available. |
 | `BigToolAgent` (1 case) | Requires an embeddings provider to score the tool catalogue; DeepSeek has none. | Provide an OpenAI/Cohere/Voyage/Jina/FastEmbed key + provider. |
-| `NamespacedMemory` (1 case) | Native litGraph memory classes silently DROP the `metadata` field on append; namespace filter on read returns empty. | Add a metadata-preserving native memory backend, OR refactor `NamespacedMemory` to maintain its own per-namespace deque on top of `append`. |
+| `NamespacedMemory` (1 case) | ✅ Unblocked: append-only native memories now use a shared, thread-safe per-namespace sidecar while still writing through to the native backend. | Covered offline against native `BufferMemory`; live external backends remain service-gated. |
 
 ---
 
@@ -100,7 +103,7 @@ Cross-checked against current state.
 | 4 | **Postgres `Store` vector-index wiring** | ✅ |
 | 5 | **Functional API: `@entrypoint` + `@task`** | ✅ shipped (live-tested in `test_functional_api.py`, `test_workflow_*.py`) |
 | 6 | **`pyo3-stub-gen` auto `.pyi`** | ❌ still hand-rolled `litgraph-stubs/` + drift checker |
-| 7 | **Pydantic-coerced state + `StreamPart`** | ✅ shipped iter 378 + 379. iter 378: `StateGraph(state_schema=Pydantic\|dataclass\|TypedDict)` auto-dumps input + auto-coerces invoke/resume output. iter 379: `StreamPart` typed-enum mirror (`Delta` / `ToolCallDelta` / `Done`) via `parse_stream_part(s)` + async variant — frozen dataclasses, `match`-narrowing, zero new deps. |
+| 7 | **Pydantic-coerced state + `StreamPart`** | ✅ shipped iter 378 + 379. `StateGraph(state_schema=Pydantic\|dataclass\|TypedDict)` auto-dumps input and coerces invoke/resume output. Typed dataclass variants and the event-kind enum cover both payload narrowing and stable event names. |
 | 8 | **Local chat model — `candle` / `mistral.rs`** | 🚫 deferred — iter 380 ships `MistralRsChat` adapter + `ModelBackend` trait + `MockModelBackend` scaffold (dormant; `engine` feature off by default → zero workspace build cost). Real `mistralrs::Engine` wiring (~3-4 iters: model loader, tokenizer, sampling loop, KV cache, streaming callback) deferred indefinitely. Users wanting local chat today: run `mistralrs-server` (Docker / native) + point `OpenAIChat(base_url=…)` at it — same path as Ollama. |
 | 9 | **Webhook-resume bridge for interrupts** | ✅ shipped iter 201/202 |
 | 10 | **Pregel-style super-step parallel exec audit** | ✅ partial — iter 377 ships `StateGraph::add_blocking_node` + `add_fallible_blocking_node` (spawn_blocking escape hatch for CPU-bound nodes — local-model forward pass, heavy tokenize, PDF rasterize). Explicit super-step contract (Pregel-style barrier API) still pending. |
@@ -114,21 +117,20 @@ deferred — see row above. Item 10 partially closed iter 377
 ### Tier-2 / Missing-feature gaps (per MISSING_FEATURES.md)
 
 #### Agent / tool ergonomics
-- ❌ **Streaming tool execution** — `OffloadingTool` + result-poll
-  pattern for long-running shell jobs
+- ✅ **Streaming tool execution alternative** — `OffloadingTool` +
+  `OffloadBackend` provide the result-poll pattern for long-running jobs
 - ✅ **Tool-call budget caps** — `ToolBudgetMiddleware` in
-  `litgraph-agents::middleware` (remote iter 348-350) caps calls
-  per agent turn via `before_tool` denial. Composes with
-  `ToolMiddlewareChain` alongside PII scrub, logging, metrics,
-  caching.
+  Rust and PyO3 caps calls per agent turn via `before_tool` denial.
 
 #### Graph
-- ✅ Branch fan-in **dedup-by-key reducer** (iter 382 — `merge_dedup_by_key(current, update, key)`)
-- ✅ **`parallel_for` shorthand** for fan-out-N-copies pattern (iter 381 — `StateGraph::add_parallel_for(name, n, worker)`)
+- ✅ Branch fan-in **dedup-by-key reducers** — explicit
+  `merge_dedup_by_key` and deterministic reducer factory `dedup_by_key`
+- ✅ **Parallel-for shorthands** — fixed-count `add_parallel_for` and
+  state-driven `parallel_for`
 
 #### Memory / store
-- ❌ **NamespacedMemory** that works on native backends (see Live-test
-  blockers above — needs metadata-preserving native memory)
+- ✅ **NamespacedMemory** works with metadata-aware and append-only native
+  backends
 
 #### Eval & reproducibility
 - ❌ **Eval-suite live smoke test** — would call the model
@@ -180,7 +182,8 @@ deferred — see row above. Item 10 partially closed iter 377
 - ✅ `litgraph trace` viewer (OTel JSON → graph timeline in terminal)
   (iter 386) — pure-Python, stdlib-only. Accepts SDK stdout shape
   AND OTLP JSON envelope (`resourceSpans`/`scopeSpans`/`spans`),
-  JSON or JSONL. ANSI-coloured + indented by parent; surfaces
+  harness JSONL, JSON, or JSONL. Supports normalized `--json` output
+  and `--limit`. ANSI-coloured + indented by parent; surfaces
   `prompt_excerpt`, `completion_excerpt`, `model`, `error`. Falls
   back to plain text when stdout isn't a TTY.
 

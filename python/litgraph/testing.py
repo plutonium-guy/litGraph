@@ -1,8 +1,7 @@
 """Mocks for deterministic unit tests against litGraph public APIs.
 
-The framework's own test suite uses a Rust `ScriptedModel`; this module
-exposes Python equivalents so user code can write tests without an
-LLM credential or network.
+`ScriptedChatModel` runs the real Rust agent path without credentials or
+network. The lightweight Python mocks remain useful for pure-Python recipes.
 
 Example:
 
@@ -24,8 +23,14 @@ import hashlib
 import math
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
+try:
+    from .providers import ScriptedChatModel
+except ImportError:  # pragma: no cover - native module is optional in source-only imports
+    ScriptedChatModel = None  # type: ignore[assignment,misc]
+
 
 __all__ = [
+    "ScriptedChatModel",
     "MockChatModel",
     "MockEmbeddings",
     "MockTool",

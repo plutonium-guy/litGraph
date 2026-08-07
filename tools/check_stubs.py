@@ -104,7 +104,7 @@ def collect_runtime_attrs(module: object) -> Set[str]:
             out.add(name)
         elif isinstance(obj, type):
             out.add(name)
-            members: Set[str] = set(dir(obj))
+            members: Set[str] = set(vars(obj))
             if dataclasses.is_dataclass(obj):
                 members |= set(obj.__dataclass_fields__.keys())
             for member in members:
@@ -179,6 +179,14 @@ def _walk_top(node: ast.AST, out: Set[str]) -> None:
             out.add(node.target.id)
 
 
+def _stub_module_names(stub_dir: Path) -> Set[str]:
+    return {
+        p.stem
+        for p in stub_dir.glob("*.pyi")
+        if p.stem != "__init__" and not p.name.startswith("._")
+    }
+
+
 def main() -> int:
     try:
         # The native module is an attribute of the outer Python
@@ -222,7 +230,7 @@ def main() -> int:
                 _walk_top(node, init_names)
         except SyntaxError:
             pass
-    submodule_names = {p.stem for p in STUB_DIR.glob("*.pyi") if p.stem != "__init__"}
+    submodule_names = _stub_module_names(STUB_DIR)
     relevant_stub_side = init_names | submodule_names
 
     missing_in_stubs = sorted(runtime - stubs)

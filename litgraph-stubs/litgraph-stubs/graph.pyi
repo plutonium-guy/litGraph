@@ -1,11 +1,13 @@
-from typing import Any, Callable, Iterator, Type, TypeVar, overload
+from typing import Any, Callable, Generic, Iterator, Type, TypeVar, overload
+
+StateT = TypeVar("StateT")
 
 START: str
 END: str
 
 T = TypeVar("T")
 
-class StateGraph:
+class StateGraph(Generic[StateT]):
     """Schema-aware StateGraph (iter 378).
 
     Passing ``state_schema=`` makes ``invoke`` / ``resume`` accept a
@@ -33,30 +35,30 @@ class StateGraph:
     def add_conditional_edges(
         self,
         from_: str,
-        router: Callable[[dict[str, Any]], str | list[str]],
+        router: Callable[[StateT], str | list[str]],
     ) -> None: ...
     def add_subgraph(self, name: str, sub: "CompiledGraph") -> None: ...
     def interrupt_before(self, node: str) -> None: ...
     def interrupt_after(self, node: str) -> None: ...
     def set_entry(self, node: str) -> None: ...
-    def compile(self) -> "CompiledGraph": ...
+    def compile(self) -> "CompiledGraph[StateT]": ...
     def to_mermaid(self) -> str: ...
     def to_ascii(self) -> str: ...
 
-class CompiledGraph:
+class CompiledGraph(Generic[StateT]):
     def invoke(
         self,
-        state: Any,
+        state: StateT | dict[str, Any],
         thread_id: str | None = None,
-    ) -> Any: ...
+    ) -> StateT: ...
     def resume(
         self,
         thread_id: str,
-        update: Any = None,
-    ) -> Any: ...
+        update: dict[str, Any] | None = None,
+    ) -> StateT: ...
     def stream(
         self,
-        state: Any,
+        state: StateT | dict[str, Any],
         thread_id: str | None = None,
     ) -> "GraphStream": ...
     def state_history(self, thread_id: str) -> list[dict[str, Any]]: ...

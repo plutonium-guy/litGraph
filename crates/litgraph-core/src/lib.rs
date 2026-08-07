@@ -60,6 +60,7 @@ pub mod priority_queue;
 pub mod metrics;
 pub mod tool_dispatch;
 pub mod table_parser;
+pub mod scripted;
 
 pub use error::{Error, Result};
 pub use structured::StructuredChatModel;
@@ -151,6 +152,7 @@ pub use table_parser::{
     format_instructions as table_format_instructions, parse_table_csv, parse_table_json,
     parse_table_value, Table, TableQuery,
 };
+pub use scripted::{ScriptedCall, ScriptedChatModel, ScriptedReply};
 pub use eval_harness::{
     run_eval, AggregateScores, ContainsAllScorer, EvalCase, EvalCaseResult, EvalDataset,
     EvalReport, ExactMatchScorer, JaccardScorer, LevenshteinScorer, LlmJudgeScorer, RegexScorer,

@@ -13,7 +13,10 @@ use litgraph_resilience::{
     SelfConsistencyChatModel, TokenBudgetChatModel,
 };
 use litgraph_core::model::ChatStreamEvent;
-use litgraph_core::{ChatModel, ChatOptions, Message, PiiScrubber, Role};
+use litgraph_core::{
+    ChatModel, ChatOptions, ChatResponse, FinishReason, Message, PiiScrubber, Role,
+    ScriptedChatModel, ScriptedReply, TokenUsage, ToolCall,
+};
 use litgraph_observability::{CallbackBus, InstrumentedChatModel};
 use litgraph_providers_anthropic::{AnthropicChat, AnthropicConfig};
 use litgraph_providers_bedrock::{AwsCredentials, BedrockChat, BedrockConfig, BedrockConverseChat};
@@ -30,6 +33,7 @@ use crate::observability::PyCostTracker;
 use crate::runtime::{block_on_compat, rt};
 
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_class::<PyScriptedChatModel>()?;
     m.add_class::<PyOpenAIChat>()?;
     m.add_class::<PyOpenAIResponses>()?;
     m.add_class::<PyAnthropicChat>()?;
@@ -56,6 +60,272 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(xai_chat, m)?)?;
     m.add_function(wrap_pyfunction!(fireworks_chat, m)?)?;
     Ok(())
+}
+
+#[pyclass(name = "ScriptedChatModel", module = "litgraph.providers")]
+pub struct PyScriptedChatModel {
+    inner: Arc<ScriptedChatModel>,
+}
+
+#[pymethods]
+impl PyScriptedChatModel {
+    #[new]
+    #[pyo3(signature = (replies, cycle=false, model="scripted", stream_chunk_size=1))]
+    fn new(
+        replies: Bound<'_, PyList>,
+        cycle: bool,
+        model: &str,
+        stream_chunk_size: usize,
+    ) -> PyResult<Self> {
+        let parsed = parse_scripted_replies(&replies, model)?;
+        let inner = ScriptedChatModel::new(parsed)
+            .and_then(|model_impl| {
+                model_impl
+                    .with_name(model)
+                    .with_cycle(cycle)
+                    .with_stream_chunk_size(stream_chunk_size)
+            })
+            .map_err(|error| PyValueError::new_err(error.to_string()))?;
+        Ok(Self { inner: Arc::new(inner) })
+    }
+
+    #[pyo3(signature = (messages, temperature=None, max_tokens=None))]
+    fn invoke<'py>(
+        &self,
+        py: Python<'py>,
+        messages: Bound<'py, PyList>,
+        temperature: Option<f32>,
+        max_tokens: Option<u32>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let messages = parse_messages(&messages)?;
+        let options = ChatOptions { temperature, max_tokens, ..Default::default() };
+        let response = self.inner
+            .invoke_sync(messages, &options)
+            .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+        scripted_response_to_py_dict(py, &response)
+    }
+
+    #[pyo3(signature = (messages, temperature=None, max_tokens=None))]
+    fn stream<'py>(
+        &self,
+        _py: Python<'py>,
+        messages: Bound<'py, PyList>,
+        temperature: Option<f32>,
+        max_tokens: Option<u32>,
+    ) -> PyResult<PyChatStream> {
+        let messages = parse_messages(&messages)?;
+        let options = ChatOptions { temperature, max_tokens, ..Default::default() };
+        Ok(PyChatStream {
+            rx: Arc::new(Mutex::new(Some(spawn_stream(
+                self.chat_model(),
+                messages,
+                options,
+            )))),
+        })
+    }
+
+    #[getter]
+    fn calls<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        let calls = PyList::empty_bound(py);
+        for call in self.inner.calls() {
+            let item = PyDict::new_bound(py);
+            item.set_item("sequence", call.sequence)?;
+            item.set_item("messages", scripted_messages_to_py_list(py, &call.messages)?)?;
+            let options = PyDict::new_bound(py);
+            options.set_item("temperature", call.options.temperature)?;
+            options.set_item("max_tokens", call.options.max_tokens)?;
+            item.set_item("options", options)?;
+            calls.append(item)?;
+        }
+        Ok(calls)
+    }
+
+    #[getter]
+    fn call_count(&self) -> usize {
+        self.inner.call_count()
+    }
+
+    #[getter]
+    fn remaining(&self) -> Option<usize> {
+        self.inner.remaining()
+    }
+
+    #[pyo3(signature = (clear_calls=true))]
+    fn reset(&self, clear_calls: bool) {
+        self.inner.reset(clear_calls);
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "ScriptedChatModel(calls={}, remaining={:?})",
+            self.inner.call_count(),
+            self.inner.remaining()
+        )
+    }
+}
+
+impl PyScriptedChatModel {
+    pub(crate) fn chat_model(&self) -> Arc<dyn ChatModel> {
+        self.inner.clone()
+    }
+}
+
+fn parse_scripted_replies(
+    replies: &Bound<'_, PyList>,
+    model: &str,
+) -> PyResult<Vec<ScriptedReply>> {
+    let mut parsed = Vec::with_capacity(replies.len());
+    for (reply_index, item) in replies.iter().enumerate() {
+        if let Ok(text) = item.extract::<String>() {
+            parsed.push(ScriptedReply::Response(ChatResponse {
+                message: Message::assistant(text),
+                finish_reason: FinishReason::Stop,
+                usage: TokenUsage::default(),
+                model: model.into(),
+            }));
+            continue;
+        }
+        let reply: Bound<PyDict> = item
+            .downcast_into()
+            .map_err(|_| PyValueError::new_err("each scripted reply must be a string or dict"))?;
+        if let Some(error) = reply.get_item("error")? {
+            parsed.push(ScriptedReply::error(error.extract::<String>()?));
+            continue;
+        }
+        let content = reply
+            .get_item("content")?
+            .or(reply.get_item("text")?)
+            .map(|value| value.extract::<String>())
+            .transpose()?
+            .unwrap_or_default();
+        let mut tool_calls = Vec::new();
+        if let Some(raw_calls) = reply.get_item("tool_calls")? {
+            let raw_calls: Bound<PyList> = raw_calls
+                .downcast_into()
+                .map_err(|_| PyValueError::new_err("tool_calls must be a list"))?;
+            for (call_index, raw_call) in raw_calls.iter().enumerate() {
+                let call: Bound<PyDict> = raw_call
+                    .downcast_into()
+                    .map_err(|_| PyValueError::new_err("each tool call must be a dict"))?;
+                let name: String = call
+                    .get_item("name")?
+                    .ok_or_else(|| PyValueError::new_err("tool call missing 'name'"))?
+                    .extract()?;
+                let id = call
+                    .get_item("id")?
+                    .map(|value| value.extract::<String>())
+                    .transpose()?
+                    .unwrap_or_else(|| format!("scripted-{reply_index}-{call_index}"));
+                let arguments = call
+                    .get_item("arguments")?
+                    .or(call.get_item("args")?)
+                    .map(|value| crate::graph::py_to_json(call.py(), &value))
+                    .transpose()?
+                    .unwrap_or_else(|| serde_json::json!({}));
+                tool_calls.push(ToolCall { id, name, arguments });
+            }
+        }
+        let finish_reason = match reply
+            .get_item("finish_reason")?
+            .map(|value| value.extract::<String>())
+            .transpose()?
+            .as_deref()
+        {
+            None if !tool_calls.is_empty() => FinishReason::ToolCalls,
+            None | Some("stop") => FinishReason::Stop,
+            Some("length") => FinishReason::Length,
+            Some("tool_calls") => FinishReason::ToolCalls,
+            Some("content_filter") => FinishReason::ContentFilter,
+            Some(_) => FinishReason::Other,
+        };
+        let usage = match reply.get_item("usage")? {
+            Some(raw_usage) => {
+                let usage: Bound<PyDict> = raw_usage
+                    .downcast_into()
+                    .map_err(|_| PyValueError::new_err("usage must be a dict"))?;
+                let prompt = dict_u32(&usage, "prompt")?;
+                let completion = dict_u32(&usage, "completion")?;
+                TokenUsage {
+                    prompt,
+                    completion,
+                    total: usage
+                        .get_item("total")?
+                        .map(|value| value.extract::<u32>())
+                        .transpose()?
+                        .unwrap_or(prompt + completion),
+                    cache_creation: dict_u32(&usage, "cache_creation")?,
+                    cache_read: dict_u32(&usage, "cache_read")?,
+                }
+            }
+            None => TokenUsage::default(),
+        };
+        let mut message = Message::assistant(content);
+        message.tool_calls = tool_calls;
+        parsed.push(ScriptedReply::Response(ChatResponse {
+            message,
+            finish_reason,
+            usage,
+            model: model.into(),
+        }));
+    }
+    Ok(parsed)
+}
+
+fn dict_u32(dict: &Bound<'_, PyDict>, key: &str) -> PyResult<u32> {
+    dict.get_item(key)?
+        .map(|value| value.extract::<u32>())
+        .transpose()
+        .map(|value| value.unwrap_or(0))
+}
+
+fn scripted_response_to_py_dict<'py>(
+    py: Python<'py>,
+    response: &ChatResponse,
+) -> PyResult<Bound<'py, PyDict>> {
+    let output = response_to_py_dict(py, response)?;
+    let calls = PyList::empty_bound(py);
+    for call in &response.message.tool_calls {
+        let item = PyDict::new_bound(py);
+        item.set_item("id", &call.id)?;
+        item.set_item("name", &call.name)?;
+        item.set_item("arguments", crate::graph::json_to_py(py, &call.arguments)?)?;
+        calls.append(item)?;
+    }
+    output.set_item("tool_calls", calls)?;
+    Ok(output)
+}
+
+fn scripted_messages_to_py_list<'py>(
+    py: Python<'py>,
+    messages: &[Message],
+) -> PyResult<Bound<'py, PyList>> {
+    let output = PyList::empty_bound(py);
+    for message in messages {
+        let item = PyDict::new_bound(py);
+        item.set_item("role", match message.role {
+            Role::System => "system",
+            Role::User => "user",
+            Role::Assistant => "assistant",
+            Role::Tool => "tool",
+        })?;
+        item.set_item("content", message.text_content())?;
+        if let Some(tool_call_id) = &message.tool_call_id {
+            item.set_item("tool_call_id", tool_call_id)?;
+        }
+        if !message.tool_calls.is_empty() {
+            let calls = PyList::empty_bound(py);
+            for call in &message.tool_calls {
+                let raw_call = PyDict::new_bound(py);
+                raw_call.set_item("id", &call.id)?;
+                raw_call.set_item("name", &call.name)?;
+                raw_call.set_item("arguments", crate::graph::json_to_py(py, &call.arguments)?)?;
+                calls.append(raw_call)?;
+            }
+            item.set_item("tool_calls", calls)?;
+        }
+        output.append(item)?;
+    }
+    Ok(output)
 }
 
 #[pyclass(name = "CohereChat", module = "litgraph.providers")]

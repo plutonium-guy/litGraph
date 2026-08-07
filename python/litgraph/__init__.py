@@ -47,12 +47,14 @@ from ._state_graph import StateGraph, CompiledGraph  # noqa: E402,F811
 from ._stream_part import (  # noqa: E402
     Delta,
     Done,
-    StreamPart,
     ToolCallDelta,
     aparse_stream_parts,
     parse_stream_part,
     parse_stream_parts,
 )
+from .harness import AgentHarness, AgentRun, create_agent  # noqa: E402
+from .stream_parts import StreamPart, stream_part  # noqa: E402
+from . import stream_parts  # noqa: E402,F401
 from . import recipes  # noqa: E402,F401
 from . import testing  # noqa: E402,F401
 from . import tool_hooks  # noqa: E402,F401
@@ -87,10 +89,17 @@ __all__.extend([
     "aparse_stream_parts",
     "parse_stream_part",
     "parse_stream_parts",
+    "AgentHarness",
+    "AgentRun",
+    "create_agent",
+    "StreamPart",
+    "stream_part",
+    "harness",
     "recipes",
     "testing",
     "tool_hooks",
     "streaming",
+    "stream_parts",
     "prompt_hub",
     "embeddings_extras",
     "providers_extras",
