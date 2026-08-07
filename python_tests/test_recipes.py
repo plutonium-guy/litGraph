@@ -70,15 +70,13 @@ def test_recipes_serve_rejects_non_graph_input():
         recipes.serve("not a graph")
 
 
-def test_recipes_serve_renders_command_for_compileable():
+def test_recipes_serve_defers_graph_shaped_inputs():
     class _Stub:
         def compile(self):
             return self
 
-    cmd = recipes.serve(_Stub(), port=9000, host="127.0.0.1")
-    assert "litgraph-serve" in cmd
-    assert "9000" in cmd
-    assert "127.0.0.1" in cmd
+    with pytest.raises(NotImplementedError, match="Graph-shaped serving"):
+        recipes.serve(_Stub(), port=9000, host="127.0.0.1")
 
 
 # ---- recipes.rag ----
