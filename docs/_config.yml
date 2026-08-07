@@ -1,0 +1,12 @@
+title: litGraph
+description: Build production agentic systems with a Rust core and a Python-first harness.
+url: https://plutonium-guy.github.io
+baseurl: /litGraph
+repository: plutonium-guy/litGraph
+github_url: https://github.com/plutonium-guy/litGraph
+theme: null
+markdown: kramdown
+highlighter: rouge
+permalink: pretty
+exclude:
+  - README.md

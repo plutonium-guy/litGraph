@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#07110f">
+    <meta name="description" content="{{ page.description | default: site.description | escape }}">
+    <title>{% if page.title %}{{ page.title }} · {% endif %}{{ site.title }}</title>
+    <link rel="icon" href="{{ site.baseurl }}/assets/img/mark.svg" type="image/svg+xml">
+    <link rel="stylesheet" href="{{ site.baseurl }}/assets/css/style.css">
+  </head>
+  <body>
+    <a class="skip-link" href="#content">Skip to content</a>
+    <div class="site-shell">
+      <aside class="sidebar" id="sidebar">
+        <a class="brand" href="{{ site.baseurl }}/">
+          <img src="{{ site.baseurl }}/assets/img/mark.svg" alt="" width="34" height="34">
+          <span><strong>litGraph</strong><small>Agent framework</small></span>
+        </a>
+
+        <label class="search" for="docs-search">
+          <span aria-hidden="true">⌕</span>
+          <input id="docs-search" type="search" placeholder="Filter documentation" autocomplete="off">
+          <kbd>/</kbd>
+        </label>
+
+        <nav class="docs-nav" aria-label="Documentation">
+          <p>Start here</p>
+          <a href="{{ site.baseurl }}/" data-nav>Overview</a>
+          <a href="{{ site.baseurl }}/getting-started/" data-nav>Getting started</a>
+          <a href="{{ site.baseurl }}/agent-harness/" data-nav>Agent harness</a>
+
+          <p>Build</p>
+          <a href="{{ site.baseurl }}/graphs/" data-nav>Graphs & workflows</a>
+          <a href="{{ site.baseurl }}/models-tools/" data-nav>Models & tools</a>
+          <a href="{{ site.baseurl }}/retrieval-memory/" data-nav>Retrieval & memory</a>
+
+          <p>Operate</p>
+          <a href="{{ site.baseurl }}/observability-evaluation/" data-nav>Observe & evaluate</a>
+          <a href="{{ site.baseurl }}/deployment/" data-nav>Serve & deploy</a>
+          <a href="{{ site.baseurl }}/troubleshooting/" data-nav>Troubleshooting</a>
+
+          <p>Understand</p>
+          <a href="{{ site.baseurl }}/architecture/" data-nav>Architecture</a>
+          <a href="{{ site.baseurl }}/python-rust/" data-nav>Python ↔ Rust</a>
+          <a href="{{ site.baseurl }}/reference/" data-nav>Reference map</a>
+        </nav>
+
+        <div class="sidebar-footer">
+          <a href="{{ site.github_url }}">GitHub ↗</a>
+          <a href="https://pypi.org/project/litgraph/">PyPI ↗</a>
+        </div>
+      </aside>
+
+      <div class="page">
+        <header class="topbar">
+          <button class="menu-button" id="menu-button" type="button" aria-controls="sidebar" aria-expanded="false">Menu</button>
+          <span class="topbar-title">{{ page.title | default: "Documentation" }}</span>
+          <a class="github-button" href="{{ site.github_url }}">View on GitHub</a>
+        </header>
+
+        <main id="content" class="content">
+          <article class="doc">
+            {% if page.eyebrow %}<p class="eyebrow">{{ page.eyebrow }}</p>{% endif %}
+            {{ content }}
+          </article>
+          <footer class="page-footer">
+            <span>Apache-2.0 · Rust 1.75+ · Python 3.9+</span>
+            <a href="{{ site.github_url }}/edit/main/docs/{{ page.path }}">Edit this page ↗</a>
+          </footer>
+        </main>
+      </div>
+    </div>
+    <div class="scrim" id="scrim" hidden></div>
+    <script src="{{ site.baseurl }}/assets/js/site.js"></script>
+  </body>
+</html>

@@ -11,6 +11,8 @@ Hot paths (HTTP, SSE parsing, tokenization, vector math, graph scheduling, JSON 
 [![tests](https://img.shields.io/badge/rust%20tests-2536%20passing-brightgreen)](#)
 [![tests](https://img.shields.io/badge/python%20tests-1222%20passing-brightgreen)](#)
 
+**[Read the documentation →](https://plutonium-guy.github.io/litGraph/)**
+
 | Doc | What it answers |
 |-----|-----------------|
 | [USAGE.md](USAGE.md) | how to use every subsystem |
