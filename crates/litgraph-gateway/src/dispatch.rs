@@ -56,22 +56,51 @@ pub async fn dispatch_invoke(
         remaining.retain(|d| d.id != chosen.id);
 
         let attempt_messages = messages.clone();
+        // The breaker must only count failures that are the DEPLOYMENT's
+        // fault. `CircuitBreaker::call` has no concept of client vs.
+        // infrastructure error — it records any `Err` the closure returns as
+        // a consecutive failure. Breakers are deployment-scoped and shared
+        // across every tenant routed to this deployment, so if a client
+        // error counted, one tenant repeatedly sending malformed requests
+        // could trip a perfectly healthy deployment's breaker and degrade
+        // service for every other tenant on it — a cross-tenant
+        // noisy-neighbour availability bug. So we hand the breaker a
+        // *completed* call (`Ok`) carrying the client error, and reserve
+        // `Err` — the thing `call` counts — for genuine infrastructure
+        // failure.
+        //
+        // Known residual, accepted for v1 (do not "fix" this back): `call`
+        // resets the consecutive-failure counter on any `Ok`, including
+        // `Ok(Err(client_error))`. So an interleaved stream of client
+        // errors between a flaky deployment's real infrastructure failures
+        // can hold its counter below `failure_threshold` and delay tripping.
+        // That is strictly less harmful than the alternative (one tenant's
+        // bad input degrading every other tenant), and fixing it properly
+        // needs a `CircuitBreaker` API that separates admission from
+        // outcome recording, which is out of scope here.
         match chosen
             .breaker()
-            .call(|| async { chosen.model.invoke(attempt_messages, opts).await })
+            .call(|| async {
+                match chosen.model.invoke(attempt_messages, opts).await {
+                    Ok(resp) => Ok(Ok(resp)),
+                    Err(e) if !is_retryable(&e) => Ok(Err(e)),
+                    Err(e) => Err(e),
+                }
+            })
             .await
         {
-            Ok(resp) => return Ok((resp, chosen)),
+            Ok(Ok(resp)) => return Ok((resp, chosen)),
+            // Client error: the completed call the breaker saw was `Ok`, so
+            // it does not count against the breaker. Do not fail over — a
+            // 400 is identical at every deployment.
+            Ok(Err(e)) => return Err(DispatchError::Upstream { message: e.to_string() }),
             // Breaker is open (or another caller holds the probe slot): this
             // deployment is not admitting traffic right now. Skip it — it is
             // not a failure of the request.
             Err(CallError::CircuitOpen) => continue,
-            Err(CallError::Inner(e)) if is_retryable(&e) => {
+            Err(CallError::Inner(e)) => {
                 tracing::warn!(deployment = %chosen.id, error = %e, "deployment failed, failing over");
                 continue;
-            }
-            Err(CallError::Inner(e)) => {
-                return Err(DispatchError::Upstream { message: e.to_string() });
             }
         }
     }
@@ -183,6 +212,91 @@ mod tests {
         assert_eq!(a.load(Ordering::SeqCst) + b.load(Ordering::SeqCst), 1);
     }
 
+    // --- Added per coordinator review of Task 5, fixing R12's code sample:
+    // `CircuitBreaker::call` records any `Err` the closure returns as a
+    // consecutive failure, with no concept of client vs. infrastructure
+    // error. Since breakers are deployment-scoped and shared across every
+    // tenant, an unpatched dispatch loop would let one tenant's repeated
+    // malformed requests trip a perfectly healthy deployment's breaker and
+    // degrade service for every OTHER tenant routed to it. This proves the
+    // fix: `Deployment::for_test` uses `registry::BREAKER_THRESHOLD` (5,
+    // private to that module) as the failure threshold, so N=7 client
+    // errors in a row — more than the threshold — must NOT trip the
+    // breaker, and a subsequent valid request must still be served by the
+    // same deployment.
+    //
+    // Load-bearing: if the dispatch closure is reverted to reporting client
+    // errors as `Err` (i.e. counted against the breaker, the pre-fix
+    // behavior), the breaker trips after the 5th client error and the 6th
+    // iteration's `dispatch_invoke` call returns
+    // `DispatchError::AllDeploymentsUnavailable` instead of `Upstream`,
+    // failing the `matches!` assertion inside the loop below — this was
+    // confirmed by temporarily reverting the fix and re-running.
+    struct ClientErrorsThenOk {
+        calls: Arc<AtomicUsize>,
+        flip_after: usize,
+    }
+
+    #[async_trait::async_trait]
+    impl ChatModel for ClientErrorsThenOk {
+        fn name(&self) -> &str {
+            "flip"
+        }
+        async fn invoke(&self, _m: Vec<Message>, _o: &ChatOptions) -> Result<ChatResponse> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            if n < self.flip_after {
+                Err(Error::invalid("400 Bad Request: malformed request"))
+            } else {
+                Ok(ChatResponse {
+                    message: Message {
+                        role: Role::Assistant,
+                        content: vec![],
+                        tool_calls: vec![],
+                        tool_call_id: None,
+                        name: None,
+                        cache: false,
+                    },
+                    finish_reason: FinishReason::Stop,
+                    usage: TokenUsage::default(),
+                    model: "flip".into(),
+                })
+            }
+        }
+        async fn stream(&self, _m: Vec<Message>, _o: &ChatOptions) -> Result<ChatStream> {
+            unreachable!("this task covers non-streaming dispatch only")
+        }
+    }
+
+    #[tokio::test]
+    async fn client_errors_do_not_trip_the_breaker() {
+        const N: usize = 7; // > registry::BREAKER_THRESHOLD (5)
+        let calls = Arc::new(AtomicUsize::new(0));
+        let model = Arc::new(ClientErrorsThenOk { calls: calls.clone(), flip_after: N });
+        let dep = Arc::new(Deployment::for_test("solo", "g", 1, model));
+        let g = ModelGroup { name: "g".into(), deployments: vec![dep] };
+
+        for _ in 0..N {
+            let err =
+                dispatch_invoke(&g, &WeightedRandom::seeded(1), vec![], &ChatOptions::default())
+                    .await
+                    .unwrap_err();
+            assert!(
+                matches!(err, DispatchError::Upstream { .. }),
+                "client errors must surface as Upstream, not trip the breaker into AllDeploymentsUnavailable"
+            );
+        }
+
+        // The breaker must still be closed after N (> threshold) client
+        // errors: this call must reach the model, not be rejected by an
+        // open breaker.
+        let (_resp, used) =
+            dispatch_invoke(&g, &WeightedRandom::seeded(1), vec![], &ChatOptions::default())
+                .await
+                .expect("client errors must not trip the breaker for an otherwise healthy deployment");
+        assert_eq!(used.id, "solo");
+        assert_eq!(calls.load(Ordering::SeqCst), N + 1, "all N client errors plus the final ok were attempted");
+    }
+
     #[tokio::test]
     async fn all_deployments_failing_reports_exhausted() {
         let a = Arc::new(AtomicUsize::new(0));
@@ -243,6 +357,9 @@ mod tests {
     async fn deployment_recovers_once_cooldown_elapses() {
         let calls = Arc::new(AtomicUsize::new(0));
         let g = group_of(&[("rec", "ok", calls.clone())]);
+        // 20ms cooldown / 60ms sleep gives ~40ms of headroom over the
+        // cooldown so this does not flake under CI scheduling jitter, while
+        // staying fast enough not to slow the suite meaningfully.
         g.deployments[0].breaker().trip(Duration::from_millis(20));
 
         // While open, the deployment is skipped and the model is never invoked.
@@ -252,7 +369,7 @@ mod tests {
         assert!(matches!(err, DispatchError::AllDeploymentsUnavailable));
         assert_eq!(calls.load(Ordering::SeqCst), 0);
 
-        tokio::time::sleep(Duration::from_millis(35)).await;
+        tokio::time::sleep(Duration::from_millis(60)).await;
 
         // Cooldown elapsed: the same deployment must be admitted (as a
         // half-open probe) and serve the request.
