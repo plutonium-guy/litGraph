@@ -5,51 +5,75 @@ suite (`python_tests/test_*.py`, `cargo test --workspace`) covers
 shape + behaviour with mocks; this doc tracks the tests that hit
 real provider endpoints.
 
-**Provider used today: DeepSeek** — OpenAI-compatible REST at
-`https://api.deepseek.com/v1`. Set `DEEPSEEK_API_KEY` to enable;
-tests skip cleanly when it's missing.
+**Any OpenAI-compatible `/chat/completions` endpoint.** DeepSeek
+(`https://api.deepseek.com/v1`, `DEEPSEEK_API_KEY`) remains the
+default. Point the suite anywhere else — Ollama, vLLM, LM Studio,
+Together — with:
 
-**Model alias used in tests:** `deepseek-chat` (the general-purpose
-model). The reasoning model `deepseek-reasoner` is exercised in the
-streaming + structured-output tests where its different finish
-semantics matter.
+| Env var | Meaning |
+|---|---|
+| `LITGRAPH_TEST_BASE_URL` | endpoint (implies no API key needed) |
+| `LITGRAPH_TEST_MODEL` | chat model id |
+| `LITGRAPH_TEST_API_KEY` | key, if the endpoint wants one |
+| `LITGRAPH_TEST_TIMEOUT_S` | per-call timeout (local models are slower) |
+| `LITGRAPH_TEST_EMBED_MODEL` | embeddings model — enables embedding-backed tests |
+| `LITGRAPH_TEST_JSON_SCHEMA` | force schema-mode support on/off |
 
-**Snapshot date:** 2026-05-02 · iter 376.
+Tests skip cleanly when nothing is configured. Capability gating lives
+in `python_tests/integration/_capabilities.py` — skips are keyed on what
+the endpoint *supports*, not on a hardcoded provider name.
+
+**Snapshot date:** 2026-08-20 · full suite run locally against Ollama
+`qwen3-14b-nothink` on an M2 Max: **139 passed, 0 failed, 0 skipped**.
+Qwen3 is a reasoning model and would spend this suite's small
+`max_tokens` budget on hidden reasoning, so the run used a derived
+model whose template hardcodes the no-think branch.
 
 ---
 
 ## Run
 
 ```bash
-export DEEPSEEK_API_KEY=sk-...
 source .venv/bin/activate
 
-# Live tests only:
+# Against DeepSeek:
+export DEEPSEEK_API_KEY=sk-...
 pytest python_tests/integration/ -v
+
+# Against a local Ollama (no key, no cost):
+LITGRAPH_TEST_BASE_URL=http://localhost:11434/v1 \
+LITGRAPH_TEST_MODEL=qwen3-14b-nothink \
+LITGRAPH_TEST_EMBED_MODEL=nomic-embed-text-v2-moe:latest \
+LITGRAPH_TEST_TIMEOUT_S=900 \
+  pytest python_tests/integration/ -v
 
 # Skip live tests (CI default):
 pytest python_tests/integration/ -v --no-deepseek
 ```
 
 Each test is decorated with `@pytest.mark.integration` and gated on
-`DEEPSEEK_API_KEY`. They make real API calls and cost real money
-(small — DeepSeek is cheap; full suite < 5 cents at the time of
-writing). Don't run on every commit; run on release-prep + after
-provider changes.
+having an endpoint configured. Against a hosted provider they make
+real API calls and cost real money (small — DeepSeek is cheap; full
+suite < 5 cents at the time of writing). Against a local endpoint they
+cost nothing, which makes a full local run cheap enough to do on every
+provider change.
 
 ---
 
 ## Tested ✅
 
-132 live integration tests against DeepSeek pass as of iter 376.
-6 cleanly skipped:
-- `LlmJudge` (2 cases) and `synthesize_eval_cases` (2 cases) — both
-  use `StructuredChatModel` → `response_format=json_schema`, which
-  DeepSeek does not support today. See Gotchas.
-- `agents_extras.BigToolAgent` (1 case) — needs an embeddings
-  provider; DeepSeek has none.
-- `memory_extras.NamespacedMemory` (1 case) — needs a metadata-
-  preserving inner backend; native memories drop metadata.
+139 live integration tests pass against Ollama `qwen3-14b-nothink`
+with `nomic-embed-text-v2-moe` for embeddings — 0 failed, 0 skipped.
+
+Four of these were previously listed as permanently blocked. They were
+blocked by DeepSeek, not by litGraph: `LlmJudge` (2 cases) and
+`synthesize_eval_cases` (2 cases) need `response_format=json_schema`,
+which Ollama, vLLM, OpenAI and LM Studio all implement. They now run
+wherever schema mode is available.
+
+`agents_extras.BigToolAgent` was a `pass` stub skipped for "DeepSeek has
+no embeddings". Running it for real found a defect — see the changelog
+entry below.
 
 | Feature | Test file | Notes |
 |---|---|---|
@@ -131,15 +155,14 @@ Features deliberately not exercised against DeepSeek. Reason in each row.
 | **OpenAI Responses API** | DeepSeek implements only `/chat/completions`, not `/responses`. |
 | **OpenAI image generation (DALL·E)** | Image-gen path on `/images`; DeepSeek's catalog doesn't include it. |
 | **Whisper / TTS tools** | Audio I/O endpoints; not on DeepSeek. |
-| **Embeddings** (`/embeddings`) | DeepSeek doesn't expose an embedding model. Use Cohere / Voyage / Jina / OpenAI / FastEmbed for embedding tests. |
+| **Embeddings** (`/embeddings`) | Not available on DeepSeek. Now covered when `LITGRAPH_TEST_EMBED_MODEL` is set — verified against Ollama `nomic-embed-text-v2-moe` (768-dim). |
 | **Vector stores live** | Need a running Qdrant / pgvector / Chroma / Weaviate / Milvus / Redis-search / Neo4j — out of scope here, separate compose-up integration suite. |
 | **Postgres / SQLite checkpointers live** | Same — needs a DB; covered by mock-state unit tests. |
 | **MCP server live** | Needs an MCP server endpoint; tested with the in-process fake server in `python_tests/test_mcp_*.py`. |
-| **`litgraph-serve` HTTP** | Needs to spawn the binary; covered by Rust integration tests in `crates/litgraph-serve/tests/`. |
+| **`litgraph-serve` HTTP** | ~~Blocked~~ — now tested. `recipes.serve(model)` spawns the axum server in-process; `test_recipes_serve_stub.py` hits `/health` + `/info` on it and shuts it down. |
 | **Free-threaded Python 3.13t** | Build matrix, not a per-call thing. Tested by running the full suite on 3.13t in CI. |
 | **Vision / multimodal** | DeepSeek-VL is a separate model + endpoint shape; current tests use `deepseek-chat` only. |
-| **Evaluator `LlmJudge` live** | Uses `StructuredChatModel` → `response_format=json_schema`. DeepSeek rejects schema-mode (`"This response_format type is unavailable now"`). Re-enable when DeepSeek adds it OR when `StructuredChatModel` falls back to `json_object` + post-validate. Test stubs are in `test_evaluators_llm_judge.py` (skipped). |
-| **`agents_extras.BigToolAgent` live** | Requires an embeddings provider to score the tool catalogue. DeepSeek has no embeddings — gated on a separate provider key. Stub in `test_agents_extras_swarm.py`. |
+| **Evaluator `LlmJudge` live** | ~~Blocked on DeepSeek~~ — now tested. Needs `response_format=json_schema`, which DeepSeek rejects but Ollama / vLLM / OpenAI / LM Studio support. Gated on `_capabilities.SUPPORTS_JSON_SCHEMA`. |
 | **`memory_extras.NamespacedMemory` against native backends** | Requires `add_user(text, metadata=...)` AND a backend that PRESERVES `metadata` on read. Native litGraph memories (`BufferMemory`, `TokenBufferMemory`, …) only expose `append({"role","content"})` and silently drop metadata. NamespacedMemory either raises `AttributeError: ... does not support 'add_user'` or returns an empty `messages()`. Re-enable once a metadata-preserving native memory backend lands or with a LangChain-compat backend. |
 
 ---
@@ -182,6 +205,26 @@ on by default.
   the substring `"json"`** (case-insensitive). DeepSeek rejects
   the request with `400 invalid_request_error` otherwise. Tests
   set the system prompt to e.g. `'Reply with valid json: {...}'`.
+- **Streaming usage needs `stream_options.include_usage`.** Fixed in
+  `litgraph-providers-openai`: the streaming request now opts in, so the
+  `done` event carries real token counts on spec-compliant servers.
+  Before the fix `usage` was `{prompt:0, completion:0, total:0}`
+  everywhere except DeepSeek, which sends usage unprompted — which is
+  exactly why the gap went unnoticed. `CostTracker` over streamed calls
+  was silently free.
+- **Reasoning models need their thinking disabled for this suite.**
+  Tests call with `max_tokens=10..50`; a reasoning model (Qwen3,
+  DeepSeek-R1) spends that entire budget on hidden reasoning and returns
+  empty `content`. Ollama honours `reasoning_effort:"none"`, but
+  `OpenAIChat.invoke()` forwards only `temperature`, `max_tokens` and
+  `response_format`, so it cannot be sent from Python. Workaround used
+  here: a derived Ollama model whose template hardcodes the no-think
+  branch (reuses the parent's blobs, costs no extra disk).
+- **Ollama does not hard-enforce a JSON schema's `required` list.**
+  Roughly 1 call in 15 under load, `LlmJudge` gets back a `JudgeScore`
+  missing `reasoning`; litGraph correctly rejects it with
+  `RuntimeError: malformed JudgeScore`. Not a litGraph defect — retry or
+  use a provider with strict schema mode for eval-critical runs.
 - **`response_format=json_schema` is not supported on DeepSeek**
   (`"This response_format type is unavailable now"`). This blocks
   `LlmJudge` and any consumer of `StructuredChatModel.with_strict(true)`

@@ -466,7 +466,7 @@ litGraph + LangGraph both ship first-class MCP; LangChain Core hasn't.
 | LangGraph Cloud-API compatible | ✅ (Studio router behind feature flag) | ❌ | ✅ (native) |
 | Managed cloud hosting | ❌ (self-host only) | 💰 (LangSmith deploy) | 💰 (LangGraph Cloud) |
 | Studio UI (visual debugger) | ⏳ (cloud-API surface; no local UI) | ⏳ (LangServe Playground) | ✅ |
-| Multi-tenant auth scaffolding | ✅ (`litgraph_serve::auth::{bearer_layer,forwarded_user_layer}`) | ❌ | 💰 |
+| Multi-tenant auth scaffolding | ⏳ (`litgraph_serve::auth` supplies bearer + `X-Forwarded-User` layers, but nothing consumes the identity — `studio_router` applies no per-thread ACL, so the serve binary is still single-tenant) | ❌ | 💰 |
 | WebSocket endpoint | ✅ (`litgraph_serve::ws`, feature `ws`) | ⏳ (LangServe) | ⏳ |
 | Single binary deploy (no Python at edge) | ✅ (Rust binary) | ❌ | ❌ |
 

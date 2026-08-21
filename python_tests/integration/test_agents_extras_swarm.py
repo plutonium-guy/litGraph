@@ -1,4 +1,4 @@
-"""Live integration: `agents_extras.SwarmAgent` and `BigToolAgent` with DeepSeek.
+"""Live integration: `agents_extras.SwarmAgent` and `BigToolAgent`.
 
 `SwarmAgent` is the swarm-style multi-agent coordinator (peers, not
 hierarchy). `BigToolAgent` retrieves the top-K relevant tools per turn
@@ -7,6 +7,8 @@ from a large pool. Both expand on the basic `ReactAgent` shape.
 from __future__ import annotations
 
 import pytest
+
+from ._capabilities import NO_EMBEDDINGS_REASON, SUPPORTS_EMBEDDINGS
 
 
 pytestmark = pytest.mark.integration
@@ -66,11 +68,57 @@ def test_swarm_agent_invoke_entry_agent(deepseek_chat):
     assert "42" in (text or ""), f"swarm entry agent failed: {out!r}"
 
 
-@pytest.mark.skip(reason="BigToolAgent needs an embeddings provider; DeepSeek has none — covered when an embedding key is supplied")
-def test_big_tool_agent_constructible(deepseek_chat):  # pragma: no cover
-    """`BigToolAgent(agent_factory, tools, embeddings, k=...)` requires
-    a real embeddings provider to score the tool catalogue. DeepSeek
-    doesn't expose embeddings, so this path is gated on a separate
-    provider key (OpenAI/Cohere/Voyage/Jina/FastEmbed). See
-    INTEGRATION_TESTS.md → Conditionally testable."""
-    pass
+@pytest.mark.skipif(not SUPPORTS_EMBEDDINGS, reason=NO_EMBEDDINGS_REASON)
+def test_big_tool_agent_selects_relevant_tools(deepseek_chat):
+    """`BigToolAgent` embeds every tool's `(name + description)` once and
+    hands the inner agent only the top-k for the query.
+
+    Needs a real embeddings provider, so it is gated on
+    `LITGRAPH_TEST_EMBED_MODEL` rather than skipped outright."""
+    from litgraph.agents import ReactAgent
+    from litgraph.agents_extras import BigToolAgent
+    from litgraph.embeddings import OpenAIEmbeddings
+    from litgraph.tools import FunctionTool
+
+    from ._capabilities import EMBED_MODEL, embed_base_url, embed_dimensions
+
+    embeddings = OpenAIEmbeddings(
+        api_key="ollama",
+        model=EMBED_MODEL,
+        dimensions=embed_dimensions(),
+        base_url=embed_base_url(),
+    )
+
+    def _tool(name: str, description: str):
+        return FunctionTool(
+            name,
+            description,
+            {"type": "object", "properties": {"x": {"type": "string"}}},
+            lambda x=None: {"tool": name},
+        )
+
+    tools = [
+        _tool("add", "Add two integers together."),
+        _tool("send_email", "Send an email to a recipient."),
+        _tool("resize_image", "Resize an image to given dimensions."),
+        _tool("translate_text", "Translate text between languages."),
+        _tool("book_flight", "Book a flight between two airports."),
+    ]
+
+    agent = BigToolAgent(
+        lambda selected: ReactAgent(
+            deepseek_chat, selected, system_prompt="Use a tool.", max_iterations=2
+        ),
+        tools,
+        embeddings,
+        k=2,
+    )
+
+    # Constructing it embeds the catalogue — the bug this guards against
+    # was an AttributeError here, because native providers expose
+    # `embed_documents`, not `embed`.
+    assert len(agent._tool_vecs) == len(tools)
+
+    picked = [t.name for t in agent._select("translate this sentence into French")]
+    assert len(picked) == 2
+    assert "translate_text" in picked, f"retrieval missed the obvious tool: {picked}"

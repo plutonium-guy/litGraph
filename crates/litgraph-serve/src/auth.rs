@@ -53,6 +53,10 @@ pub fn bearer_layer_multi(tokens: HashSet<String>) -> _BearerLayer {
 
 /// Concrete return type for the bearer layer constructors. Re-exported
 /// so callers that want to store the layer in a struct can name it.
+/// The trailing type parameter is axum's extractor tuple. Every argument
+/// before `Next` belongs in it — including `Request<Body>`, which axum
+/// treats as the final `FromRequest` extractor. Omitting it leaves the
+/// layer without a `Service` impl, so `Router::layer` rejects it.
 pub type _BearerLayer = axum::middleware::FromFnLayer<
     fn(
         axum::extract::State<Arc<HashSet<String>>>,
@@ -60,7 +64,7 @@ pub type _BearerLayer = axum::middleware::FromFnLayer<
         Next,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send>>,
     Arc<HashSet<String>>,
-    (axum::extract::State<Arc<HashSet<String>>>,),
+    (axum::extract::State<Arc<HashSet<String>>>, Request<Body>),
 >;
 
 fn bearer_check(
@@ -106,13 +110,15 @@ pub fn forwarded_user_layer() -> _ForwardedUserLayer {
 }
 
 /// Concrete return type for [`forwarded_user_layer`].
+/// See [`_BearerLayer`] on why `Request<Body>` appears in the extractor
+/// tuple: this middleware takes no state, so the tuple is just `(Request,)`.
 pub type _ForwardedUserLayer = axum::middleware::FromFnLayer<
     fn(
         Request<Body>,
         Next,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send>>,
     (),
-    (),
+    (Request<Body>,),
 >;
 
 fn forwarded_user_inner(

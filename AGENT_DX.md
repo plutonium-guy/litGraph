@@ -340,7 +340,7 @@ Lower the barrier from "intent" to "working agent."
 | `litgraph.agents.deep.create_deep_agent(...)` (retries+budget+tracing wired) | ✅ | — |
 | **💡 `litgraph.recipes.rag(corpus_path, model=...)`** → working RAG agent in 1 call | 💡 | M |
 | **`litgraph.recipes.eval(target, cases)`** → harness with sane metrics | ✅ (iter 339) | S |
-| **`litgraph.recipes.serve(graph, port=8080)`** → REST + SSE in 1 call | ⏳ (renders cmd; full impl pending) | S |
+| **`litgraph.recipes.serve(model, port=8080)`** → REST + SSE in 1 call | ✅ for a ChatModel (spawns axum in-process, returns `ServeHandle`); ⏳ graph-shaped input raises `NotImplementedError` | S |
 | **💡 `litgraph.recipes.multi_agent(roles=[...])`** → supervisor pre-wired | 💡 | M |
 
 **Why Claude Code cares:** when the user says "build me an X", the

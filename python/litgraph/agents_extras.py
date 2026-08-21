@@ -155,6 +155,32 @@ class SwarmAgent:
         }
 
 
+def _embed_many(embeddings: Any, texts: list[str]) -> Any:
+    """Batch-embed `texts` across the two embedding shapes in the wild.
+
+    Native `litgraph.embeddings.*` providers expose `embed_documents` /
+    `embed_query`; LangChain-style and hand-rolled duck types often expose
+    a single `embed(texts)`. Accept either so `BigToolAgent` works with the
+    providers its own docstring advertises.
+    """
+    for meth in ("embed_documents", "embed"):
+        fn = getattr(embeddings, meth, None)
+        if callable(fn):
+            return fn(texts)
+    raise TypeError(
+        f"{type(embeddings).__name__} is not an embeddings provider: expected "
+        "an `embed_documents(texts)` or `embed(texts)` method."
+    )
+
+
+def _embed_one(embeddings: Any, text: str) -> Any:
+    """Embed a single query, preferring a provider's dedicated query path."""
+    fn = getattr(embeddings, "embed_query", None)
+    if callable(fn):
+        return fn(text)
+    return _embed_many(embeddings, [text])[0]
+
+
 class BigToolAgent:
     """Large-scale tool selection. Embed each tool's `(name +
     description)`, retrieve top-`k` by cosine similarity to the user's
@@ -169,8 +195,9 @@ class BigToolAgent:
             agent given the selected tool list. Typically
             `lambda tools: ReactAgent(model, tools, system_prompt=...)`.
         tools: full tool catalogue.
-        embeddings: any `litgraph.embeddings.*` (or duck-shape with
-            `embed(texts) -> list[list[float]]`).
+        embeddings: any `litgraph.embeddings.*` (which expose
+            `embed_documents` / `embed_query`), or a duck-shape with
+            `embed(texts) -> list[list[float]]`.
         k: how many tools to retrieve per turn.
     """
 
@@ -193,12 +220,12 @@ class BigToolAgent:
             f"{getattr(t, 'name', type(t).__name__)}: {getattr(t, 'description', '')}"
             for t in self._tools
         ]
-        self._tool_vecs = embeddings.embed(descriptors)
+        self._tool_vecs = _embed_many(embeddings, descriptors)
         self._embeddings = embeddings
 
     def _select(self, query: str) -> list[Any]:
         import math
-        q_vec = self._embeddings.embed_query(query) if hasattr(self._embeddings, "embed_query") else self._embeddings.embed([query])[0]
+        q_vec = _embed_one(self._embeddings, query)
         # Cosine similarity (assume L2-normalised vectors → dot is fine,
         # but we normalise defensively here).
         def cos(a: list[float], b: list[float]) -> float:

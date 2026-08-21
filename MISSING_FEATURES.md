@@ -51,9 +51,6 @@ work with `iter N` in the commit log.
   the Harness report by default).
 
 ### Serve
-- WebSocket streaming endpoint on `litgraph-serve`. SSE covers the
-  forward path; WS would unlock client-driven cancellation +
-  back-channel control without a second connection.
 - Multi-tenant auth scaffolding (`X-Forwarded-User`, JWT validator,
   per-thread ACL). Today the serve binary is single-tenant.
 

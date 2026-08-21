@@ -22,11 +22,12 @@ def _drain():
     time.sleep(0.5)
 
 
-def test_cost_tracker_records_calls(deepseek_chat):
+def test_cost_tracker_records_calls(deepseek_chat, live_model):
     from litgraph.observability import CostTracker
 
-    # DeepSeek prices ($/1M tokens, May 2026 list — cache-miss + output rates).
-    tracker = CostTracker({"deepseek-chat": (0.27, 1.10)})
+    # Price table keyed by the live model ($/1M tokens; DeepSeek's
+    # May 2026 cache-miss + output rates as representative numbers).
+    tracker = CostTracker({live_model: (0.27, 1.10)})
     deepseek_chat.instrument(tracker)
 
     deepseek_chat.invoke([{"role": "user", "content": "Reply: hi"}], max_tokens=10)
@@ -40,24 +41,24 @@ def test_cost_tracker_records_calls(deepseek_chat):
     assert snap["usd"] >= 0.0
 
 
-def test_cost_tracker_per_model_breakdown(deepseek_chat):
+def test_cost_tracker_per_model_breakdown(deepseek_chat, live_model):
     from litgraph.observability import CostTracker
 
-    tracker = CostTracker({"deepseek-chat": (0.27, 1.10)})
+    tracker = CostTracker({live_model: (0.27, 1.10)})
     deepseek_chat.instrument(tracker)
     deepseek_chat.invoke([{"role": "user", "content": "ok"}], max_tokens=10)
     _drain()
 
     snap = tracker.snapshot()
     per_model = snap.get("per_model", {})
-    assert "deepseek-chat" in per_model
-    assert per_model["deepseek-chat"]["calls"] >= 1
+    assert live_model in per_model
+    assert per_model[live_model]["calls"] >= 1
 
 
-def test_cost_tracker_usd_helper(deepseek_chat):
+def test_cost_tracker_usd_helper(deepseek_chat, live_model):
     from litgraph.observability import CostTracker
 
-    tracker = CostTracker({"deepseek-chat": (0.27, 1.10)})
+    tracker = CostTracker({live_model: (0.27, 1.10)})
     deepseek_chat.instrument(tracker)
     deepseek_chat.invoke([{"role": "user", "content": "ok"}], max_tokens=10)
     _drain()
