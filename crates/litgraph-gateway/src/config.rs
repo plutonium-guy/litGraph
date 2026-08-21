@@ -24,6 +24,12 @@ pub enum ConfigError {
     UnknownGroup { key_id: String, group: String },
     #[error("config declares no deployments")]
     NoDeployments,
+    #[error("deployment {0:?} names env var that is not set")]
+    MissingEnv(String),
+    #[error("deployment {deployment_id:?} uses unsupported provider {provider:?}")]
+    UnknownProvider { deployment_id: String, provider: String },
+    #[error("deployment {0:?} failed to build its provider client: {1}")]
+    ProviderBuild(String, String),
 }
 
 fn default_weight() -> u32 {
