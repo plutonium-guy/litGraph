@@ -18,6 +18,8 @@ pub enum ConfigError {
     DuplicateDeploymentId(String),
     #[error("duplicate key id {0:?}")]
     DuplicateKeyId(String),
+    #[error("duplicate key prefix {0:?}")]
+    DuplicateKeyPrefix(String),
     #[error("key {key_id:?} allows group {group:?}, which no deployment serves")]
     UnknownGroup { key_id: String, group: String },
     #[error("config declares no deployments")]
@@ -53,6 +55,9 @@ pub struct DeploymentConfig {
 #[derive(Debug, Clone, Deserialize)]
 pub struct KeyConfig {
     pub id: String,
+    /// Lookup index for this key. Must match the prefix embedded in the
+    /// plaintext token. Emitted by `keygen` alongside the hash.
+    pub prefix: String,
     /// argon2id PHC string. Never a plaintext key.
     pub hash: String,
     /// Groups this key may invoke. Exact match; no globs in v1.
@@ -93,9 +98,13 @@ impl GatewayConfig {
             groups.insert(d.group.as_str());
         }
         let mut key_ids = HashSet::new();
+        let mut key_prefixes = HashSet::new();
         for k in &self.key {
             if !key_ids.insert(k.id.as_str()) {
                 return Err(ConfigError::DuplicateKeyId(k.id.clone()));
+            }
+            if !key_prefixes.insert(k.prefix.as_str()) {
+                return Err(ConfigError::DuplicateKeyPrefix(k.prefix.clone()));
             }
             for g in &k.groups {
                 if !groups.contains(g.as_str()) {
@@ -127,6 +136,7 @@ rpm = 3000
 
 [[key]]
 id = "team-research"
+prefix = "abcd1234"
 hash = "$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$aGFzaA"
 groups = ["gpt-4o"]
 rpm = 600
@@ -208,11 +218,70 @@ api_key_env = "K"
 
 [[key]]
 id = "k1"
+prefix = "aaaaaaaa"
 hash = "x"
 groups = ["does-not-exist"]
 "#,
         )
         .unwrap_err();
         assert!(matches!(err, ConfigError::UnknownGroup { .. }));
+    }
+
+    #[test]
+    fn rejects_duplicate_key_ids() {
+        let err = GatewayConfig::from_toml_str(
+            r#"
+[[deployment]]
+id = "d1"
+group = "gpt-4o"
+provider = "openai"
+model = "m"
+base_url = "http://localhost"
+api_key_env = "K"
+
+[[key]]
+id = "dup"
+prefix = "aaaaaaaa"
+hash = "x"
+groups = ["gpt-4o"]
+
+[[key]]
+id = "dup"
+prefix = "bbbbbbbb"
+hash = "y"
+groups = ["gpt-4o"]
+"#,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ConfigError::DuplicateKeyId(ref s) if s == "dup"));
+    }
+
+    #[test]
+    fn rejects_duplicate_key_prefixes() {
+        let err = GatewayConfig::from_toml_str(
+            r#"
+[[deployment]]
+id = "d1"
+group = "gpt-4o"
+provider = "openai"
+model = "m"
+base_url = "http://localhost"
+api_key_env = "K"
+
+[[key]]
+id = "team-a"
+prefix = "shared01"
+hash = "x"
+groups = ["gpt-4o"]
+
+[[key]]
+id = "team-b"
+prefix = "shared01"
+hash = "y"
+groups = ["gpt-4o"]
+"#,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ConfigError::DuplicateKeyPrefix(ref s) if s == "shared01"));
     }
 }
