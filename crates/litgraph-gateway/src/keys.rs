@@ -48,6 +48,17 @@ pub enum AuthError {
     Unknown,
     #[error("stored hash for key {0:?} is not a valid PHC string")]
     BadStoredHash(String),
+    /// `GatewayConfig::validate` already rejects this at config-parse time,
+    /// but `KeyStore::from_configs` takes a bare `&[KeyConfig]` — nothing
+    /// in its signature guarantees the caller validated first (a future
+    /// hot-reload path or a hand-built `Vec<KeyConfig>` could skip it). A
+    /// silent overwrite here would mean the last key with a given prefix
+    /// wins and every earlier tenant sharing it is locked out, so this
+    /// file — the actual security boundary — enforces uniqueness itself
+    /// too. The redundancy with config validation is deliberate defense
+    /// in depth, not an oversight.
+    #[error("duplicate key prefix {0:?}")]
+    DuplicateKeyPrefix(String),
 }
 
 /// An authenticated tenant. Carries no secret material.
@@ -145,6 +156,12 @@ impl KeyStore {
             // Validate the stored hash at startup so a malformed config
             // fails fast rather than 500-ing on the first request.
             PasswordHash::new(&k.hash).map_err(|_| AuthError::BadStoredHash(k.id.clone()))?;
+            // Enforced again here (see AuthError::DuplicateKeyPrefix doc):
+            // a plain `HashMap::insert` would silently let a later key
+            // overwrite an earlier one's index entry.
+            if by_prefix.contains_key(&k.prefix) {
+                return Err(AuthError::DuplicateKeyPrefix(k.prefix.clone()));
+            }
             by_prefix.insert(
                 k.prefix.clone(),
                 StoredKey {
@@ -169,6 +186,21 @@ impl KeyStore {
     }
 
     /// Verify a presented bearer token.
+    ///
+    /// # Known, accepted timing side channel
+    ///
+    /// Malformed input and an unknown prefix return immediately, while a
+    /// known prefix with the wrong secret pays a full argon2 verify
+    /// (10-50 ms). That timing gap lets an attacker enumerate which 8-char
+    /// prefixes are live by observing response latency across many guesses.
+    ///
+    /// This is a deliberate, reasoned trade-off, not an oversight — do not
+    /// "fix" it by paying argon2 on every miss including garbage input.
+    /// That would turn any unauthenticated request into a guaranteed
+    /// 10-50 ms CPU burn, which is a far cheaper denial-of-service lever
+    /// than the enumeration it prevents. What actually leaks is only which
+    /// prefixes exist; a prefix without its paired 256-bit secret is
+    /// worthless to an attacker. Do not change this control flow.
     pub fn authenticate(&self, token: &str) -> Result<Arc<VirtualKey>, AuthError> {
         let (prefix, secret) = split_token(token).ok_or(AuthError::Unknown)?;
         let stored = self.by_prefix.get(prefix).ok_or(AuthError::Unknown)?;
@@ -296,13 +328,33 @@ mod tests {
     #[test]
     fn debug_output_never_contains_key_material() {
         let (plaintext, prefix, hash) = generate_key();
-        let store =
-            KeyStore::from_configs(&[key_cfg("team-a", &prefix, &hash, &["gpt-4o"])]).unwrap();
+        let cfg = key_cfg("team-a", &prefix, &hash, &["gpt-4o"]);
+        let store = KeyStore::from_configs(&[cfg.clone()]).unwrap();
         let vk = store.authenticate(&plaintext).unwrap();
 
-        let rendered = format!("{vk:?} {store:?}");
+        let gateway_cfg = crate::config::GatewayConfig {
+            deployment: Vec::new(),
+            key: vec![cfg.clone()],
+        };
+
+        let rendered = format!("{vk:?} {store:?} {cfg:?} {gateway_cfg:?}");
         let secret = plaintext.split_once('.').unwrap().1;
         assert!(!rendered.contains(secret), "secret leaked into Debug output");
         assert!(!rendered.contains(&hash), "hash leaked into Debug output");
+    }
+
+    #[test]
+    fn from_configs_rejects_colliding_prefixes_even_without_config_validation() {
+        // Bypasses GatewayConfig::validate entirely — constructs the
+        // KeyStore directly from a hand-built slice, as a future hot-reload
+        // path or unvalidated caller might.
+        let (_, _, hash_a) = generate_key();
+        let (_, _, hash_b) = generate_key();
+        let err = KeyStore::from_configs(&[
+            key_cfg("team-a", "shared01", &hash_a, &["gpt-4o"]),
+            key_cfg("team-b", "shared01", &hash_b, &["gpt-4o"]),
+        ])
+        .unwrap_err();
+        assert!(matches!(err, AuthError::DuplicateKeyPrefix(ref s) if s == "shared01"));
     }
 }

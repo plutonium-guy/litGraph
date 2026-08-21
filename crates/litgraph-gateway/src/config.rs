@@ -52,7 +52,7 @@ pub struct DeploymentConfig {
     pub rpm: Option<u32>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct KeyConfig {
     pub id: String,
     /// Lookup index for this key. Must match the prefix embedded in the
@@ -68,6 +68,23 @@ pub struct KeyConfig {
     /// Rolling daily spend ceiling in USD. `None` = uncapped.
     #[serde(default)]
     pub max_usd_per_day: Option<f64>,
+}
+
+/// Hand-written so `hash` — a live argon2id PHC string — never appears in
+/// logs or trace output via `format!("{cfg:?}")` or `tracing::debug!`. A
+/// derived `Debug` would print it verbatim; `#[derive(Debug)]` on
+/// `GatewayConfig` also relies on this impl for the same reason.
+impl std::fmt::Debug for KeyConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KeyConfig")
+            .field("id", &self.id)
+            .field("prefix", &self.prefix)
+            .field("hash", &"<redacted>")
+            .field("groups", &self.groups)
+            .field("rpm", &self.rpm)
+            .field("max_usd_per_day", &self.max_usd_per_day)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
