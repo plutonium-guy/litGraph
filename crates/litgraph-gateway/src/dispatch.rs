@@ -142,11 +142,19 @@ mod tests {
         }
     }
 
+    // Deployment order here is deliberately [good, bad] rather than [bad,
+    // good]: with `WeightedRandom::seeded(1)` and two equal-weight
+    // candidates, the first `pick` draws the *second* vec element (see the
+    // comment on `timeout_fails_over_to_the_next_deployment` below for the
+    // empirical finding). Putting the failing deployment second makes it
+    // the one drawn first, so this test is forced to actually exercise
+    // failover regardless of draw order — the assertion on `bad.load`
+    // below would fail loudly if it did not.
     #[tokio::test]
     async fn infrastructure_failure_fails_over_to_the_next_deployment() {
-        let bad = Arc::new(AtomicUsize::new(0));
         let good = Arc::new(AtomicUsize::new(0));
-        let g = group_of(&[("bad", "5xx", bad.clone()), ("good", "ok", good.clone())]);
+        let bad = Arc::new(AtomicUsize::new(0));
+        let g = group_of(&[("good", "ok", good.clone()), ("bad", "5xx", bad.clone())]);
 
         let (_resp, used) =
             dispatch_invoke(&g, &WeightedRandom::seeded(1), vec![], &ChatOptions::default())
@@ -154,6 +162,11 @@ mod tests {
                 .expect("should succeed on the healthy deployment");
         assert_eq!(used.id, "good");
         assert_eq!(good.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            bad.load(Ordering::SeqCst), 1,
+            "the failing deployment must actually have been tried — otherwise this \
+             test passes without exercising failover at all"
+        );
     }
 
     #[tokio::test]
@@ -198,15 +211,14 @@ mod tests {
 
     // --- Added per task-5-ruling.md R3: Error::Timeout must fail over like a 5xx. ---
     //
-    // Deployment order here is deliberately [good, bad] rather than [bad,
-    // good]: with `WeightedRandom::seeded(1)` and two equal-weight
-    // candidates, the first `pick` draws the *second* vec element (verified
-    // empirically — the brief's own [bad, good] ordering, kept unmodified
-    // above for `infrastructure_failure_fails_over_to_the_next_deployment`,
-    // happens to succeed on the first pick and never actually exercises the
-    // failover path, since it only asserts `good.load == 1`). Putting the
-    // failing deployment second here makes it the one drawn first, so this
-    // test genuinely exercises "timeout on attempt 1, success on attempt 2".
+    // Same [good, bad] ordering trick as
+    // `infrastructure_failure_fails_over_to_the_next_deployment` above, and
+    // for the same reason: under `WeightedRandom::seeded(1)` with two
+    // equal-weight candidates the first `pick` draws the second vec
+    // element, so putting the failing deployment second makes it the one
+    // tried first. This test genuinely exercises "timeout on attempt 1,
+    // success on attempt 2" rather than passing because the healthy
+    // deployment happened to be picked first.
     #[tokio::test]
     async fn timeout_fails_over_to_the_next_deployment() {
         let good = Arc::new(AtomicUsize::new(0));
