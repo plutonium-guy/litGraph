@@ -7,6 +7,7 @@
 //! over a pool of them rather than a second execution engine.
 
 pub mod config;
+pub mod dispatch;
 pub mod keys;
 pub mod registry;
 pub mod tenant;
