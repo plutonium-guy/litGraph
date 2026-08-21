@@ -1,32 +1,26 @@
-"""Live integration: LLM-as-judge — currently BLOCKED on DeepSeek.
+"""Live integration: LLM-as-judge.
 
-`LlmJudge` wraps the model in `StructuredChatModel` which sets
-`response_format=json_schema`. DeepSeek's chat-completions endpoint
-returns:
+`LlmJudge` wraps the model in `StructuredChatModel`, which sets
+`response_format=json_schema` (strict schema mode).
 
-    400 Bad Request: "This response_format type is unavailable now"
-
-DeepSeek today only supports `response_format=json_object` (the loose
-"emit valid JSON" mode), not the strict `json_schema` variant.
-
-Re-enable these tests when:
-- DeepSeek adds `json_schema` support, OR
-- We add a fallback in `StructuredChatModel` that downgrades to
-  `json_object` + post-validation when the provider rejects schema mode.
-
-Until then the LlmJudge live path runs against OpenAI / Anthropic
-(see CONDITIONALLY-TESTABLE table in INTEGRATION_TESTS.md).
+Not every OpenAI-compatible endpoint implements schema mode --
+DeepSeek answers `400 "This response_format type is unavailable now"`
+and only supports the loose `json_object` variant. These tests are
+gated on `_capabilities.SUPPORTS_JSON_SCHEMA` and run against any
+endpoint that does support it (Ollama, vLLM, OpenAI, LM Studio).
 """
 from __future__ import annotations
 
 import pytest
 
+from ._capabilities import NO_JSON_SCHEMA_REASON, SUPPORTS_JSON_SCHEMA
+
 
 pytestmark = pytest.mark.integration
 
 
-@pytest.mark.skip(reason="DeepSeek rejects response_format=json_schema (used by StructuredChatModel)")
-def test_llm_judge_scores_match(deepseek_chat):  # pragma: no cover
+@pytest.mark.skipif(not SUPPORTS_JSON_SCHEMA, reason=NO_JSON_SCHEMA_REASON)
+def test_llm_judge_scores_match(deepseek_chat):
     from litgraph.evaluators import LlmJudge
 
     judge = LlmJudge(deepseek_chat)
@@ -38,8 +32,8 @@ def test_llm_judge_scores_match(deepseek_chat):  # pragma: no cover
     assert 0.0 <= float(res["score"]) <= 1.0
 
 
-@pytest.mark.skip(reason="DeepSeek rejects response_format=json_schema (used by StructuredChatModel)")
-def test_llm_judge_batch(deepseek_chat):  # pragma: no cover
+@pytest.mark.skipif(not SUPPORTS_JSON_SCHEMA, reason=NO_JSON_SCHEMA_REASON)
+def test_llm_judge_batch(deepseek_chat):
     from litgraph.evaluators import LlmJudge
 
     judge = LlmJudge(deepseek_chat)

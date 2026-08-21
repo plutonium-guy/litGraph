@@ -46,14 +46,14 @@ def test_invoke_returns_usage_block(deepseek_chat):
     assert usage["total"] >= usage["completion"]
 
 
-def test_invoke_returns_model_id(deepseek_chat):
+def test_invoke_returns_model_id(deepseek_chat, live_model):
     out = deepseek_chat.invoke(
         [{"role": "user", "content": "ping"}],
         max_tokens=10,
     )
-    # DeepSeek echoes the model alias used in the request.
+    # The provider echoes the model alias used in the request.
     assert isinstance(out.get("model"), str)
-    assert "deepseek" in out["model"].lower()
+    assert out["model"].lower() == live_model.lower()
 
 
 def test_multi_turn_conversation(deepseek_chat):

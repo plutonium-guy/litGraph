@@ -93,6 +93,14 @@ impl OpenAIChat {
             "messages": messages.iter().map(message_to_openai).collect::<Vec<_>>(),
             "stream": stream,
         });
+        // Ask for the trailing usage chunk. Per the OpenAI streaming spec a
+        // server only reports token usage on a stream when the client opts in;
+        // without this the `done` event carries a zeroed TokenUsage on every
+        // spec-compliant backend (OpenAI, Ollama, vLLM, LM Studio). Some
+        // providers (DeepSeek) send usage unprompted and ignore the field.
+        if stream {
+            body["stream_options"] = json!({ "include_usage": true });
+        }
         if let Some(t) = opts.temperature { body["temperature"] = json!(t); }
         if let Some(t) = opts.top_p { body["top_p"] = json!(t); }
         if let Some(t) = opts.max_tokens { body["max_tokens"] = json!(t); }
@@ -223,7 +231,11 @@ impl ChatModel for OpenAIChat {
                         };
                     }
                 }
-                if let Some(u) = v.get("usage") {
+                // With `stream_options.include_usage` set, OpenAI emits
+                // `"usage": null` on every intermediate chunk and the real
+                // totals only on the final one. Ignore the nulls so they
+                // can't clobber a value we already captured.
+                if let Some(u) = v.get("usage").filter(|u| u.is_object()) {
                     final_usage.prompt = u.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
                     final_usage.completion = u.get("completion_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
                     final_usage.total = u.get("total_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
@@ -794,6 +806,28 @@ mod tests {
         let t = body["temperature"].as_f64().expect("temperature is a number");
         assert!((t - 0.7).abs() < 1e-3, "temperature ≈ 0.7, got {t}");
         assert_eq!(body["stream"], json!(false));
+        // Non-streaming calls report usage in the response body; asking for
+        // the streaming usage chunk here would be meaningless.
+        assert!(body.get("stream_options").is_none());
+    }
+
+    #[tokio::test]
+    async fn stream_requests_usage_chunk_via_stream_options() {
+        // Spec-compliant OpenAI-compatible servers only emit token usage on a
+        // stream when the client opts in. Without this the `done` event
+        // carries a zeroed TokenUsage.
+        let captured: Arc<Mutex<Option<Value>>> = Arc::new(Mutex::new(None));
+        let cap = captured.clone();
+        let cfg = OpenAIConfig::new("sk-fake", "gpt-fake")
+            .with_base_url("http://127.0.0.1:1") // unreachable; the hook still fires
+            .with_on_request(move |_model, body| {
+                *cap.lock().unwrap() = Some(body.clone());
+            });
+        let chat = OpenAIChat::new(cfg).unwrap();
+        let _ = chat.stream(vec![Message::user("hi")], &ChatOptions::default()).await;
+        let body = captured.lock().unwrap().take().expect("inspector should have fired");
+        assert_eq!(body["stream"], json!(true));
+        assert_eq!(body["stream_options"], json!({ "include_usage": true }));
     }
 
     // ---------- Responses API (iter 83) ----------

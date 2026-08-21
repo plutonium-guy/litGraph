@@ -105,9 +105,27 @@ def test_serve_shutdown_is_idempotent():
 
 
 def test_serve_rejects_graph_with_clear_message():
-    # `CompiledGraph` would have `.compile` missing but `.invoke`
-    # present — simulate that surface so the test doesn't need the
-    # full graph wiring.
+    # A real `CompiledGraph` has `.invoke` AND `.stream` and, being already
+    # compiled, no `.compile` — the same surface as a ChatModel. Mirror that
+    # faithfully (including a graph-only traversal method), otherwise the
+    # fake can't catch a dispatcher that misroutes graphs into `spawn_chat`.
+    class FakeCompiledGraph:
+        def invoke(self, *a, **kw):
+            return {}
+
+        def stream(self, *a, **kw):
+            return iter(())
+
+        def state_history(self, *a, **kw):
+            return []
+
+    with pytest.raises(NotImplementedError, match="recipes.serve\\(graph\\)"):
+        recipes.serve(FakeCompiledGraph(), port=0)
+
+
+def test_serve_rejects_invocable_non_streamable_as_graph():
+    # Invocable but not streamable is not a ChatModel; the caller gets the
+    # explanatory deferral rather than a bare TypeError.
     class FakeGraph:
         def invoke(self, *a, **kw):
             return {}

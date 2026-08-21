@@ -63,14 +63,14 @@ def test_token_budget_auto_trim_drops_oldest(deepseek_chat):
     assert out["text"].strip()
 
 
-def test_cost_capped_wrapper_aborts_when_ceiling_hit(deepseek_chat):
+def test_cost_capped_wrapper_aborts_when_ceiling_hit(deepseek_chat, live_model):
     """Tiny ceiling: once usage lands, second call should refuse."""
     from litgraph.providers import CostCappedChat
 
     capped = CostCappedChat(
         deepseek_chat,
         max_usd=1e-12,  # impossibly small — first call's usage trips the cap
-        prices={"deepseek-chat": (0.27, 1.10)},
+        prices={live_model: (0.27, 1.10)},
     )
     # First call: still allowed (cap is checked AFTER usage updates).
     capped.invoke([{"role": "user", "content": "ok"}], max_tokens=10)

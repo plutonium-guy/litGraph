@@ -122,17 +122,34 @@ def serve(graph: Any, port: int = 8080, host: str = "127.0.0.1") -> Any:
             "an axum server on its own."
         ) from e
 
-    # ChatModel duck-shape: `.invoke` + `.stream`, no `.compile`. The
-    # native `OpenAIChat` / `AnthropicChat` / `GeminiChat` etc. expose
-    # these via PyO3 #[pymethods]; `.name` is a Rust-side getter and
-    # not always surfaced through dir(), so we don't require it here.
-    is_chat = (
-        hasattr(graph, "invoke")
-        and hasattr(graph, "stream")
-        and not hasattr(graph, "compile")
+    # Identify graphs POSITIVELY. A `CompiledGraph` also has `.invoke` and
+    # `.stream`, and — being already compiled — no `.compile`, so keying
+    # "chat model" off the absence of `.compile` misroutes it into
+    # `spawn_chat` and surfaces a confusing ValueError instead of the
+    # NotImplementedError documented above.
+    #
+    # `.compile` marks an uncompiled `StateGraph`; the traversal methods
+    # below are unique to a compiled one (a ChatModel has none of them).
+    is_graph = (
+        hasattr(graph, "compile")
+        or any(
+            hasattr(graph, attr)
+            for attr in ("resume", "state_history", "to_mermaid")
+        )
+        # Invocable but not streamable: not a ChatModel, so treat it as a
+        # graph and give the caller the explanatory deferral rather than a
+        # bare TypeError.
+        or (hasattr(graph, "invoke") and not hasattr(graph, "stream"))
     )
-    is_graph = hasattr(graph, "compile") or (
-        hasattr(graph, "invoke") and not is_chat
+
+    # ChatModel duck-shape: `.invoke` + `.stream`. The native `OpenAIChat` /
+    # `AnthropicChat` / `GeminiChat` etc. expose these via PyO3 #[pymethods];
+    # `.name` is a Rust-side getter and not always surfaced through dir(),
+    # so we don't require it here.
+    is_chat = (
+        not is_graph
+        and hasattr(graph, "invoke")
+        and hasattr(graph, "stream")
     )
 
     if is_chat:
