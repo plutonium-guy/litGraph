@@ -44,6 +44,7 @@ members = [
     "crates/litgraph-bench",
     "crates/litgraph-mcp",
     "crates/litgraph-serve",
+    "crates/litgraph-gateway",
     "crates/litgraph-py",
 ]
 
