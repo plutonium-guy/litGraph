@@ -85,7 +85,12 @@ impl TokenBucket {
             Ok(())
         } else {
             let deficit = 1.0 - *tokens;
-            Err((deficit / self.refill_per_ms).ceil() as u64)
+            if self.refill_per_ms == 0.0 {
+                // rpm = 0 means reject everything with a plausible retry hint
+                Err(1000)
+            } else {
+                Err((deficit / self.refill_per_ms).ceil() as u64)
+            }
         }
     }
 }
@@ -97,17 +102,47 @@ pub trait SpendStore: Send + Sync {
     fn spent_today(&self, key_id: &str) -> f64;
 }
 
-#[derive(Debug, Default)]
 pub struct MemorySpendStore {
-    inner: RwLock<HashMap<String, f64>>,
+    clock: Arc<dyn Clock>,
+    // (day_index, usd) per key, where day_index = now_ms / 86_400_000
+    inner: RwLock<HashMap<String, (u64, f64)>>,
+}
+
+impl std::fmt::Debug for MemorySpendStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MemorySpendStore").finish_non_exhaustive()
+    }
+}
+
+impl MemorySpendStore {
+    pub fn new(clock: Arc<dyn Clock>) -> Self {
+        Self { clock, inner: RwLock::new(HashMap::new()) }
+    }
+
+    fn current_day_index(&self) -> u64 {
+        self.clock.now_ms() / 86_400_000
+    }
 }
 
 impl SpendStore for MemorySpendStore {
     fn record(&self, key_id: &str, usd: f64) {
-        *self.inner.write().entry(key_id.to_string()).or_insert(0.0) += usd;
+        let day_idx = self.current_day_index();
+        let mut inner = self.inner.write();
+        let entry = inner.entry(key_id.to_string()).or_insert((day_idx, 0.0));
+        if entry.0 < day_idx {
+            entry.0 = day_idx;
+            entry.1 = 0.0;
+        }
+        entry.1 += usd;
     }
+
     fn spent_today(&self, key_id: &str) -> f64 {
-        self.inner.read().get(key_id).copied().unwrap_or(0.0)
+        let day_idx = self.current_day_index();
+        let inner = self.inner.read();
+        match inner.get(key_id) {
+            Some((stored_day_idx, usd)) if *stored_day_idx == day_idx => *usd,
+            _ => 0.0,
+        }
     }
 }
 
@@ -182,7 +217,7 @@ mod tests {
     #[test]
     fn bucket_allows_burst_then_refuses_until_refill() {
         let clock = Arc::new(TestClock::new());
-        let policy = TenantPolicy::new(clock.clone(), Arc::new(MemorySpendStore::default()));
+        let policy = TenantPolicy::new(clock.clone(), Arc::new(MemorySpendStore::new(clock.clone())));
         let k = key("team-a", Some(60), None);
 
         // 60 rpm => capacity 60, refill 1/sec.
@@ -198,7 +233,7 @@ mod tests {
     #[test]
     fn rate_limits_are_per_key_and_never_shared() {
         let clock = Arc::new(TestClock::new());
-        let policy = TenantPolicy::new(clock.clone(), Arc::new(MemorySpendStore::default()));
+        let policy = TenantPolicy::new(clock.clone(), Arc::new(MemorySpendStore::new(clock.clone())));
         let a = key("team-a", Some(1), None);
         let b = key("team-b", Some(1), None);
 
@@ -211,7 +246,7 @@ mod tests {
     #[test]
     fn no_rpm_configured_means_unlimited() {
         let clock = Arc::new(TestClock::new());
-        let policy = TenantPolicy::new(clock, Arc::new(MemorySpendStore::default()));
+        let policy = TenantPolicy::new(clock.clone(), Arc::new(MemorySpendStore::new(clock)));
         let k = key("team-a", None, None);
         for _ in 0..1_000 {
             assert_eq!(policy.check(&k), PolicyDecision::Allow);
@@ -221,7 +256,7 @@ mod tests {
     #[test]
     fn spend_cap_rejects_only_once_the_ceiling_is_already_crossed() {
         let clock = Arc::new(TestClock::new());
-        let store = Arc::new(MemorySpendStore::default());
+        let store = Arc::new(MemorySpendStore::new(clock.clone()));
         let policy = TenantPolicy::new(clock, store.clone());
         let k = key("team-a", None, Some(1.0));
 
@@ -235,11 +270,105 @@ mod tests {
     #[test]
     fn spend_is_per_key_and_never_bleeds() {
         let clock = Arc::new(TestClock::new());
-        let store = Arc::new(MemorySpendStore::default());
-        let policy = TenantPolicy::new(clock, store.clone());
+        let store = Arc::new(MemorySpendStore::new(clock));
+        let policy = TenantPolicy::new(Arc::new(TestClock::new()), store.clone());
 
         policy.record_spend("team-a", 5.0);
         assert!((store.spent_today("team-a") - 5.0).abs() < 1e-9);
         assert_eq!(store.spent_today("team-b"), 0.0);
+    }
+
+    #[test]
+    fn spend_recorded_on_day_n_is_visible_on_day_n() {
+        let clock = Arc::new(TestClock::new());
+        let store = Arc::new(MemorySpendStore::new(clock.clone()));
+
+        // Start at day 0
+        store.record("team-a", 2.5);
+        assert!((store.spent_today("team-a") - 2.5).abs() < 1e-9);
+
+        // Record more on same day
+        store.record("team-a", 1.5);
+        assert!((store.spent_today("team-a") - 4.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn advancing_clock_past_day_boundary_resets_spent_today() {
+        let clock = Arc::new(TestClock::new());
+        let store = Arc::new(MemorySpendStore::new(clock.clone()));
+
+        // Day 0
+        store.record("team-a", 5.0);
+        assert!((store.spent_today("team-a") - 5.0).abs() < 1e-9);
+
+        // Advance to day 1 (86_400_000 ms per day)
+        clock.advance_ms(86_400_000);
+        assert_eq!(store.spent_today("team-a"), 0.0, "spend should reset on new day");
+    }
+
+    #[test]
+    fn budget_exhausted_becomes_allow_after_rollover() {
+        let clock = Arc::new(TestClock::new());
+        let store = Arc::new(MemorySpendStore::new(clock.clone()));
+        let policy = TenantPolicy::new(clock.clone(), store.clone());
+        let k = key("team-a", None, Some(1.0));
+
+        // Day 0: exhaust budget
+        assert_eq!(policy.check(&k), PolicyDecision::Allow);
+        policy.record_spend("team-a", 1.50);
+        assert!(matches!(policy.check(&k), PolicyDecision::BudgetExhausted { .. }));
+
+        // Day 1: budget resets
+        clock.advance_ms(86_400_000);
+        assert_eq!(policy.check(&k), PolicyDecision::Allow, "should allow after day rollover");
+    }
+
+    #[test]
+    fn rollover_is_per_key() {
+        let clock = Arc::new(TestClock::new());
+        let store = Arc::new(MemorySpendStore::new(clock.clone()));
+
+        // Day 0: record for both keys
+        store.record("team-a", 5.0);
+        store.record("team-b", 3.0);
+        assert!((store.spent_today("team-a") - 5.0).abs() < 1e-9);
+        assert!((store.spent_today("team-b") - 3.0).abs() < 1e-9);
+
+        // Day 1: advance clock
+        clock.advance_ms(86_400_000);
+
+        // Both should reset independently
+        assert_eq!(store.spent_today("team-a"), 0.0);
+        assert_eq!(store.spent_today("team-b"), 0.0);
+
+        // Record only for team-b
+        store.record("team-b", 2.0);
+        assert_eq!(store.spent_today("team-a"), 0.0, "team-a should still be 0");
+        assert!((store.spent_today("team-b") - 2.0).abs() < 1e-9, "team-b should have 2.0");
+    }
+
+    #[test]
+    fn rpm_zero_rejects_everything() {
+        let clock = Arc::new(TestClock::new());
+        let policy = TenantPolicy::new(clock, Arc::new(MemorySpendStore::new(Arc::new(TestClock::new()))));
+        let k = key("team-a", Some(0), None);
+
+        // First request should be rejected
+        assert!(matches!(policy.check(&k), PolicyDecision::RateLimited { .. }));
+        // Every request should be rejected
+        assert!(matches!(policy.check(&k), PolicyDecision::RateLimited { .. }));
+    }
+
+    #[test]
+    fn rpm_zero_retry_after_is_plausible() {
+        let clock = Arc::new(TestClock::new());
+        let policy = TenantPolicy::new(clock, Arc::new(MemorySpendStore::new(Arc::new(TestClock::new()))));
+        let k = key("team-a", Some(0), None);
+
+        if let PolicyDecision::RateLimited { retry_after_ms } = policy.check(&k) {
+            assert!(retry_after_ms > 0 && retry_after_ms < 10_000, "retry_after_ms should be plausible, not u64::MAX");
+        } else {
+            panic!("expected RateLimited");
+        }
     }
 }
