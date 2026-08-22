@@ -4,16 +4,17 @@ Tag-driven. CI does the rest.
 
 ## What gets released
 
-A litGraph release ships **two PyPI packages**:
+A litGraph release ships the native **`litgraph`** package through the checked-in
+workflow. `litgraph-stubs` is maintained separately and is not currently
+published by a workflow in this repository.
 
 | Package          | Source                | Built by                                |
 | ---------------- | --------------------- | --------------------------------------- |
-| `litgraph`       | `crates/litgraph-py`  | `.github/workflows/CI.yml`              |
-| `litgraph-stubs` | `litgraph-stubs/`     | `.github/workflows/release-stubs.yml`   |
+| `litgraph` | `crates/litgraph-py` | `.github/workflows/workflow.yml` |
 
-Both publish to PyPI via [trusted publishing](https://docs.pypi.org/trusted-publishers/).
-Set up the publisher entries on PyPI (one per package) before the first
-release — workflow + repo are configured for `id-token: write`.
+It publishes to PyPI via [trusted publishing](https://docs.pypi.org/trusted-publishers/).
+The PyPI publisher binding must remain aligned with the workflow environment
+and repository; the workflow is configured for `id-token: write`.
 
 ## Pre-tag checklist
 
@@ -38,11 +39,10 @@ git tag vX.Y.Z
 git push origin vX.Y.Z
 ```
 
-This triggers:
-- `CI.yml` — builds wheels for Linux (x86_64, x86, aarch64, armv7, s390x,
-  ppc64le), musllinux (4 targets), Windows, macOS, sdist; signs them with
-  build provenance; publishes to PyPI as `litgraph`.
-- `release-stubs.yml` — builds + publishes `litgraph-stubs`.
+This triggers `.github/workflows/workflow.yml`, which builds manylinux wheels
+for x86_64 and aarch64, musllinux x86_64, Windows x64, macOS aarch64, and an
+sdist; generates build provenance; and publishes `litgraph` to PyPI. A manual
+workflow dispatch builds inspectable artifacts but does not publish.
 
 ## SemVer policy
 

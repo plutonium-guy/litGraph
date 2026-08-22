@@ -1,6 +1,6 @@
 # Missing & Nice-to-have Features
 
-Snapshot: 2026-08-07. For full long-form prioritisation,
+Snapshot: 2026-08-22. For full long-form prioritisation,
 see `ROADMAP.md`. This file is the short, actionable view: each item
 is either *missing* (a real gap) or *nice-to-have* (would help, not
 load-bearing).
@@ -24,9 +24,10 @@ work with `iter N` in the commit log.
   reproducibility and step-by-step debug strictly defined.
 
 ### Local / on-device models
-- Local chat model via `candle` or `mistral.rs`. Cuts the OpenAI
-  dependency for local dev + privacy-sensitive workloads. Adds a
-  `LocalChatModel` adapter with the same `ChatModel` trait.
+- Production engine wiring for the existing `MistralRsChat` /
+  `ModelBackend` scaffold. Ollama, vLLM, and other local
+  OpenAI-compatible servers already work through `OpenAIChat` and
+  `litgraph-gateway`; the missing part is true in-process inference.
 - Local embedding model parity for FastEmbed (already shipped) +
   GGUF/llama.cpp option for users who want a single binary.
 
@@ -53,6 +54,9 @@ work with `iter N` in the commit log.
 ### Serve
 - Multi-tenant auth scaffolding (`X-Forwarded-User`, JWT validator,
   per-thread ACL). Today the serve binary is single-tenant.
+- Gateway v1 intentionally has no embeddings proxy, persistent spend ledger,
+  admin API, or latency-aware routing; it covers Chat Completions, virtual
+  keys, budgets, weighted dispatch, failover, and SSE.
 
 ### Python ergonomics
 - `pyo3-stub-gen` auto-generated `.pyi` to replace hand-rolled
@@ -92,10 +96,10 @@ work with `iter N` in the commit log.
   flag in `litgraph-serve` covers the cloud API surface only).
 
 ### Docs
-- A "migrate from LangChain" guide with side-by-side translations
-  for the top 20 LangChain idioms.
-- Per-crate README pointing at the canonical example for that
-  subsystem.
+- ✅ `MIGRATION_LANGCHAIN.md` provides side-by-side translations for the
+  common LangChain and LangGraph idioms.
+- Per-crate READMEs remain incomplete. `litgraph-gateway` has a canonical
+  quickstart; most adapter crates still point to workspace-level docs.
 
 ### Performance
 - A criterion compare bot in CI that flags >5% regression on a

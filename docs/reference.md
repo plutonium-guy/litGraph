@@ -23,6 +23,7 @@ This site explains the main development paths. The repository documents are the 
 | [MIGRATION_LANGCHAIN](https://github.com/plutonium-guy/litGraph/blob/main/MIGRATION_LANGCHAIN.md) | Migration patterns and compatibility helpers. |
 | [FREE_THREADING](https://github.com/plutonium-guy/litGraph/blob/main/FREE_THREADING.md) | Python free-threading audit and constraints. |
 | [INTEGRATION_TESTS](https://github.com/plutonium-guy/litGraph/blob/main/INTEGRATION_TESTS.md) | Live backend test setup and credential requirements. |
+| [Gateway README](https://github.com/plutonium-guy/litGraph/blob/main/crates/litgraph-gateway/README.md) | Virtual keys, Ollama configuration, routing policy, streaming, and benchmarks. |
 
 ## Python surfaces
 
@@ -61,6 +62,7 @@ Modules ending in `_extras` contain adapters backed by optional Python packages.
 | Checkpoint backends | `crates/litgraph-checkpoint-*` |
 | Observability and cache | `crates/litgraph-observability`, `crates/litgraph-cache` |
 | Python bindings | `crates/litgraph-py` |
+| OpenAI-compatible LLM gateway | `crates/litgraph-gateway` |
 | Benchmarks | `crates/litgraph-bench` |
 
 Trait definitions live under `crates/litgraph-core/src`, streaming events in `model.rs`, graph execution under `crates/litgraph-graph/src`, and PyO3 wrappers under `crates/litgraph-py/src`.

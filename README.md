@@ -4,12 +4,12 @@
 
 Hot paths (HTTP, SSE parsing, tokenization, vector math, graph scheduling, JSON repair, RRF, MMR) live in Rust. Python is a thin shim that drops the GIL around every blocking call. Result: shallow stacks, true parallelism, no class-zoo, no 200+ transitive dependencies.
 
-[![status](https://img.shields.io/badge/iter-332-blue)](#)
+[![release](https://img.shields.io/badge/release-v0.1.2-blue)](https://pypi.org/project/litgraph/)
 [![license](https://img.shields.io/badge/license-Apache--2.0-green)](LICENSE)
 [![rust](https://img.shields.io/badge/rust-1.75%2B-orange)](Cargo.toml)
 [![python](https://img.shields.io/badge/python-3.9%2B-blue)](pyproject.toml)
-[![tests](https://img.shields.io/badge/rust%20tests-2536%20passing-brightgreen)](#)
-[![tests](https://img.shields.io/badge/python%20tests-1222%20passing-brightgreen)](#)
+[![tests](https://img.shields.io/badge/rust%20tests-2700%2B-brightgreen)](#)
+[![tests](https://img.shields.io/badge/python%20tests-1480%20passing-brightgreen)](#)
 
 **[Read the documentation →](https://plutonium-guy.github.io/litGraph/)**
 
@@ -54,6 +54,7 @@ Hot paths (HTTP, SSE parsing, tokenization, vector math, graph scheduling, JSON 
    - [Evaluation harness](#evaluation-harness)
    - [MCP client + server](#mcp-client--server)
    - [HTTP serve](#http-serve)
+   - [OpenAI-compatible gateway](#openai-compatible-gateway)
 6. [Workspace layout](#workspace-layout)
 7. [Provider / store / loader matrix](#supported-providers-stores-loaders)
 8. [Design principles](#design-principles)
@@ -106,7 +107,13 @@ Numbers will drift; the shape is the point — every primitive is a Rust call, n
 
 ## Install
 
-Wheels for PyPI are pending v1. For now: build from source.
+Install the published abi3 wheel:
+
+```bash
+pip install litgraph
+```
+
+For source development:
 
 ```bash
 # Prereqs (one-time):
@@ -520,6 +527,31 @@ cargo run -p litgraph-serve --release -- --graph my.app:graph --port 8080
 
 The Studio debug router (Cargo feature `studio`) adds `/runs`, `/threads`, `/checkpoints/<id>` endpoints used by the LangGraph Studio UI.
 
+### OpenAI-compatible gateway
+
+`litgraph-gateway` fronts OpenAI-compatible deployments with virtual keys,
+model-group authorization, request and daily-spend limits, weighted routing,
+circuit-breaker failover, and streaming SSE relay. Ollama needs no upstream
+credential:
+
+```toml
+# gateway.toml
+[[deployment]]
+id = "local"
+group = "chat"
+provider = "ollama"
+base_url = "http://localhost:11434/v1"
+model = "qwen3:latest"
+```
+
+```bash
+cargo run -p litgraph-gateway -- keygen --id local --group chat
+cargo run -p litgraph-gateway -- serve --config gateway.toml
+```
+
+Point any OpenAI SDK at `http://localhost:8080/v1` and use the generated
+virtual key. See the [gateway guide](crates/litgraph-gateway/README.md).
+
 ---
 
 ## Workspace layout
@@ -574,11 +606,12 @@ crates/
 │
 ├── litgraph-mcp                   MCP client + server (stdio + HTTP/SSE)
 ├── litgraph-serve                 axum-based REST + SSE server (LangGraph-cloud-compat)
+├── litgraph-gateway               OpenAI-compatible multi-tenant LLM gateway
 ├── litgraph-bench                 criterion micro-benches
 └── litgraph-py                    PyO3 bindings (abi3-py39, shared tokio runtime)
 ```
 
-43 crates total; default-features stay tight, you opt in.
+45 crates total; default-features stay tight, you opt in.
 
 ---
 
@@ -652,7 +685,7 @@ The graph executor honours LangGraph's super-step semantics: parallel branches i
 ## FAQ
 
 **Is this production-ready?**
-Used internally for high-traffic agent stacks. The Rust core has 2,500+ unit tests, the Python shim has 1,200+ pytest cases, all passing. Wheels are not yet on PyPI — `maturin develop` from source for now.
+Used internally for high-traffic agent stacks. The workspace has 2,700+ Rust tests, and the latest offline Python run passed 1,480 tests with 142 live-service cases skipped. The abi3 wheel is published on PyPI as `litgraph`.
 
 **How does it compare with LangChain on speed?**
 On graph orchestration (the headline number): ~1.3 µs/node Kahn scheduling vs LangGraph's ~120 µs/node Python orchestration. Per-call overhead in chat invocation is dominated by the model itself; litGraph removes ~3-5 ms of Python-side glue per call.
@@ -670,7 +703,7 @@ The callback bus + `on_request` hook + `before_node`/`after_node` graph events c
 Supported. `py.detach()` is called around every blocking section, so a no-GIL Python build can use the full tokio runtime for free. See [FREE_THREADING.md](FREE_THREADING.md).
 
 **What's missing?**
-See [MISSING_FEATURES.md](MISSING_FEATURES.md) for the short, actionable list. Headline gaps: `before_tool` / `after_tool` middleware hooks, local chat-model adapter via `candle`, WebSocket endpoint on `litgraph-serve`, vector-indexed search on more `Store` backends, auto-generated stubs via `pyo3-stub-gen`.
+See [MISSING_FEATURES.md](MISSING_FEATURES.md) for the short, actionable list. Headline gaps are true in-process local-model engine wiring, automatic stub generation, multi-tenant ACLs for graph serving, and live coverage for credential- or service-gated integrations.
 
 ---
 
@@ -690,7 +723,10 @@ m = ollama_chat("llama3.2", base_url="http://10.0.0.5:11434/v1")
 
 Local embeddings via `litgraph-embeddings-fastembed` (FastEmbed ONNX, no network) and reranking via `litgraph-rerankers-fastembed`.
 
-Roadmap item: a first-class `LocalChatModel` adapter on `candle` / `mistral.rs` so you don't even need the local HTTP server. See [MISSING_FEATURES.md](MISSING_FEATURES.md).
+`MistralRsChat` provides the in-process adapter and pluggable backend surface,
+but a production `mistralrs::Engine` backend is still deferred. For current
+local deployments, Ollama or another OpenAI-compatible server is the supported
+end-to-end path. See [MISSING_FEATURES.md](MISSING_FEATURES.md).
 
 ---
 

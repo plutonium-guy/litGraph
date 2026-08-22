@@ -1,6 +1,6 @@
 # What's left in litGraph — single-pane view
 
-**Snapshot:** 2026-08-07 · implementation audit against the current tree.
+**Snapshot:** 2026-08-22 · implementation audit against the current tree.
 
 Items marked shipped below were verified in code during this pass. The
 remaining provider-key and service-gated rows are validation work, not local
@@ -19,8 +19,8 @@ linked sources for prioritisation rationale.
 
 ## TL;DR — five buckets
 
-1. **Live-test blockers** — tests we can't run today against DeepSeek
-   alone (6 cases). All have documented reasons.
+1. **Live-test blockers** — generic OpenAI-compatible tests run locally with
+   Ollama; only protocol-specific or external-service tests remain gated.
 2. **Provider-key gated** — exists in code, can't run without that
    provider's API credential.
 3. **Service-gated** — exists in code, needs a running DB / vector
@@ -33,13 +33,14 @@ linked sources for prioritisation rationale.
 
 ## 1. Live-test blockers
 
-All against DeepSeek; documented in `INTEGRATION_TESTS.md` → Blocked.
+The formerly DeepSeek-blocked cases now run against Ollama; see
+`INTEGRATION_TESTS.md` for the endpoint and capability flags.
 
 | Skip | Root cause | Unblocks when… |
 |---|---|---|
-| `LlmJudge` (2 cases) | ✅ Code-unblocked: `StructuredChatModel` retries explicit unsupported-schema errors with `json_object`, injects the JSON Schema into the system prompt, and still post-validates JSON. | Run live when `DEEPSEEK_API_KEY` is available. |
-| `synthesize_eval_cases` (2 cases) | ✅ Code-unblocked by the same structured-output fallback. | Run live when `DEEPSEEK_API_KEY` is available. |
-| `BigToolAgent` (1 case) | Requires an embeddings provider to score the tool catalogue; DeepSeek has none. | Provide an OpenAI/Cohere/Voyage/Jina/FastEmbed key + provider. |
+| `LlmJudge` (2 cases) | ✅ Live-tested with Ollama schema mode. | Set `LITGRAPH_TEST_BASE_URL` and `LITGRAPH_TEST_MODEL`. |
+| `synthesize_eval_cases` (2 cases) | ✅ Live-tested with Ollama schema mode. | Same Ollama configuration. |
+| `BigToolAgent` (1 case) | ✅ Live-tested with Ollama plus `nomic-embed-text-v2-moe`. | Set `LITGRAPH_TEST_EMBED_MODEL`. |
 | `NamespacedMemory` (1 case) | ✅ Unblocked: append-only native memories now use a shared, thread-safe per-namespace sidecar while still writing through to the native backend. | Covered offline against native `BufferMemory`; live external backends remain service-gated. |
 
 ---
@@ -133,8 +134,8 @@ deferred — see row above. Item 10 partially closed iter 377
   backends
 
 #### Eval & reproducibility
-- ❌ **Eval-suite live smoke test** — would call the model
-  recursively; covered today by mock unit tests only
+- ✅ **Eval-suite live smoke test** — `LlmJudge` and synthetic eval generation
+  passed against Ollama schema mode on 2026-08-22
 - ❌ **Trajectory replay CLI** — take an OTel trace ID and replay the
   exact prompt against a chosen model
 
@@ -194,7 +195,8 @@ deferred — see row above. Item 10 partially closed iter 377
   embeddings/vector stores, RAG, tool-calling agents, agent events,
   memory, StateGraph, parallel fan-out, conditional edges,
   interrupts, checkpointers, time travel, HTTP serve)
-- ❌ Per-crate README pointing at canonical example
+- 🟡 Per-crate READMEs: `litgraph-gateway` now has a canonical quickstart;
+  the remaining adapter crates still rely on workspace-level guides
 
 ### Performance / build
 

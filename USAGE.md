@@ -30,13 +30,17 @@ is the only crate that imports `pyo3`.
 16. [Evaluation harness](#eval)
 17. [MCP client + server](#mcp)
 18. [HTTP serve (`litgraph-serve`)](#serve)
+19. [LLM gateway (`litgraph-gateway`)](#gateway)
 
 ---
 
 ## <a id="install"></a>1. Install
 
 ```bash
-# Python (dev install from source — needs Rust toolchain + maturin):
+# Python release wheel:
+pip install litgraph
+
+# Development install from source — needs Rust toolchain + maturin:
 pip install maturin
 maturin develop --release
 
@@ -48,8 +52,6 @@ pip install ./litgraph-stubs
 litgraph-core = { path = "crates/litgraph-core" }
 litgraph-providers-openai = { path = "crates/litgraph-providers-openai" }
 ```
-
-PyPI wheels: pending v1 release.
 
 Required env when calling providers: `OPENAI_API_KEY`,
 `ANTHROPIC_API_KEY`, `GOOGLE_API_KEY`, `COHERE_API_KEY`, `JINA_API_KEY`,
@@ -462,6 +464,29 @@ and `/checkpoints/<id>` endpoints used by the LangGraph Studio UI.
 
 ---
 
+## <a id="gateway"></a>19. LLM gateway
+
+`litgraph-gateway` exposes OpenAI Chat Completions while applying virtual-key
+authorization, model-group allowlists, per-tenant rate and spend limits,
+weighted deployment selection, circuit-breaker failover, and SSE relay.
+
+```bash
+# Emits a plaintext virtual key plus the TOML stanza containing its Argon2id hash.
+cargo run -p litgraph-gateway -- keygen --id local --group local-chat
+
+# After adding that stanza and a [[deployment]] entry to gateway.toml:
+cargo run -p litgraph-gateway -- serve --config gateway.toml --bind 127.0.0.1:8080
+```
+
+For a local Ollama deployment, set `provider = "ollama"`,
+`base_url = "http://127.0.0.1:11434/v1"`, and the physical `model`; no
+upstream API-key environment variable is required. Clients request the
+deployment `group` as their model and use the generated virtual key. See
+`crates/litgraph-gateway/README.md` for a complete configuration and the
+streaming/failover contract.
+
+---
+
 ## Where to look in the source
 
 | Concern | File / crate |
@@ -474,6 +499,7 @@ and `/checkpoints/<id>` endpoints used by the LangGraph Studio UI.
 | Provider HTTP | `crates/litgraph-providers-*/src/lib.rs` |
 | Vector store impls | `crates/litgraph-stores-*/src/lib.rs` |
 | PyO3 bindings | `crates/litgraph-py/src/*.rs` |
+| LLM gateway | `crates/litgraph-gateway/src/*.rs` |
 | Python wrappers | `python/litgraph/**/*.py` |
 | Examples | `examples/*.py` |
 | Per-feature tests | `python_tests/test_*.py` (one file per surface) |

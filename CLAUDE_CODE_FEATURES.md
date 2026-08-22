@@ -4,7 +4,7 @@ Features distilled from **LangChain** + **LangGraph** that matter for an LLM
 assistant (Claude Code) to ship a production-ready agent **without writing
 framework plumbing**. Each row marks status in `litGraph`.
 
-Audit date: 2026-04-29 · Source of truth: `crates/litgraph-py/src/*.rs`,
+Audit date: 2026-08-22 · Source of truth: `crates/litgraph-py/src/*.rs`,
 `python_tests/*.py`, `FEATURES.md`.
 
 Tracks LangChain **1.0** (Sep 2025 rewrite) + LangGraph **1.1** (2026) feature
@@ -33,7 +33,8 @@ long-term Store. Older (v0.3) features rolled in from prior audit.
 | AWS Bedrock (native + Converse) | Enterprise/SOC2 deployments | ✅ |
 | Cohere Command | Alt frontier model | ✅ |
 | OpenAI-compat (Ollama, Groq, Together, Mistral, DeepSeek, xAI, Fireworks) | Cheap/local fallback | ✅ |
-| Local inference (llama.cpp/candle) | Air-gapped agents | ❌ candle/mistral.rs |
+| Local inference (llama.cpp/candle) | Air-gapped agents | 🟡 `MistralRsChat` backend scaffold; production in-process engine deferred; Ollama works via OpenAI compatibility |
+| OpenAI-compatible LLM gateway | Central virtual keys, budgets, routing, and failover | ✅ `litgraph-gateway`, including credential-free Ollama dispatch |
 | SSE streaming | Token-stream UX | ✅ async iterator |
 | Native tool/function calling | Agents need it | ✅ per provider |
 | Structured output (JSON schema) | Typed agent results | ✅ `StructuredChatModel` + schemars |
@@ -533,17 +534,22 @@ Distinct from short-term checkpointer — JSON document store keyed by
 Top gaps to close, ranked by user-impact for a no-code-glue path:
 
 1. ✅ **Long-term memory `Store`** — core trait + `InMemoryStore` + `PostgresStore` shipped; `SemanticStore` (iter 185) adds Rayon-parallel cosine semantic-search recall on top of any `Store`.
-2. 🟡 **Middleware chain primitive** — `before/after_model` chain shipped (`litgraph.middleware`, 7 Py + 6 Rust tests). Built-ins: Logging, MessageWindow, SystemPrompt. `before/after_tool` hooks + tool-result offload still pending.
+2. ✅ **Middleware chain primitive** — model middleware plus native
+   `before_tool` / `after_tool` hooks, Python `HookedTool`, tool budgets, and
+   offloading are shipped.
 3. ✅ **Deep Agents harness** — `PlanningTool` + `VirtualFilesystemTool` + `load_agents_md` + `load_skills_dir` + `SystemPromptBuilder` + `SubagentTool` + one-call `litgraph.deep_agent.create_deep_agent(...)` factory all shipped (43 Rust + 41 Py tests across the seven).
 4. 🟡 **Functional API** (`@entrypoint` + `@task`) — pure-Python v1 shipped iter 317 (decorators + `Workflow` class with invoke/ainvoke/astream); maturin mixed-layout via `python-source = "python"`. Full StateGraph runtime integration (checkpointable per-task graph nodes) remains roadmap work.
 5. ✅ **Pydantic-coerced state in Python** (iter 318) — `coerce_one` + `coerce_stream` pure-Python helpers; supports Pydantic v1/v2 BaseModel + dataclass + TypedDict; pydantic is optional dep.
 6. 🟡 **`pyo3-stub-gen` auto-stubs** — drift checker shipped iter 320 (`tools/check_stubs.py`, CI-runnable, 16 tests). Full pyo3-stub-gen integration (auto-generates .pyi from `#[gen_stub_pyfunction]` macros in Rust source) still on roadmap.
 7. ✅ **fastembed-rs local embeddings** — `litgraph-embeddings-fastembed::FastembedEmbeddings` ships ONNX-backed local embeddings; default `bge-small-en-v1.5`, all fastembed models selectable.
-8. ❌ **candle / mistral.rs local chat** — full offline agent.
+8. 🟡 **candle / mistral.rs local chat** — `MistralRsChat` and the pluggable
+   backend scaffold ship; production in-process engine wiring is deferred.
 9. ✅ **LangServe-style HTTP serve crate** — `litgraph-serve::serve_chat(model, addr)` ships REST + SSE in one call. (CLI wrapper still pending.)
 10. ✅ **Graph visualizer (Mermaid)** — `to_mermaid()` + `to_ascii()` on StateGraph + CompiledGraph (8 Rust + 9 Py tests). PNG render still pending (out-of-process via `mmdc` or `kroki`).
 11. ✅ **Eval coverage** — trajectory evaluator, `PairwiseEvaluator`, and `synthesize_eval_cases` shipped. Eval suite covers golden-set runs, trajectory grading, A/B judging, and seed-based dataset synthesis.
 12. 🟡 **Discord/YouTube loaders** — long-tail integrations remaining. (Redis chat history shipped iter 164. arXiv + Wikipedia loaders shipped iter 165. PubMed loader shipped iter 166.)
+13. ✅ **OpenAI-compatible gateway** — virtual keys, model-group policy,
+    tenant budgets/rate limits, weighted failover, SSE, and Ollama dispatch.
 
 ## Quick prod-ready agent recipe (uv, no venv)
 

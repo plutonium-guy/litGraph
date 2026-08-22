@@ -8,10 +8,11 @@ This is a *living* doc — picked up at the start of each iteration to
 choose the next ship target. Numbered items below get crossed off as
 they land in `git log` (look for `iter N`).
 
-Snapshot date: 2026-04-29 · last shipped: iter 180 (Studio debug
-router for `litgraph-serve`, feature-gated). Tracker of *what's done*
-lives in `FEATURES.md` and `CLAUDE_CODE_FEATURES.md`; this doc is
-*what's next*.
+Snapshot date: 2026-08-22. The original Tier 1 list is now largely shipped;
+remaining work and intentional deferrals are called out inline. The current
+standalone edge-service addition is `litgraph-gateway`, with OpenAI-compatible
+dispatch, tenant policy, budgets, failover, and Ollama support. Trackers of
+*what's done* live in `FEATURES.md` and `CLAUDE_CODE_FEATURES.md`.
 
 ---
 
@@ -22,8 +23,8 @@ lives in `FEATURES.md` and `CLAUDE_CODE_FEATURES.md`; this doc is
    scheduling, RRF, MMR) are Rust. Python is `#[pyfunction]` and
    `extract_chat_model`.
 2. **Parallelism is a first-class feature.** Tokio for I/O fan-out;
-   Rayon for CPU-bound batching; `py.allow_threads` (PyO3 0.22+ →
-   `py.detach`) around every blocking call so the GIL is dropped.
+   Rayon for CPU-bound batching; `py.detach` around every blocking call so
+   the interpreter is released.
 3. **No bloat.** Each capability is its own crate behind a feature
    flag. Default features stay tight; users opt in.
 4. **Graph-first, no Runnable cathedral.** A `StateGraph` + a few
@@ -68,11 +69,9 @@ Total = sum. Anything ≥18 is fair game for the next ten iters.
   `EnsembleRetriever` runs sequentially under the GIL.
 - **Effort:** 1 iter. New file `ensemble.rs`, ~150 LOC + tests.
 
-### 2. `before_tool` / `after_tool` middleware hooks
-- **Status:** 🟡. `before/after_model` exists. Tool wrappers
-  (`RetryTool`, `TimeoutTool`, `OffloadingTool`) cover
-  point use-cases, but a generic chain over the agent loop's tool
-  invocations is still missing.
+### 2. `before_tool` / `after_tool` middleware hooks ✅ shipped
+- **Status:** ✅. Native hooks shipped across the agent loop in iters 348–350;
+  the Python middleware adapter followed in iter 376.
 - **What:** Extend `MiddlewareChain` to intercept the tool-execution
   branch of `ReactAgent` / `SupervisorAgent`. Same trait shape as
   the model hooks.
@@ -90,13 +89,12 @@ Total = sum. Anything ≥18 is fair game for the next ten iters.
 - **Remaining:** pgvector-backed indexed search on `PostgresStore`
   for the >10k items/namespace tier.
 
-### 4. Postgres `Store` already shipped → wire vector index
-- **Status:** ✅ structurally, 🟡 functionally. `PostgresStore`
-  exists. Adding a `pgvector` column for the `value` JSON's optional
-  embedding completes #3 for distributed deployments.
+### 4. Postgres `Store` vector index ✅ shipped
+- **Status:** ✅. Distributed pgvector-backed semantic search is wired into
+  `PostgresStore`; the in-memory `SemanticStore` remains the small-data tier.
 
-### 5. Functional API: `@entrypoint` + `@task` (Python)
-- **Status:** ❌.
+### 5. Functional API: `@entrypoint` + `@task` (Python) ✅ shipped iter 317
+- **Status:** ✅.
 - **What:** Decorator-based alternative to `StateGraph` for simple
   workflows. `@entrypoint` marks the root, `@task` marks a
   sub-routine; the runtime auto-builds the graph.
@@ -106,8 +104,9 @@ Total = sum. Anything ≥18 is fair game for the next ten iters.
   Python-side ergonomics layer.
 - **Effort:** 1 iter (py-only).
 
-### 6. `pyo3-stub-gen` auto-generated `.pyi`
-- **Status:** 🟡. Hand-written stubs in `litgraph-stubs/` drift.
+### 6. `pyo3-stub-gen` auto-generated `.pyi` 🚫 intentionally deferred
+- **Status:** 🚫. Hand-written stubs remain canonical and
+  `python tools/check_stubs.py` enforces native/stub surface alignment.
 - **What:** Wire `pyo3-stub-gen` so stubs regenerate on every
   `maturin build`.
 - **Why:** Pyright import warnings hurt agent-authored code (and
@@ -115,8 +114,9 @@ Total = sum. Anything ≥18 is fair game for the next ten iters.
   `litgraph`).
 - **Effort:** 1 iter.
 
-### 7. Pydantic-coerced state + StreamPart on Python side
-- **Status:** ❌.
+### 7. Pydantic-coerced state + StreamPart on Python side ✅ shipped
+- **Status:** ✅. Typed coercion and stream adapters shipped across iters
+  318, 378, and 379.
 - **What:** `litgraph.StateModel` (Pydantic v2 base) so the Python
   state dict gets validated/typed; `StreamPart` discriminated
   union for stream events.
@@ -165,9 +165,8 @@ Total = sum. Anything ≥18 is fair game for the next ten iters.
 - WhatsApp / Telegram **history** loaders (Telegram is push-only;
   no usable history. WhatsApp Business API is feasible but
   paperwork-heavy.)
-- WebSocket streaming endpoint on `litgraph-serve` (today: SSE
-  covers 95% of use-cases; WS is a nice-to-have for back-channel
-  cancellation).
+- WebSocket streaming endpoint on `litgraph-serve` is shipped behind the
+  `ws` feature; remaining serve work is multi-tenant identity enforcement.
 - Video-in modality — needs provider-side support, not framework
   work.
 - Sentence/NLTK/SpaCy splitters — recursive char + token splitter
@@ -368,9 +367,9 @@ Findings worth keeping around as we plan future iters.
   decoding. `candle` is closer to the metal but every project ends
   up rebuilding the same engine. Pick `mistralrs` unless we hit a
   licensing wall.
-- **pyo3-stub-gen** — works on PyO3 0.22 (we're on 0.28). Need to
-  verify compatibility before adopting; otherwise the manual
-  `litgraph-stubs/*.pyi` flow stays.
+- **pyo3-stub-gen** — PyO3 is 0.22, but adoption would still require
+  redecorating the binding surface and adding a generation build. The manual
+  `litgraph-stubs/*.pyi` flow plus drift checker remains the deliberate choice.
 - **Webhook-resume design** — should re-use `Command::resume(value)`
   and `Command::goto(node)` so we don't invent a third execution
   control surface.

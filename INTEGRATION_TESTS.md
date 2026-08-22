@@ -29,6 +29,12 @@ Qwen3 is a reasoning model and would spend this suite's small
 `max_tokens` budget on hidden reasoning, so the run used a derived
 model whose template hardcodes the no-think branch.
 
+**Targeted revalidation:** 2026-08-22 · the five formerly blocked live cases
+(`LlmJudge`, synthetic eval generation, and `BigToolAgent`) passed against
+Ollama. Separately, three official OpenAI Python SDK compatibility cases passed
+through `litgraph-gateway` to Ollama, covering models, non-streaming chat, and
+streaming chat.
+
 ---
 
 ## Run
@@ -144,7 +150,9 @@ entry below.
 
 ## Blocked / not tested ❌
 
-Features deliberately not exercised against DeepSeek. Reason in each row.
+Features not covered by the generic Ollama run or requiring a provider-specific
+protocol/service. Historical DeepSeek limitations are retained where they
+explain capability gates.
 
 | Feature | Why not tested |
 |---|---|
@@ -160,6 +168,7 @@ Features deliberately not exercised against DeepSeek. Reason in each row.
 | **Postgres / SQLite checkpointers live** | Same — needs a DB; covered by mock-state unit tests. |
 | **MCP server live** | Needs an MCP server endpoint; tested with the in-process fake server in `python_tests/test_mcp_*.py`. |
 | **`litgraph-serve` HTTP** | ~~Blocked~~ — now tested. `recipes.serve(model)` spawns the axum server in-process; `test_recipes_serve_stub.py` hits `/health` + `/info` on it and shuts it down. |
+| **`litgraph-gateway` OpenAI SDK wire compatibility** | ✅ Covered separately by `python_tests/gateway/test_openai_sdk_compat.py`; 3 cases passed against gateway → Ollama on 2026-08-22. |
 | **Free-threaded Python 3.13t** | Build matrix, not a per-call thing. Tested by running the full suite on 3.13t in CI. |
 | **Vision / multimodal** | DeepSeek-VL is a separate model + endpoint shape; current tests use `deepseek-chat` only. |
 | **Evaluator `LlmJudge` live** | ~~Blocked on DeepSeek~~ — now tested. Needs `response_format=json_schema`, which DeepSeek rejects but Ollama / vLLM / OpenAI / LM Studio support. Gated on `_capabilities.SUPPORTS_JSON_SCHEMA`. |

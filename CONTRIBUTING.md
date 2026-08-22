@@ -25,7 +25,7 @@ override it for cargo: `VIRTUAL_ENV=/path/to/.venv PYO3_PYTHON=/path/to/.venv/bi
 
 - **Read [ARCHITECTURE.md](./ARCHITECTURE.md) first.** The five
   non-negotiables (no PyO3 outside `litgraph-py`, GIL released on every Rust
-  call, one shared tokio runtime, bincode for checkpoints, zero default
+  call, one shared tokio runtime, MessagePack for checkpoints, zero default
   features) catch nearly every "this won't work" PR.
 - **Workspace deps live in the root `Cargo.toml`.** Add new shared deps under
   `[workspace.dependencies]`, then reference with `dep.workspace = true` in
@@ -44,6 +44,8 @@ override it for cargo: `VIRTUAL_ENV=/path/to/.venv PYO3_PYTHON=/path/to/.venv/bi
       just compiles).
 - [ ] If you added a feature flag or env var: documented in README or
       ARCHITECTURE.
+- [ ] If you touched `litgraph-gateway`: its unit and real-HTTP tests pass;
+      protocol changes include an OpenAI SDK compatibility case where relevant.
 - [ ] No new dependencies without a one-line justification in the PR
       description (we ship slim).
 
@@ -68,6 +70,15 @@ override it for cargo: `VIRTUAL_ENV=/path/to/.venv PYO3_PYTHON=/path/to/.venv/bi
    `tokio::task::spawn_blocking`.
 3. Add a `PyXxxVectorStore` class with an `as_store() -> Arc<dyn
    VectorStore>` accessor, then extend `PyVectorRetriever::new` to accept it.
+
+## Changing gateway dispatch
+
+Keep tenant policy separate from deployment policy. Virtual-key authorization,
+tenant RPM, and daily spend live at the edge; upstream RPM and circuit health
+belong to shared deployments. Retry only infrastructure/setup failures, never
+client errors. A stream may fail over before establishment, but never after
+partial output has been relayed. Run `cargo test -p litgraph-gateway` and the
+OpenAI SDK tests under `python_tests/gateway/`.
 
 ## Bench discipline
 
