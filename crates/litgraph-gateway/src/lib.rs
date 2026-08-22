@@ -8,6 +8,8 @@
 
 pub mod config;
 pub mod dispatch;
+pub mod error;
+pub mod http;
 pub mod keys;
 pub mod registry;
 pub mod tenant;
