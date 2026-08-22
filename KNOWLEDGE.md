@@ -18,12 +18,13 @@ LangChain + LangGraph wedge points:
 litGraph thesis:
 
 1. **Rust core, Python shim** — every hot path (HTTP, SSE parse, tokenize, embed math, vector search, JSON parse, graph scheduling) lives in Rust. PyO3 layer is a thin dispatch.
-2. **GIL-free parallelism** — `tokio::JoinSet` for I/O fan-out, `rayon::par_iter` for CPU batching. `py.allow_threads()` around every heavy block. Free-threaded Python 3.13 ready.
+2. **GIL-free parallelism** — `tokio::JoinSet` for I/O fan-out, `rayon::par_iter` for CPU batching. `py.detach()` around every heavy block. Free-threaded Python 3.13 ready.
 3. **Shallow stacks** — ≤ 2 frames from user code to HTTP. No `Runnable | Runnable | Runnable` magic.
-4. **Split crates, zero default features** — pay for what you import. Workspace = 37 crates.
+4. **Split crates, zero default features** — pay for what you import. Workspace = 45 crates.
 5. **Graph-first** — `StateGraph` is the headline. Class zoo collapses to functions + nodes.
 6. **Inspectable** — `on_request` hook exposes final HTTP body. Solves 50% of debug pain.
-7. **OTel-native** — tracing spans + future OTLP exporter (still TODO).
+7. **OTel-native** — tracing spans plus OTLP gRPC/HTTP exporters and a
+   LangSmith compatibility initializer.
 
 ---
 
@@ -48,6 +49,7 @@ crates/
 ├── litgraph-resilience/    Retry + RateLimit + Fallback wrappers
 ├── litgraph-observability/ CostTracker + GraphEvent + AgentEvent
 ├── litgraph-mcp/           MCP client (HTTP/SSE)
+├── litgraph-gateway/       OpenAI-compatible virtual-key gateway + dispatch
 ├── litgraph-macros/        proc-macro #[tool] (schemars-derived)
 ├── litgraph-bench/         criterion benches
 └── litgraph-py/            ALL PyO3 bindings live here. Zero PyO3 elsewhere.
@@ -82,7 +84,7 @@ Without `sys.modules` insert, `from litgraph.X import Y` fails even when attribu
 `crate::runtime::{block_on_compat, rt}` — single shared runtime. `block_on_compat` lets sync Python methods drive async Rust without spinning a fresh runtime per call. `rt().spawn(...)` for streaming pumps.
 
 ### GIL release
-`py.allow_threads(|| block_on_compat(async move { ... }))` around every long Rust call. Releases the GIL so other Python threads make progress. Critical for free-threaded 3.13 + concurrent agent invocations.
+`py.detach(|| block_on_compat(async move { ... }))` around every long Rust call. Detaches from the interpreter so other Python threads make progress. Critical for free-threaded 3.13 + concurrent agent invocations.
 
 ### Streams to Python
 Pattern: spawn a tokio task that pumps the inner Stream into an `mpsc::channel`. Wrap the receiver in a `#[pyclass]` with `__iter__` + `__next__`. `__next__` blocks on `rx.recv()` with GIL released. Used by ReactAgent.stream(), TextReActAgent.stream(), LLM token streams.
@@ -142,7 +144,7 @@ Parsers complement each other; `format_instructions` helpers tell the LLM how to
 | `parse_markdown_list` (106) | "- foo\n- bar" | `markdown_list_format_instructions` |
 | `parse_boolean` (106) | yes/no, substring-safe | `boolean_format_instructions` |
 | `parse_react_step` (107) | Thought/Action/Action Input/Final Answer | `react_format_instructions` |
-| **OutputFixingParser** | LLM repair on parse fail | TODO |
+| **OutputFixingParser** | LLM repair on parse fail | `fix_with_llm` / `parse_with_retry` shipped |
 
 All parsers tolerant of LLM noise (loose-prose tolerance, case-insensitive labels, code-fence stripping, markdown-bold labels).
 
@@ -311,20 +313,13 @@ Each iter follows this rhythm:
 
 ## 17. Open gaps — read FEATURES.md status block for current list
 
-Top picks for next iters (in rough leverage order):
-
-1. **OutputFixingParser** — LLM-repair-on-parse-fail. FEATURES.md line 78. Real prod pain. Small surface.
-2. **Time travel + state history API** — `state_history(thread_id)`, `fork_at(checkpoint_id)`, `replay_from(...)`. FEATURES.md line 126. The LangGraph-vs-litGraph differentiator that's listed but unbuilt.
-3. **OpenTelemetry OTLP exporter** — `litgraph-tracing-otel` crate. Real prod observability needs it.
-4. **`pyo3-stub-gen` `.pyi` generation** — kills every Pyright import warning; universal DX.
-5. **Streaming JSON parser** — parse structured output as tokens arrive.
-
-After v1.0 closes:
-- fastembed-rs (local embeddings)
-- candle / mistral.rs (local chat)
-- ort (local cross-encoder rerankers)
-- LangSmith OTel compat shim
-- Webhook notifier tool
+The former top picks—output repair, time travel, OTLP export, partial JSON,
+FastEmbed embeddings/reranking, LangSmith OTel compatibility, and webhook
+notifications—have shipped. Current gaps are tracked only in
+`MISSING_FEATURES.md`; the main ones are production in-process local-model
+engine wiring, automatic stub generation, serve-side tenant ACLs, and
+credential/service-gated integration coverage. `litgraph-gateway` now supplies
+the self-hosted OpenAI-compatible edge with Ollama dispatch.
 
 ---
 

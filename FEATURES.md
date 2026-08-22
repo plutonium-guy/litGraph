@@ -1,17 +1,19 @@
 # litGraph — Feature List
 
 Production-grade, slim alternative to LangChain + LangGraph.
-Rust core, Python bindings via PyO3 0.28 + maturin.
+Rust core, Python bindings via PyO3 0.22 + maturin.
 
-## Status — 2026-05-02 (iter 325)
+## Status — 2026-08-22
 
-43 crates · 2536 Rust unit tests · 166 Python test modules · all passing.
+45 workspace crates · 2,700+ Rust tests · latest offline Python run:
+1,480 passed, 142 live-service cases skipped.
 
-**Legend:** ✅ done · ⏳ in flight · ❌ not started · 🚫 deferred indefinitely
+**Legend:** ✅ done · 🟡 partial · ⏳ in flight · ❌ not started · 🚫 deferred indefinitely
 
 ### Done — v1.0 must-haves
 - ✅ ChatModel + Embeddings traits
-- ✅ Providers: OpenAI, OpenAIResponses, Anthropic, Gemini (AI Studio + Vertex), Bedrock (native + Converse), Cohere, OpenAI-compat (Ollama, Groq, Together, Mistral, DeepSeek, xAI, Fireworks), **`MistralRsChat`** (iter 380, first-party in-process local-chat scaffold via pluggable `ModelBackend` trait; real `mistralrs::Engine` lands iter 381 behind `engine` feature)
+- ✅ Providers: OpenAI, OpenAIResponses, Anthropic, Gemini (AI Studio + Vertex), Bedrock (native + Converse), Cohere, OpenAI-compat (Ollama, Groq, Together, Mistral, DeepSeek, xAI, Fireworks), **`MistralRsChat`** (iter 380, in-process local-chat scaffold via a pluggable `ModelBackend`; production `mistralrs::Engine` wiring remains deferred)
+- ✅ **`litgraph-gateway`**: OpenAI-compatible virtual keys, model-group authorization, tenant limits and budgets, weighted routing, circuit-breaker failover, Ollama dispatch, and SSE relay
 - ✅ Native function/tool calling per provider
 - ✅ SSE streaming → Python async iterator
 - ✅ Tokenizers (tiktoken-rs + HF tokenizers)
@@ -48,12 +50,12 @@ Rust core, Python bindings via PyO3 0.28 + maturin.
 - ✅ **OutputFixingParser** (iter 119) — `fix_with_llm`, `parse_with_retry`, Python `parse_json_with_retry`. LangChain parity.
 - ✅ **Time travel + state history API** (iter 120) — `state_history`, `rewind_to`, `fork_at`, `clear_thread` on Checkpointer + PyCompiledGraph. Native DELETE paths on sqlite/pg/redis. Scheduler serialization swapped bincode→rmp-serde (fixed pre-existing PyCompiledGraph.resume() bug for Value-state graphs).
 - ✅ **OpenTelemetry OTLP exporter** (iter 121) — new crate `litgraph-tracing-otel`. `init_otlp(endpoint, service_name)` / `init_stdout()` / in-memory for tests. Batch span processor. Env var fallbacks. Drop-guard. Python `litgraph.tracing.{init_otlp, init_stdout, shutdown}`.
-- ❌ **`pyo3-stub-gen` `.pyi` generation** — line 157. Every Pyright import warning is from missing stubs.
+- 🚫 **`pyo3-stub-gen` `.pyi` generation** — intentionally deferred. Hand-written PEP 561 stubs remain canonical and `tools/check_stubs.py` detects surface drift.
 - ✅ **Streaming JSON parser** (iter 122) — `parse_partial_json` + `repair_partial_json`. Auto-closes unclosed braces/quotes/brackets. Monotonic-growth invariant. Powers progressive structured-output UIs.
 
 ### Left — local inference (lines 173, 219-220)
 - ✅ **fastembed-rs** local embeddings (no-network) — iter 177
-- ❌ **candle / mistral.rs** local chat (in-process small models)
+- 🟡 **candle / mistral.rs** local chat: adapter/backend scaffold exists; production engine wiring is deferred. Ollama and other local OpenAI-compatible servers work end-to-end.
 - ✅ **ort** ONNX runtime (local cross-encoder rerankers) — iter 179 via `litgraph-rerankers-fastembed`
 
 ### Left — v1.1 nice-to-haves

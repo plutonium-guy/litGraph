@@ -2,12 +2,15 @@
 
 use std::sync::Arc;
 
+use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::HeaderMap;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use litgraph_core::{ChatOptions, Message};
 use litgraph_observability::cost::PriceSheet;
+use rand::RngCore;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -77,8 +80,23 @@ async fn list_models(
 async fn chat_completions(
     State(s): State<Arc<GatewayState>>,
     headers: HeaderMap,
-    Json(req): Json<ChatCompletionRequest>,
-) -> Result<Json<Value>, GatewayError> {
+    body: Bytes,
+) -> Result<Response, GatewayError> {
+    // Deserialize manually rather than via the `Json<T>` extractor: axum's
+    // extractor rejects a malformed/mistyped body BEFORE this handler runs,
+    // with a plain-text 400 that has no `error` object. An OpenAI SDK that
+    // parses every error through `error.message/type/code` throws a parse
+    // error instead of a normal `APIError`. Routing the failure through
+    // `GatewayError::BadRequest` keeps every failure mode in the OpenAI
+    // envelope. The serde detail is not client-facing (it can echo body
+    // content); only the trace gets it.
+    let req: ChatCompletionRequest = serde_json::from_slice(&body).map_err(|e| {
+        tracing::warn!(error = %e, "malformed chat completion request body");
+        GatewayError::BadRequest {
+            message: "could not parse request body as JSON".into(),
+        }
+    })?;
+
     // 1. authenticate
     let token = bearer(&headers).ok_or(GatewayError::Unauthorized)?;
     let key = s.keys.authenticate(token).map_err(|_| GatewayError::Unauthorized)?;
@@ -111,17 +129,36 @@ async fn chat_completions(
         max_tokens: req.max_tokens,
         ..Default::default()
     };
+
+    let completion_id = completion_id();
+    if req.stream {
+        let (upstream, used) =
+            crate::dispatch::dispatch_stream(group, s.strategy.as_ref(), messages, &opts)
+                .await
+                .map_err(dispatch_error)?;
+        let price = s.prices.lookup(&used.upstream_model);
+        let state = s.clone();
+        let key_id = key.id.clone();
+        let meter = Arc::new(move |usage: litgraph_core::TokenUsage| {
+            if let Some(price) = price {
+                let usd = (usage.prompt as f64 / 1_000_000.0) * price.prompt_per_mtok
+                    + (usage.completion as f64 / 1_000_000.0) * price.completion_per_mtok;
+                state.policy.record_spend(&key_id, usd);
+            }
+        });
+        return Ok(crate::streaming::sse_relay(
+            upstream,
+            req.model,
+            completion_id,
+            used.id.clone(),
+            meter,
+        ));
+    }
+
     let (resp, used) =
         crate::dispatch::dispatch_invoke(group, s.strategy.as_ref(), messages, &opts)
             .await
-            .map_err(|e| match e {
-                crate::dispatch::DispatchError::Upstream { message } => {
-                    GatewayError::UpstreamRejected { message }
-                }
-                crate::dispatch::DispatchError::AllDeploymentsUnavailable => {
-                    GatewayError::NoDeploymentAvailable
-                }
-            })?;
+            .map_err(dispatch_error)?;
 
     // 6. meter
     if let Some(price) = s.prices.lookup(&used.upstream_model) {
@@ -132,8 +169,9 @@ async fn chat_completions(
 
     // 7. respond, echoing the alias the client asked for
     Ok(Json(json!({
-        "id": format!("chatcmpl-{}", &used.id),
+        "id": completion_id,
         "object": "chat.completion",
+        "created": unix_seconds(),
         "model": req.model,
         "choices": [{
             "index": 0,
@@ -145,7 +183,32 @@ async fn chat_completions(
             "completion_tokens": resp.usage.completion,
             "total_tokens": resp.usage.total,
         },
-    })))
+    }))
+    .into_response())
+}
+
+fn dispatch_error(error: crate::dispatch::DispatchError) -> GatewayError {
+    match error {
+        crate::dispatch::DispatchError::Upstream { message } => {
+            GatewayError::UpstreamRejected { message }
+        }
+        crate::dispatch::DispatchError::AllDeploymentsUnavailable => {
+            GatewayError::NoDeploymentAvailable
+        }
+    }
+}
+
+fn completion_id() -> String {
+    let mut bytes = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    format!("chatcmpl-{}", crate::keys::hex(&bytes))
+}
+
+fn unix_seconds() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 fn to_core_message(m: &WireMessage) -> Message {
@@ -186,7 +249,7 @@ mod tests {
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt; // for `oneshot`
 
-    use litgraph_core::{ChatModel, ChatOptions, ChatResponse, ChatStream,
+    use litgraph_core::{ChatModel, ChatOptions, ChatResponse, ChatStream, ChatStreamEvent,
                         FinishReason, Message, Result, TokenUsage};
     use litgraph_observability::cost::{ModelPrice, PriceSheet};
     use crate::config::KeyConfig;
@@ -210,7 +273,22 @@ mod tests {
             })
         }
         async fn stream(&self, _m: Vec<Message>, _o: &ChatOptions) -> Result<ChatStream> {
-            unreachable!("Task 6 covers non-streaming only")
+            Ok(Box::pin(futures::stream::iter(vec![
+                Ok(ChatStreamEvent::Delta { text: "hi".into() }),
+                Ok(ChatStreamEvent::Done {
+                    response: ChatResponse {
+                        message: Message::assistant("hi"),
+                        finish_reason: FinishReason::Stop,
+                        usage: TokenUsage {
+                            prompt: 10,
+                            completion: 5,
+                            total: 15,
+                            ..Default::default()
+                        },
+                        model: "upstream-model-name".into(),
+                    },
+                }),
+            ])))
         }
     }
 
@@ -275,6 +353,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn malformed_json_uses_the_openai_error_envelope() {
+        let app = router(test_state());
+        let resp = app
+            .oneshot(
+                Request::post("/v1/chat/completions")
+                    .header("authorization", format!("Bearer {}", test_plaintext_key()))
+                    .header("content-type", "application/json")
+                    .body(Body::from("{"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["error"]["type"], "invalid_request_error");
+    }
+
+    #[tokio::test]
     async fn key_cannot_use_a_group_it_does_not_allow() {
         let app = router(test_state());
         let resp = app
@@ -312,6 +409,32 @@ mod tests {
         assert_eq!(v["model"], "gpt-4o");
         assert!(v["choices"][0]["message"]["content"].is_string());
         assert!(v["usage"]["total_tokens"].is_number());
+    }
+
+    #[tokio::test]
+    async fn streaming_path_returns_sse_chunks_and_done() {
+        let app = router(test_state());
+        let resp = app
+            .oneshot(
+                Request::post("/v1/chat/completions")
+                    .header("authorization", format!("Bearer {}", test_plaintext_key()))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}],"stream":true}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(resp.headers()["content-type"]
+            .to_str()
+            .unwrap()
+            .starts_with("text/event-stream"));
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("chat.completion.chunk"));
+        assert!(body.contains("data: [DONE]"));
     }
 
     #[tokio::test]

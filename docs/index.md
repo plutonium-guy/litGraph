@@ -14,7 +14,7 @@ eyebrow: Production agent framework
   </div>
   <div class="stat-row">
     <div class="stat"><strong>1 wheel</strong><span>CPython 3.9–3.13+ via abi3</span></div>
-    <div class="stat"><strong>43 crates</strong><span>Pay only for the Rust pieces you use</span></div>
+    <div class="stat"><strong>45 crates</strong><span>Pay only for the Rust pieces you use</span></div>
     <div class="stat"><strong>0 hard deps</strong><span>Python standard library by default</span></div>
   </div>
 </div>
@@ -44,6 +44,7 @@ The model is always explicit. Planning, virtual scratch space, streaming, event 
   <a class="card" href="graphs/"><strong>StateGraph</strong><span>Typed state, conditional routes, parallel branches, checkpoints, interrupts, and replay.</span></a>
   <a class="card" href="models-tools/"><strong>Composable primitives</strong><span>Providers, tools, middleware, streaming, structured output, and resilience wrappers.</span></a>
   <a class="card" href="python-rust/"><strong>Rust crates</strong><span>Use the core traits and specialized crates directly without depending on Python.</span></a>
+  <a class="card" href="deployment/"><strong>LLM gateway</strong><span>Front Ollama or hosted OpenAI-compatible deployments with virtual keys, budgets, routing, failover, and SSE.</span></a>
 </div>
 
 ## What is included
@@ -60,6 +61,7 @@ The model is always explicit. Planning, virtual scratch space, streaming, event 
 <span class="tag">OpenTelemetry</span>
 <span class="tag">MCP</span>
 <span class="tag">HTTP + SSE</span>
+<span class="tag">LLM gateway</span>
 
 The framework includes provider adapters, deterministic testing models, document ingestion, vector stores, memory, caching, retry and budget controls, evaluation metrics, checkpointing, human-in-the-loop interrupts, and HTTP serving. The [reference map](/litGraph/reference/) links every subsystem to its canonical guide, tests, and source.
 

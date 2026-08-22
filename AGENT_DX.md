@@ -341,6 +341,7 @@ Lower the barrier from "intent" to "working agent."
 | **💡 `litgraph.recipes.rag(corpus_path, model=...)`** → working RAG agent in 1 call | 💡 | M |
 | **`litgraph.recipes.eval(target, cases)`** → harness with sane metrics | ✅ (iter 339) | S |
 | **`litgraph.recipes.serve(model, port=8080)`** → REST + SSE in 1 call | ✅ for a ChatModel (spawns axum in-process, returns `ServeHandle`); ⏳ graph-shaped input raises `NotImplementedError` | S |
+| **`litgraph-gateway` binary** → OpenAI-compatible edge with explicit TOML | ✅ virtual keys, budgets, weighted failover, SSE, and Ollama dispatch | — |
 | **💡 `litgraph.recipes.multi_agent(roles=[...])`** → supervisor pre-wired | 💡 | M |
 
 **Why Claude Code cares:** when the user says "build me an X", the
@@ -389,12 +390,12 @@ The agent often writes tests. Make the test infrastructure obvious.
 
 | Feature | Status | Effort |
 |---|---|---|
-| `ScriptedModel` for deterministic chat tests (already used internally) | ⏳ (Rust-only) | S to expose |
+| `ScriptedChatModel` for deterministic chat tests | ✅ exposed through `litgraph.testing` and `litgraph.providers` | — |
 | Python `MockChatModel` with scripted replies | ✅ (iter 339) | S |
 | `MockEmbeddings(dim, deterministic=True)` | ✅ (iter 339) | S |
 | `MockTool(returns=...)` | ✅ (iter 339) | S |
 | Pytest fixtures auto-discovered: `mock_chat`, `mock_emb`, `mock_store` | 💡 | M |
-| `litgraph.testing` module documented in USAGE.md | 🚧 | S |
+| `litgraph.testing` module documented in README/getting-started examples | ✅ | — |
 
 **Why Claude Code cares:** the agent's tests need deterministic
 behaviour. If `MockChatModel` is one import away, the agent writes

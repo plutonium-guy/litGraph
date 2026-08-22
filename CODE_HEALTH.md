@@ -1,8 +1,10 @@
 # Code health — where the structure hurts and what to do
 
-**Snapshot:** 2026-07-31 · commit `e8163aa` + working-tree refactor ·
-128,880 lines of Rust across 43 crates · 2,573 workspace lib tests
-passing.
+**Graph snapshot:** 2026-07-31 · commit `e8163aa` + working-tree refactor ·
+128,880 lines of Rust across 43 crates · 2,573 workspace lib tests passing.
+The workspace has since grown to 45 crates as of 2026-08-22; the topology
+counts below remain the reproducible historical snapshot until the next full
+graph re-index.
 
 Derived from a GitNexus knowledge-graph index of the workspace
 (16,804 nodes / 40,559 edges) rather than from reading files in

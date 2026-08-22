@@ -1,5 +1,12 @@
 # litgraph-gateway Implementation Plan
 
+**Implementation status:** complete and verified on 2026-08-22. The task list
+below is retained as the build record; commit-oriented checkboxes are not a
+statement about the current uncommitted working tree. Verification completed:
+gateway unit and real-HTTP tests, workspace Rust tests, the offline Python
+suite, five formerly blocked Ollama live cases, three official OpenAI SDK
+gateway cases, docs/stub checks, and Criterion gateway benchmarks.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Ship `litgraph-gateway` v1 — an OpenAI-compatible LLM gateway with virtual API keys, per-tenant rate limits and spend caps, and weighted routing with failover across N deployments per model alias.

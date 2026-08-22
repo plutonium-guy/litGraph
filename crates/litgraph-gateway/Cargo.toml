@@ -25,7 +25,20 @@ toml = "0.8"
 argon2 = "0.5"
 rand = "0.8"
 bytes = "1"
+async-stream.workspace = true
+clap.workspace = true
+tracing-subscriber.workspace = true
+tower.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
-tower = { version = "0.5", features = ["util"] }
+reqwest.workspace = true
+criterion = { workspace = true, features = ["async_tokio"] }
+
+[[bin]]
+name = "litgraph-gateway"
+path = "src/main.rs"
+
+[[bench]]
+name = "relay"
+harness = false

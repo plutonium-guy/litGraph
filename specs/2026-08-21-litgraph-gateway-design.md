@@ -1,8 +1,15 @@
 # litgraph-gateway — design
 
-**Status:** approved design, not yet implemented
+**Status:** implemented and verified 2026-08-22
 **Date:** 2026-08-21
 **Scope:** v1 = routing + metering core
+
+Implementation notes: v1 also includes the `serve` and `keygen` CLI, explicit
+`provider = "ollama"` dispatch without an upstream credential, real-HTTP wire
+tests, and official OpenAI Python SDK coverage. Streaming failover is limited
+to upstream setup; after establishment, errors are reported in-band and
+partial output is metered. The measured mock-upstream overhead is about
+7.25 µs non-streaming and 1.25 ms for a 1,000-chunk SSE relay.
 
 > Kept outside `docs/` deliberately: `docs/**` triggers the GitHub Pages
 > build and `_config.yml` excludes only `README.md`, so anything added
@@ -327,8 +334,9 @@ middleware and read by nothing; `studio_router` applies no tenant
 scoping, so any caller can read or mutate any `thread_id`. Both layer
 constructors also failed to compile for any caller until 2026-08-20.
 
-The row should read ⏳ until this design ships. That correction should
-be made now and does not depend on the gateway.
+The row should remain partial after gateway v1: the gateway enforces its own
+virtual-key tenant boundary, but `litgraph-serve` still does not apply identity
+to per-thread ACLs.
 
 ## 12. Decisions on points left open during design
 

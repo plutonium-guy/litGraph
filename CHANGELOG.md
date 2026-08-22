@@ -51,6 +51,15 @@ to Semantic Versioning.
   `AGENT_DX.md` still described `recipes.serve` as rendering a command string.
 
 ### Added
+- **`litgraph-gateway` v1**: a self-hosted OpenAI-compatible gateway with
+  Argon2id virtual keys, exact-match model-group authorization, per-tenant
+  request limits and daily spend ceilings, weighted deployment routing,
+  circuit-breaker failover, OpenAI-shaped errors, and streaming SSE relay.
+  The `serve` and `keygen` CLI commands make it independently deployable;
+  `provider = "ollama"` supplies a credential-free local-model path. Streaming
+  fails over only before the upstream stream is established, reports later
+  failures in-band, and meters partial output. Real-HTTP tests and the official
+  OpenAI Python SDK verify streaming and non-streaming wire compatibility.
 - **Providers**: OpenAI, Anthropic, Google Gemini — all with native tool calling
   and SSE streaming. OpenAI-compatible base URLs cover Ollama / vLLM / Together
   / Groq / Fireworks / DeepSeek / LM Studio.
@@ -94,15 +103,14 @@ to Semantic Versioning.
 - README.md with quickstarts. LICENSE (Apache-2.0).
 
 ### Architecture
-- 22 split crates with zero default features — pay only for what you import.
+- 45 focused workspace crates with tight default features — pay only for what you import.
 - Shared tokio runtime in `litgraph-py` (one per process); GIL released around
   every async / Rayon block.
-- bincode-serialized state snapshots for checkpoints (compact, fast).
+- MessagePack (`rmp-serde`) state snapshots for resumable generic JSON state.
 - Submodules registered in `sys.modules` so `from litgraph.X import Y` works.
 
 ### Tests
-- 44 Rust unit + integration tests across all crates.
-- 33 Python E2E tests covering StateGraph, RAG pipeline, streaming, agents,
-  cache, observability, multi-agent supervisor.
+- 2,700+ Rust tests across the workspace.
+- Latest offline Python run: 1,480 passed, with 142 live-service cases skipped.
 - Fake HTTP servers used to verify provider SSE streams, cache wiring, and
   cost-instrumentation pipelines without live API calls.

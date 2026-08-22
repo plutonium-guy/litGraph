@@ -147,6 +147,13 @@ fn build_model(d: &DeploymentConfig) -> Result<Arc<dyn ChatModel>, ConfigError> 
                 .map_err(|e| ConfigError::ProviderBuild(d.id.clone(), e.to_string()))?;
             Ok(Arc::new(chat))
         }
+        "ollama" => {
+            let cfg = litgraph_providers_openai::OpenAIConfig::new("ollama", d.model.clone())
+                .with_base_url(d.base_url.clone());
+            let chat = litgraph_providers_openai::OpenAIChat::new(cfg)
+                .map_err(|e| ConfigError::ProviderBuild(d.id.clone(), e.to_string()))?;
+            Ok(Arc::new(chat))
+        }
         other => Err(ConfigError::UnknownProvider {
             deployment_id: d.id.clone(),
             provider: other.to_string(),
@@ -282,5 +289,24 @@ mod tests {
         assert_eq!(reg.group("gpt-4o").unwrap().deployments.len(), 2);
         assert_eq!(reg.group("claude").unwrap().deployments.len(), 1);
         assert!(reg.group("nope").is_none());
+    }
+
+    #[test]
+    fn ollama_deployment_builds_without_an_api_key_environment_variable() {
+        let cfg = GatewayConfig::from_toml_str(
+            r#"
+[[deployment]]
+id = "local"
+group = "local-chat"
+provider = "ollama"
+model = "qwen2.5:0.5b"
+base_url = "http://127.0.0.1:11434/v1"
+"#,
+        )
+        .expect("valid Ollama config");
+
+        let registry = Registry::from_config(&cfg).expect("Ollama does not require a key env");
+        let deployment = &registry.group("local-chat").unwrap().deployments[0];
+        assert_eq!(deployment.upstream_model, "qwen2.5:0.5b");
     }
 }

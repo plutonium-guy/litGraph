@@ -7,7 +7,7 @@ not to do. Skip the discovery phase.
 ## What this repo is
 
 litGraph: a production-grade slim alternative to LangChain + LangGraph.
-Rust core (43 crates) + Python bindings via PyO3 0.22 + maturin. One
+Rust core (45 workspace crates) + Python bindings via PyO3 0.22 + maturin. One
 abi3 wheel covers Python 3.9–3.13+. Live on PyPI as `litgraph`.
 
 Doc map: see [README.md](README.md) for the top-level index.
@@ -41,7 +41,7 @@ AppleDouble `._*` files. They're gitignored; don't commit them.
 ## Repo layout
 
 ```
-crates/                    Rust workspace (43 crates)
+crates/                    Rust workspace (45 crates)
 ├── litgraph-core          traits + types + errors  (zero PyO3)
 ├── litgraph-graph         StateGraph + Kahn scheduler
 ├── litgraph-agents        ReactAgent / Supervisor / etc.
@@ -49,6 +49,7 @@ crates/                    Rust workspace (43 crates)
 ├── litgraph-providers-*   one crate per LLM provider
 ├── litgraph-stores-*      one crate per vector store
 ├── litgraph-checkpoint-*  one crate per checkpointer backend
+├── litgraph-gateway       OpenAI-compatible virtual-key LLM gateway
 ├── litgraph-py            ← the ONLY crate that imports pyo3
 └── …                      see Cargo.toml for the full list
 

@@ -17,6 +17,7 @@ crates/
 ├── litgraph-observability   # Callback bus, CostTracker, OTel (feature-gated)
 ├── litgraph-cache           # Memory + SQLite + Semantic caches, CachedModel
 ├── litgraph-macros          # Proc-macros (#[tool] derives schemars JSON Schema)
+├── litgraph-gateway         # OpenAI-compatible routing, policy, budgets, SSE relay
 ├── litgraph-providers-{openai,anthropic,gemini}
 ├── litgraph-stores-{memory,hnsw,qdrant,pgvector}
 ├── litgraph-checkpoint-{sqlite,postgres,redis}
@@ -30,17 +31,17 @@ crates/
    crate is usable as a pure Rust dependency. Violating this couples the entire
    workspace to the Python ABI.
 2. **GIL released around all Rust work.** Every `#[pymethods]` function that
-   does real work wraps the work in `py.allow_threads(...)`. Only the JSON ↔
+   does real work wraps the work in `py.detach(...)`. Only the JSON ↔
    Python conversion at the entry/exit holds the GIL. Failing this serializes
    parallel branches through Python's GIL — kills the entire perf story.
 3. **One shared Tokio runtime per process.** Lives in `litgraph-py::runtime`,
    built lazily via `OnceCell`. Provider methods, graph scheduler, and
    checkpointers all `block_on` it. Spinning a fresh runtime per call costs
    ~1ms and breaks tokio::spawn callers (e.g. graph stream).
-4. **Bincode for checkpoints, JSON for messages.** Snapshots roundtrip through
-   `bincode` for speed; the message wire format stays JSON for provider
-   compatibility. Don't migrate snapshots to JSON — that was LangGraph's perf
-   drag at 10k+ message histories.
+4. **MessagePack for checkpoints, JSON for messages.** Snapshots roundtrip
+   through `rmp-serde`; the message wire format stays JSON for provider
+   compatibility. The previous bincode format could not safely resume generic
+   JSON-value state.
 5. **Zero default features.** Each store/checkpoint/provider is a separate
    crate. Users pay for what they import. Workspace-level `Cargo.toml` has no
    `default = ["..."]` lists pulling adapters.
@@ -96,6 +97,20 @@ Two orthogonal caching strategies:
 
 Both bypass cache for `.stream()` — token streams don't roundtrip cleanly.
 
+## Gateway dispatch
+
+`litgraph-gateway` is an independent Rust edge service; it does not cross the
+PyO3 boundary. A virtual key is located by its opaque prefix and verified with
+Argon2id, then its exact model-group allowlist, tenant request limit, and daily
+spend ceiling are checked. The registry selects a healthy deployment by
+weight. Retryable setup failures can move to another deployment through a
+per-deployment circuit breaker; client errors do not fail over.
+
+For streaming requests, failover ends once an upstream stream is established.
+Subsequent failures are sent as an in-band SSE error followed by `[DONE]`, and
+relayed partial output remains billable. `provider = "ollama"` builds the same
+OpenAI-compatible adapter without requiring an upstream credential.
+
 ## Vector store dispatch
 
 `VectorStore` is one async trait in `litgraph-retrieval`. Stores implement it
@@ -113,7 +128,7 @@ Python user code
        ▼
 PyO3 #[pymethods]            ← GIL held briefly
        │
-       │  py.allow_threads { ... }   ← GIL released
+       │  py.detach { ... }          ← interpreter detached
        ▼
 shared tokio runtime  →  Rust async work  →  Result
        ▲

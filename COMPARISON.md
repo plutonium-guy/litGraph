@@ -468,6 +468,7 @@ litGraph + LangGraph both ship first-class MCP; LangChain Core hasn't.
 | Studio UI (visual debugger) | ⏳ (cloud-API surface; no local UI) | ⏳ (LangServe Playground) | ✅ |
 | Multi-tenant auth scaffolding | ⏳ (`litgraph_serve::auth` supplies bearer + `X-Forwarded-User` layers, but nothing consumes the identity — `studio_router` applies no per-thread ACL, so the serve binary is still single-tenant) | ❌ | 💰 |
 | WebSocket endpoint | ✅ (`litgraph_serve::ws`, feature `ws`) | ⏳ (LangServe) | ⏳ |
+| OpenAI-compatible gateway (virtual keys, budgets, multi-deployment routing) | ✅ (`litgraph-gateway`) | ❌ | ❌ |
 | Single binary deploy (no Python at edge) | ✅ (Rust binary) | ❌ | ❌ |
 
 LangGraph wins for managed deploy; litGraph wins for self-hosted
@@ -490,6 +491,8 @@ hits Python; LangGraph hits LangChain.
 | HNSW search / 100 K vecs | ~ 41 µs | ~ 4 ms | ~ 4 ms (uses LangChain) |
 | SSE parse / 16 KB chunk | ~ 12 µs | ~ 2 ms | ~ 2 ms |
 | JSON repair / 256 B | ~ 280 ns | ~ 50 µs | ~ 50 µs |
+| Gateway mock round trip / non-streaming | ~ 7.25 µs | n/a | n/a |
+| Gateway SSE relay / 1,000 chunks | ~ 1.25 ms | n/a | n/a |
 | RRF fuse / 4 × 100 lists | ~ 65 µs | ~ 5 ms | ~ 5 ms |
 | Cold-import time | < 50 ms | ~ 500 ms – 2 s | ~ 1–3 s |
 

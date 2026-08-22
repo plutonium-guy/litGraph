@@ -129,6 +129,8 @@ csv = "1.3"
 
 # Benchmarks + macros
 criterion = { version = "0.5", features = ["async_tokio"] }
+clap = { version = "4.5", features = ["derive"] }
+tower = { version = "0.5", features = ["util"] }
 syn = { version = "2", features = ["full"] }
 quote = "1"
 proc-macro2 = "1"

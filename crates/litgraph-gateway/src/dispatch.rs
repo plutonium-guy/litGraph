@@ -15,7 +15,7 @@
 use std::sync::Arc;
 
 use litgraph_core::circuit_breaker::CallError;
-use litgraph_core::{ChatOptions, ChatResponse, Error, Message};
+use litgraph_core::{ChatOptions, ChatResponse, ChatStream, Error, Message};
 use thiserror::Error as ThisError;
 
 use crate::registry::{Deployment, ModelGroup, RoutingStrategy};
@@ -107,6 +107,47 @@ pub async fn dispatch_invoke(
     Err(DispatchError::AllDeploymentsUnavailable)
 }
 
+/// Select a deployment and establish an upstream stream.
+///
+/// Failover is possible only while `ChatModel::stream` is establishing the
+/// response. Once this function returns, the HTTP layer owns a live stream
+/// and must surface later failures in-band without trying another model.
+pub async fn dispatch_stream(
+    group: &ModelGroup,
+    strategy: &dyn RoutingStrategy,
+    messages: Vec<Message>,
+    opts: &ChatOptions,
+) -> Result<(ChatStream, Arc<Deployment>), DispatchError> {
+    let mut remaining: Vec<Arc<Deployment>> = group.deployments.clone();
+
+    while !remaining.is_empty() {
+        let Some(chosen) = strategy.pick(&remaining) else { break };
+        remaining.retain(|d| d.id != chosen.id);
+
+        let attempt_messages = messages.clone();
+        let attempt_opts = opts.clone();
+        match chosen
+            .breaker()
+            .call(|| async {
+                match chosen.model.stream(attempt_messages, &attempt_opts).await {
+                    Ok(stream) => Ok(Ok(stream)),
+                    Err(e) if !is_retryable(&e) => Ok(Err(e)),
+                    Err(e) => Err(e),
+                }
+            })
+            .await
+        {
+            Ok(Ok(stream)) => return Ok((stream, chosen)),
+            Ok(Err(e)) => return Err(DispatchError::Upstream { message: e.to_string() }),
+            Err(CallError::CircuitOpen) => continue,
+            Err(CallError::Inner(e)) => {
+                tracing::warn!(deployment = %chosen.id, error = %e, "stream setup failed, failing over");
+            }
+        }
+    }
+    Err(DispatchError::AllDeploymentsUnavailable)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -150,7 +191,13 @@ mod tests {
             }
         }
         async fn stream(&self, _m: Vec<Message>, _o: &ChatOptions) -> Result<ChatStream> {
-            unreachable!("this task covers non-streaming dispatch only")
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            match self.kind {
+                "ok" => Ok(Box::pin(futures::stream::empty())),
+                "5xx" => Err(Error::provider("upstream 503 Service Unavailable")),
+                "timeout" => Err(Error::Timeout),
+                _ => Err(Error::invalid("400 Bad Request: unsupported parameter")),
+            }
         }
     }
 
@@ -209,6 +256,42 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, DispatchError::Upstream { .. }));
         // Exactly one deployment was tried — a 400 is the same everywhere.
+        assert_eq!(a.load(Ordering::SeqCst) + b.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn stream_setup_failure_fails_over_before_first_byte() {
+        let good = Arc::new(AtomicUsize::new(0));
+        let bad = Arc::new(AtomicUsize::new(0));
+        let g = group_of(&[("good", "ok", good.clone()), ("bad", "5xx", bad.clone())]);
+
+        let (_stream, used) = dispatch_stream(
+            &g,
+            &WeightedRandom::seeded(1),
+            vec![],
+            &ChatOptions::default(),
+        )
+        .await
+        .expect("stream setup should fail over to the healthy deployment");
+        assert_eq!(used.id, "good");
+        assert_eq!(bad.load(Ordering::SeqCst), 1);
+        assert_eq!(good.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn stream_client_error_does_not_fail_over() {
+        let a = Arc::new(AtomicUsize::new(0));
+        let b = Arc::new(AtomicUsize::new(0));
+        let g = group_of(&[("a", "4xx", a.clone()), ("b", "4xx", b.clone())]);
+
+        let result = dispatch_stream(
+            &g,
+            &WeightedRandom::seeded(1),
+            vec![],
+            &ChatOptions::default(),
+        )
+        .await;
+        assert!(matches!(result, Err(DispatchError::Upstream { .. })));
         assert_eq!(a.load(Ordering::SeqCst) + b.load(Ordering::SeqCst), 1);
     }
 

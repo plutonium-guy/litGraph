@@ -1,13 +1,20 @@
 ---
 layout: default
 title: Getting started
-description: Install litGraph with Pixi, build the PyO3 extension, and run a deterministic first agent.
+description: Install litGraph, use Pixi for source development, and run a deterministic first agent.
 eyebrow: Start here
 ---
 
 # Getting started
 
-Use Pixi for the most reproducible development setup. It supplies Python, Rust, maturin, pytest, and the project tasks from one lockfile.
+For application use, install the published wheel:
+
+```bash
+pip install litgraph
+```
+
+Use Pixi for the most reproducible source-development setup. It supplies
+Python, Rust, maturin, pytest, and the project tasks from one lockfile.
 
 ## Requirements
 
@@ -17,7 +24,7 @@ Use Pixi for the most reproducible development setup. It supplies Python, Rust, 
 
 The workspace supports macOS arm64, Linux x86-64, and Linux arm64. Python is constrained to 3.9–3.13 and Rust to 1.75 or newer.
 
-## Clone and build
+## Clone and build from source
 
 ```bash
 git clone https://github.com/plutonium-guy/litGraph.git
@@ -138,5 +145,6 @@ After changing Rust code, rebuild before Python tests; otherwise Python may load
 
 - [Agent harness](/litGraph/agent-harness/) for runs, streams, traces, and evaluation.
 - [Graphs and workflows](/litGraph/graphs/) for stateful or branching systems.
+- [Serve and deploy](/litGraph/deployment/) for graph APIs and the OpenAI-compatible LLM gateway.
 - [Models and tools](/litGraph/models-tools/) for providers, schemas, and middleware.
 - [Troubleshooting](/litGraph/troubleshooting/) for build, interpreter, and native-module issues.

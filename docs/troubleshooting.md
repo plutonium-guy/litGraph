@@ -71,6 +71,24 @@ model = OpenAIChat(
 
 Check whether the service includes `/v1` in its compatibility endpoint and whether it implements tool calls or streaming used by the application.
 
+## Gateway returns 401, 403, 429, or 503
+
+- `401` means the virtual key is missing, malformed, or failed Argon2id
+  verification. Use the plaintext emitted by `keygen`, not the stored hash.
+- `403` means the key's exact `groups` allowlist does not contain the requested
+  model alias.
+- `429` means the tenant request limit or daily spend ceiling rejected the
+  request. Budgets reject the next request after the ceiling is crossed; they
+  do not cut off an active completion.
+- `503` means no healthy deployment could serve the group. Check upstream
+  health, model names, API-key environment variables, and circuit-breaker
+  cooldowns. Ollama deployments should use `provider = "ollama"` and need no
+  `api_key_env`.
+
+For an SSE stream that fails after it begins, inspect the in-band `error` event.
+HTTP status can no longer change after response headers and partial tokens have
+been sent; the gateway follows the error with `[DONE]` and meters partial usage.
+
 ## Graph does not terminate
 
 Inspect conditional routes and cycles, then lower the recursion limit while debugging. Every cycle needs an explicit state change and exit condition. Generate `to_ascii()` or `to_mermaid()` output to confirm edges match the intended workflow.

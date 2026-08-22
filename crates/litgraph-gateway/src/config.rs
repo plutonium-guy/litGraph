@@ -42,13 +42,16 @@ pub struct DeploymentConfig {
     pub id: String,
     /// The alias clients send as `"model"`. Many deployments may share one.
     pub group: String,
-    /// Provider adapter to construct. v1 supports "openai" (which covers
-    /// every OpenAI-compatible endpoint via `base_url`).
+    /// Provider adapter to construct. `openai` covers authenticated
+    /// OpenAI-compatible endpoints; `ollama` uses the same wire adapter
+    /// without requiring an API-key environment variable.
     pub provider: String,
     /// The model name sent upstream, which may differ from `group`.
     pub model: String,
     pub base_url: String,
     /// Env var holding the upstream credential. Never the secret itself.
+    /// Optional for `provider = "ollama"`.
+    #[serde(default)]
     pub api_key_env: String,
     #[serde(default = "default_weight")]
     pub weight: u32,

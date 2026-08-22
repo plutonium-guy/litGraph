@@ -135,7 +135,10 @@ pub fn generate_key() -> (String, String, String) {
     (plaintext, prefix, phc)
 }
 
-fn hex(bytes: &[u8]) -> String {
+/// Encode bytes as lowercase hex. `pub(crate)` so other gateway modules
+/// (e.g. `http`'s opaque response ids) can reuse it instead of growing a
+/// second copy.
+pub(crate) fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 

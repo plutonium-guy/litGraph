@@ -24,6 +24,7 @@ litGraph is a Rust workspace with a deliberately thin Python boundary. Core trai
 | `litgraph-cache` | Exact, SQLite, embedding, and semantic cache composition. |
 | Provider/store/checkpoint crates | One external integration per focused crate. |
 | `litgraph-macros` | Rust procedural macros such as schema-producing tool declarations. |
+| `litgraph-gateway` | OpenAI-compatible virtual-key policy, weighted deployment routing, failover, spend metering, and SSE relay. |
 | `litgraph-py` | The only PyO3 crate; converts Python values and delegates work to Rust. |
 | `python/litgraph` | Thin Python wrappers, decorators, harness, recipes, compatibility, and optional extras. |
 
@@ -87,7 +88,14 @@ providers ─┐
 stores ────┼──> litgraph-core <── litgraph-graph <── litgraph-agents
 retrieval ─┘            ^
                         └──────── litgraph-py ──────> Python package
+litgraph-gateway ────────┘
 ```
+
+The gateway is a pure-Rust edge over `Arc<dyn ChatModel>` deployments. It
+authenticates a virtual key, enforces tenant policy, chooses a healthy weighted
+deployment, and relays the OpenAI response. Setup failures may fail over;
+stream failures after establishment stay on the selected deployment and are
+reported in-band.
 
 When a proposed feature would add Python knowledge to a Rust trait, place conversion in `litgraph-py` instead. When an adapter would add a heavy dependency to unrelated users, give it a focused crate or optional Python extras module.
 
