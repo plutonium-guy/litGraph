@@ -137,6 +137,13 @@ async fn chat_completions(
                 .await
                 .map_err(dispatch_error)?;
         let price = s.prices.lookup(&used.upstream_model);
+        if price.is_none() {
+            // Same silently-free hazard as the non-streaming path below.
+            tracing::warn!(
+                upstream_model = %used.upstream_model,
+                "no price entry for this deployment; stream served unmetered"
+            );
+        }
         let state = s.clone();
         let key_id = key.id.clone();
         let meter = Arc::new(move |usage: litgraph_core::TokenUsage| {
@@ -161,10 +168,21 @@ async fn chat_completions(
             .map_err(dispatch_error)?;
 
     // 6. meter
-    if let Some(price) = s.prices.lookup(&used.upstream_model) {
-        let usd = (resp.usage.prompt as f64 / 1_000_000.0) * price.prompt_per_mtok
-            + (resp.usage.completion as f64 / 1_000_000.0) * price.completion_per_mtok;
-        s.policy.record_spend(&key.id, usd);
+    match s.prices.lookup(&used.upstream_model) {
+        Some(price) => {
+            let usd = (resp.usage.prompt as f64 / 1_000_000.0) * price.prompt_per_mtok
+                + (resp.usage.completion as f64 / 1_000_000.0) * price.completion_per_mtok;
+            s.policy.record_spend(&key.id, usd);
+        }
+        // An unpriced deployment serves traffic that costs real money upstream
+        // while `spent_today` never moves, so `max_usd_per_day` never trips for
+        // it. Nothing else would reveal a missing `PriceSheet` row, so warn:
+        // silently-free traffic must at least be greppable. Server-side only —
+        // the upstream model name is never surfaced to the client.
+        None => tracing::warn!(
+            upstream_model = %used.upstream_model,
+            "no price entry for this deployment; request served unmetered"
+        ),
     }
 
     // 7. respond, echoing the alias the client asked for
@@ -255,7 +273,7 @@ mod tests {
     use crate::config::KeyConfig;
     use crate::keys::{generate_key, KeyStore};
     use crate::registry::{Deployment, Registry, WeightedRandom};
-    use crate::tenant::{MemorySpendStore, TenantPolicy, TestClock};
+    use crate::tenant::{MemorySpendStore, SpendStore, TenantPolicy, TestClock};
     use std::sync::OnceLock;
 
     /// Upstream that always succeeds with fixed text and non-zero usage.
@@ -305,6 +323,12 @@ mod tests {
     /// One deployment in group "gpt-4o", plus a second group the key is
     /// NOT allowed to use, so the 403-vs-404 distinction is testable.
     fn test_state() -> Arc<GatewayState> {
+        test_state_and_store().0
+    }
+
+    /// Same fixture, but also handing back the spend store so a test can
+    /// assert what was actually metered rather than only what was returned.
+    fn test_state_and_store() -> (Arc<GatewayState>, Arc<MemorySpendStore>) {
         let (_, prefix, hash) = test_key();
         let keys = KeyStore::from_configs(&[KeyConfig {
             id: "team-a".into(),
@@ -317,8 +341,13 @@ mod tests {
         .expect("valid key config");
 
         let registry = Registry::for_test(vec![
-            Arc::new(Deployment::for_test("d1", "gpt-4o", 1, Arc::new(Echo))),
-            Arc::new(Deployment::for_test("d2", "claude-sonnet-4-5", 1, Arc::new(Echo))),
+            Arc::new(Deployment::for_test("gpt4o-openai-primary", "gpt-4o", 1, Arc::new(Echo))),
+            Arc::new(Deployment::for_test(
+                "sonnet-anthropic-primary",
+                "claude-sonnet-4-5",
+                1,
+                Arc::new(Echo),
+            )),
         ]);
 
         let mut prices = PriceSheet::new();
@@ -328,13 +357,15 @@ mod tests {
         );
 
         let clock = Arc::new(TestClock::new());
-        Arc::new(GatewayState {
+        let store = Arc::new(MemorySpendStore::new(clock.clone()));
+        let state = Arc::new(GatewayState {
             registry,
             keys,
-            policy: TenantPolicy::new(clock.clone(), Arc::new(MemorySpendStore::new(clock.clone()))),
+            policy: TenantPolicy::new(clock.clone(), store.clone()),
             strategy: Box::new(WeightedRandom::seeded(1)),
             prices,
-        })
+        });
+        (state, store)
     }
 
     #[tokio::test]
@@ -390,7 +421,8 @@ mod tests {
 
     #[tokio::test]
     async fn happy_path_returns_openai_shaped_completion() {
-        let app = router(test_state());
+        let (state, store) = test_state_and_store();
+        let app = router(state);
         let resp = app
             .oneshot(
                 Request::post("/v1/chat/completions")
@@ -409,6 +441,62 @@ mod tests {
         assert_eq!(v["model"], "gpt-4o");
         assert!(v["choices"][0]["message"]["content"].is_string());
         assert!(v["usage"]["total_tokens"].is_number());
+
+        // The response id must be opaque. "gpt4o-openai-primary" is the
+        // deployment that served this call, and it is shaped like this repo's
+        // real config ids on purpose — echoing one here would tell every
+        // tenant which upstream handled their request. Asserting shape alone
+        // would not catch that, which is how it shipped the first time.
+        //
+        // The fixture id must also be something that cannot occur inside a
+        // random hex string: a short id like "d1" appears by chance in a
+        // 32-char hex id about 12% of the time and makes this flake.
+        let id = v["id"].as_str().expect("id must be a string");
+        assert!(id.starts_with("chatcmpl-"), "id must keep the OpenAI prefix: {id}");
+        assert!(
+            !id.contains("gpt4o-openai-primary"),
+            "response id leaked the deployment id: {id}"
+        );
+
+        // Metering actually ran, with the right amount against the right key.
+        // Echo reports {prompt: 10, completion: 5} and the fixture prices
+        // "test-model" at $1/Mtok prompt and $2/Mtok completion, so:
+        //   10/1e6 * 1.0  +  5/1e6 * 2.0  =  2e-5
+        // Without this, a wrong formula, a wrong key id, or a no-op
+        // record_spend would all still pass.
+        let spent = store.spent_today("team-a");
+        assert!(
+            (spent - 2e-5).abs() < 1e-12,
+            "expected 2e-5 USD metered to team-a, got {spent}"
+        );
+        assert_eq!(store.spent_today("team-b"), 0.0, "spend must not bleed across keys");
+    }
+
+    #[tokio::test]
+    async fn completion_ids_are_opaque_and_unique_per_request() {
+        // A constant id would satisfy "does not contain the deployment id",
+        // so pin uniqueness separately: two calls must not collide.
+        async fn one_id() -> String {
+            let app = router(test_state());
+            let resp = app
+                .oneshot(
+                    Request::post("/v1/chat/completions")
+                        .header("authorization", format!("Bearer {}", test_plaintext_key()))
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            r#"{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}"#,
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            v["id"].as_str().unwrap().to_string()
+        }
+
+        let (a, b) = (one_id().await, one_id().await);
+        assert_ne!(a, b, "completion ids must not repeat across requests");
     }
 
     #[tokio::test]

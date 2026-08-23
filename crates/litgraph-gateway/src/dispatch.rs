@@ -23,6 +23,13 @@ use crate::registry::{Deployment, ModelGroup, RoutingStrategy};
 #[derive(Debug, ThisError)]
 pub enum DispatchError {
     /// A client-side error from upstream. Not retried, surfaced as-is.
+    ///
+    /// `message` is the upstream error text unmodified, and `http.rs` relays
+    /// it to the client verbatim as `GatewayError::UpstreamRejected`. Nothing
+    /// between here and the wire sanitises it, so a `ChatModel` in a
+    /// `Deployment` must not put deployment ids, base URLs or credentials in
+    /// the text of a non-retryable error. See the doc comment on
+    /// `crate::error::GatewayError::UpstreamRejected` for the full rationale.
     #[error("upstream rejected the request: {message}")]
     Upstream { message: String },
     /// Every deployment was open or failed. Surfaces as 503.

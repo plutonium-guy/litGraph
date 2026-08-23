@@ -18,6 +18,25 @@ pub enum GatewayError {
     BudgetExhausted { spent_usd: f64, cap_usd: f64 },
     NoDeploymentAvailable,
     /// A client-side rejection relayed from upstream.
+    ///
+    /// # Invariant: `message` reaches the client verbatim
+    ///
+    /// This is deliberate. An upstream 400 ("context length exceeded",
+    /// "unsupported parameter") is the most useful thing a caller gets, and
+    /// replacing it with a generic string makes every client error
+    /// undebuggable. Nothing here sanitises it.
+    ///
+    /// The consequence is an invariant this module cannot enforce: any
+    /// `ChatModel` placed in a `Deployment` must keep the text of its
+    /// NON-RETRYABLE errors free of deployment ids, upstream base URLs and
+    /// credentials. Retryable errors are safe by construction — they are
+    /// consumed by failover and only ever logged (see `dispatch::is_retryable`).
+    ///
+    /// Shipped providers satisfy this today: they construct only
+    /// `Error::provider(..)`, which is retryable. But the path is live, not
+    /// theoretical — `TokenBudgetChatModel` (`litgraph-resilience`) returns a
+    /// non-retryable `Error::invalid(..)` and can wrap any `ChatModel`. Its
+    /// text is benign; the next wrapper's might not be. Check before composing.
     UpstreamRejected { message: String },
     BadRequest { message: String },
 }
@@ -140,11 +159,37 @@ mod tests {
 
     #[tokio::test]
     async fn client_errors_never_leak_deployment_internals() {
+        // NoDeploymentAvailable's message is a hardcoded constant, so on its
+        // own this assertion can never fail no matter what the code does. It
+        // is kept as one case among several, not as the whole test.
         let r = GatewayError::NoDeploymentAvailable.into_response();
         let v = body_json(r).await;
         let msg = v["error"]["message"].as_str().unwrap();
         for leak in ["http://", "https://", "api_key", "deployment_id", "gpt4o-azure"] {
             assert!(!msg.contains(leak), "error message leaked {leak:?}: {msg}");
         }
+    }
+
+    #[tokio::test]
+    async fn upstream_rejected_relays_its_message_verbatim() {
+        // This is the one variant that puts caller-supplied upstream text
+        // straight into the body, so it is the variant a leak would travel
+        // through. The relay is deliberate (see the doc comment on the
+        // variant): an upstream 400 like "context length exceeded" is the
+        // most useful thing a client gets, and blanking it would make every
+        // client error undebuggable.
+        //
+        // This test therefore pins the CONTRACT, not an absence: whatever
+        // dispatch hands over arrives intact and correctly enveloped. The
+        // safety obligation lives upstream, on whoever composes a ChatModel
+        // into a Deployment.
+        let r = GatewayError::UpstreamRejected {
+            message: "context length exceeded: 9000 > 8192".into(),
+        }
+        .into_response();
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+        let v = body_json(r).await;
+        assert_eq!(v["error"]["message"], "context length exceeded: 9000 > 8192");
+        assert_eq!(v["error"]["type"], "invalid_request_error");
     }
 }
